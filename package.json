@@ -1,0 +1,19 @@
+{
+  "name": "llm-box",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "pi integration for a local llama.cpp server: live model catalog, GPU placement, provenance — see docs/PI.md",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Polygonschmiede/llm-box.git"
+  },
+  "pi": {
+    "extensions": ["./pi/extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

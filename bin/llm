@@ -1,0 +1,1464 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  llm  —  a simple front end for local LLMs (llama.cpp + llama-swap)
+#  Docs:  README.md  and  docs/MODELS.md
+# ============================================================================
+set -uo pipefail
+
+#  From the location of THIS file, not from $HOME: that way the repository works
+#  in any directory, and a symlink in ~/.local/bin/llm resolves too (readlink -f
+#  follows it). LLM_HOME=... still overrides everything.
+LLM_HOME="${LLM_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export LLM_HOME
+CONFIG="$LLM_HOME/config/llama-swap.yaml"
+MODELS="$LLM_HOME/models"
+LLAMA_SERVER="$LLM_HOME/llama.cpp/build/bin/llama-server"
+SERVICE="llama-swap"                      # systemd --user unit
+API="http://127.0.0.1:8080"
+
+# The address OTHER machines use to reach the OpenAI API (not 127.0.0.1!).
+# Detected, not hardcoded - otherwise every installation points at the network of
+# whoever edited this file last.
+lan_ip(){ hostname -I 2>/dev/null | awk '{print $1; exit}'; }
+PUBLIC_HOST="${LLM_PUBLIC_HOST:-$(lan_ip)}"
+PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+PUBLIC_API="${LLM_PUBLIC_API:-http://$PUBLIC_HOST:8080/v1}"
+
+# --- Configuration lock -----------------------------------------------------
+#  Since the registry API (port 8081) can trigger changes, two writers can arrive
+#  at once: 'llm add' appends at the bottom while a PATCH rewrites the file. Both
+#  take the SAME lock file (lib/llmreg.py: config_lock).
+# Shared library: catalog, provenance, config patching (the API uses it too)
+REG="$LLM_HOME/lib/llmreg.py"
+reg(){ python3 "$REG" "$@"; }
+
+CFG_LOCK="$LLM_HOME/config/.llama-swap.lock"
+cfg_lock(){   exec 9>"$CFG_LOCK" && flock -w 30 9 || warn "configuration is locked - not waiting any longer"; }
+cfg_unlock(){ exec 9>&- 2>/dev/null || true; }
+
+# --- Updates (see 'llm update' / 'llm versions' / 'llm rollback') -----------
+LCPP="$(readlink -f "$LLM_HOME/llama.cpp" 2>/dev/null || echo "$LLM_HOME/llama.cpp")"
+SWAP_BIN="$LLM_HOME/bin/llama-swap"
+UPD_CACHE="$LLM_HOME/.update-cache"        # cached version query (once a day)
+UPD_MAXAGE=86400
+KEEP_BUILDS=2                              # active build + this many fallbacks
+WCPP="$(readlink -f "$HOME/whisper.cpp" 2>/dev/null || echo "$HOME/whisper.cpp")"
+GH_LCPP="https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+GH_SWAP="https://api.github.com/repos/mostlygeek/llama-swap/releases/latest"
+GH_WCPP="https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest"
+GH_COMFY="https://api.github.com/repos/comfyanonymous/ComfyUI/releases/latest"
+PYPI_OWUI="https://pypi.org/pypi/open-webui/json"
+#  Two venvs on purpose - see config/requirements-*.txt
+VENV_API="$LLM_HOME/venv-api"
+VENV_UI="$LLM_HOME/venv-webui"
+VENV_PY="${LLM_VENV_PY:-3.12}"              # Open WebUI needs >=3.11,<3.13
+OWUI_DATA="$LLM_HOME/openwebui-data"
+COMFY="$(readlink -f "${LLM_COMFY_HOME:-$HOME/comfyui}" 2>/dev/null || echo "${LLM_COMFY_HOME:-$HOME/comfyui}")"
+#  State (not cache): what a rollback goes back to.
+UPD_STATE="$LLM_HOME/.update-state"
+#  Where the pi extension is installed from (own fork? set it here).
+LLM_REPO_URL="${LLM_REPO_URL:-https://github.com/Polygonschmiede/llm-box}"
+# Build flags. $ORIGIN RUNPATH so that every build directory loads its OWN .so
+# files - without it a test build would load the libraries of the ACTIVE build,
+# which defeats the point of testing before switching. Tests are off to save time.
+#
+#  The gfx target and the HIP compiler used to be fixed values here AND in the
+#  whisper build - two places that would produce a binary that does not run on any
+#  other card or ROCm version. Both now come from the detection (rocm-smi and
+#  hipconfig) and can be overridden by environment. hw_get reads the file written
+#  by 'llm gpu sync', so a build does not need rocm-smi itself.
+HW_ENV="$LLM_HOME/config/hardware.env"
+hw_get(){ # $1=key
+  [[ -f "$HW_ENV" ]] && sed -n "s/^$1=\(.*\)$/\1/p" "$HW_ENV" | head -1
+}
+hip_flags(){                                # -> Array in HIP_FLAGS
+  local gfx="${LLM_GFX_TARGETS:-$(hw_get LLM_GFX_TARGETS)}"
+  local cc="${LLM_HIP_COMPILER:-$(hw_get LLM_HIP_COMPILER)}"
+  if [[ -z "$gfx" || -z "$cc" ]]; then      # 'llm gpu sync' has not run yet
+    gfx="${gfx:-$(reg hw 2>/dev/null | sed -n 's/.*"gfxTargets": *"\([^"]*\)".*/\1/p')}"
+    cc="${cc:-$(reg hw 2>/dev/null | sed -n 's/.*"hipCompiler": *"\([^"]*\)".*/\1/p')}"
+  fi
+  [[ -z "$gfx" ]] && { err "No gfx target detected. Does rocm-smi work? Otherwise: LLM_GFX_TARGETS=gfx1201 llm update llama"; return 1; }
+  [[ -z "$cc"  ]] && { err "No HIP compiler found. Is hipcc/ROCm installed? Otherwise set LLM_HIP_COMPILER=..."; return 1; }
+  HIP_FLAGS=(-DGGML_HIP=ON "-DAMDGPU_TARGETS=$gfx" "-DCMAKE_HIP_COMPILER=$cc")
+}
+LCPP_CMAKE_FLAGS=(
+  -DCMAKE_BUILD_TYPE=Release
+  -DGGML_NATIVE=ON
+  -DGGML_SCHED_MAX_COPIES=4
+  -DLLAMA_CURL=ON
+  -DLLAMA_BUILD_TESTS=OFF
+  -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
+)
+
+# Colours
+c_g=$'\033[0;32m'; c_y=$'\033[0;33m'; c_r=$'\033[0;31m'; c_b=$'\033[0;36m'; c_0=$'\033[0m'
+info(){ printf "%s\n" "${c_b}$*${c_0}"; }
+ok(){   printf "%s\n" "${c_g}$*${c_0}"; }
+warn(){ printf "%s\n" "${c_y}$*${c_0}"; }
+err(){  printf "%s\n" "${c_r}$*${c_0}" >&2; }
+
+# uv/uvx for Hugging Face downloads (no globally installed package needed)
+UVX="$(command -v uvx || echo "$HOME/.local/bin/uvx")"
+UV="$(command -v uv || echo "$HOME/.local/bin/uv")"
+need_uv(){   # uv downloads models from Hugging Face and builds the venvs
+  [[ -x "$UV" && -x "$UVX" ]] && return 0
+  err "uv is missing. Install it once:"
+  err "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+  return 1
+}
+
+usage(){
+cat <<EOF
+${c_b}llm${c_0} — run local LLMs on AMD cards without memorising llama.cpp command lines.
+      ONE OpenAI-compatible endpoint, models swap in and out by themselves.
+
+${c_y}── OVERVIEW ──────────────────────────────────────────────────────${c_0}
+  llm                     this help
+  llm status              dashboard: services, loaded model, GPU temperature
+  llm url                 the addresses (API / chat / images / registry)
+  llm doctor              check everything and say how to fix what is broken
+
+${c_y}── FIRST RUN ─────────────────────────────────────────────────────${c_0}
+  llm init                create the configuration from config/llama-swap.example.yaml
+  llm setup               create the Python environments (registry, chat UI)
+  llm update llama        fetch and build llama.cpp (also the setup step)
+
+${c_y}── MODELS (you choose; nothing downloads on its own) ──────────────${c_0}
+  llm add [OPTIONS] <hf-repo> [quant] [-- <extra flags>]
+                          download a model from Hugging Face and configure it
+        OPTIONS:   -c CTX      context size (default 8192)
+                   -t TEMP     default temperature (e.g. 0.7)
+                   --mtp       token prediction via built-in MTP heads (see: llm speed)
+                   --ngram     token prediction without a draft model   (see: llm speed)
+                   --embed     embedding model for RAG (not chat)   → /v1/embeddings
+                   --rerank    reranker: sorts RAG hits by relevance → /v1/rerank
+                   --gpu N     pin to card N; two pinned models run AT THE SAME TIME
+                   --gpu all   spread over every card (the default)
+                   --ttl SEC   idle time before unloading (0 = never; default 900)
+                   -- ...      any further llama-server flags (e.g. --top-p 0.9)
+  llm ls                  show configured models
+  llm meta                where each model came from (Hugging Face repo + quant)
+  llm meta backfill       fill in provenance for models added earlier
+  llm rm <name>           remove a model (asks whether to delete the files too)
+  llm edit                hand-tune the configuration  (then: llm llama restart)
+  llm search <text>       how to find GGUF models on Hugging Face
+  llm export              models.json for pi on stdout (fallback — normally the
+                          agent reads everything live from the registry API)
+  llm speed               EXPLAINER: token prediction, and when it helps
+
+${c_y}── CARDS ─────────────────────────────────────────────────────────${c_0}
+  llm gpu                 snapshot: temperature / VRAM / load / watts
+  llm gpu list            the cards this machine has, and what is pinned where
+  llm gpu sync            re-match config and cards after a hardware change
+                          (--dry-run shows the diff without writing)
+
+${c_y}── STAYING CURRENT ───────────────────────────────────────────────${c_0}
+  llm update              just look: what is installed, what is newer
+  llm update llama        build llama.cpp → smoke test → only then switch
+  llm update swap         replace the llama-swap binary (old one is kept)
+  llm update whisper      build whisper.cpp (speech to text) → smoke test → switch
+  llm update ui           Open WebUI (keeps a rollback snapshot incl. its database)
+  llm update comfy        ComfyUI (tag checkout plus dependencies)
+  llm update all          everything that is installed here
+  llm versions            installed builds and versions (● = active)
+  llm rollback <what>     llama | swap | whisper | ui | comfy — back one version
+
+${c_y}── SERVICES  (action: on | off | restart | status | logs) ─────────${c_0}
+  llm llama <action>      LLM API  (llama.cpp/llama-swap)  port 8080  ← chat & API
+  llm api   <action>      registry API for agents          port 8081  ← pi & MCP
+     (llm api client = ready-made setup line for a client machine
+      llm api url    = addresses · llm api token = key for making changes)
+  llm comfy <action>      ComfyUI  (image generation)      port 8188
+  llm ui    <action>      Open WebUI (chat interface)      port 3000
+     (no action = status)
+
+${c_y}── ALL ON / ALL OFF ──────────────────────────────────────────────${c_0}
+  llm on                  start the LLM API and the chat UI
+  llm off                 stop ALL services → GPUs completely free
+  llm start|stop|restart  short for 'llm llama …' (the LLM API)
+
+${c_y}── WATCHING ──────────────────────────────────────────────────────${c_0}
+  llm watch               live monitor (every 2s; Ctrl+C to stop)
+  llm logs                live logs of the LLM API   (= llm llama logs)
+  llm ps                  which model is loaded right now
+
+${c_y}── EXAMPLES ──────────────────────────────────────────────────────${c_0}
+  llm add unsloth/Qwen3-8B-GGUF Q4_K_M
+  llm add -c 32768 -t 0.7 unsloth/Qwen3-14B-GGUF Q4_K_M
+  llm add --ngram bartowski/Qwen2.5-Coder-14B-Instruct-GGUF Q5_K_M
+  llm add --gpu 0 unsloth/Qwen3-8B-GGUF Q4_K_M     # small, pinned to card 0
+  llm add --gpu 1 unsloth/Qwen3-14B-GGUF Q4_K_M    # small, card 1 (runs in parallel)
+  llm comfy on            # start ComfyUI when you need it
+  llm off                 # everything off, GPUs free
+
+  Documentation: docs/  (INSTALL, MODELS, FLAGS, UPDATES, API, PI, COMFYUI, REMOTE)
+EOF
+}
+
+# --- Explainer: token prediction / speculative decoding ---------------------
+cmd_speed(){
+cat <<EOF
+${c_b}Answering faster: token prediction (speculative decoding) in llama.cpp${c_0}
+
+${c_y}The idea:${c_0} normally the model produces ONE token at a time. With token
+prediction several tokens are guessed ahead and then verified in a single pass.
+When the guess is right you get several tokens per step → more tokens per second,
+${c_g}with identical quality${c_0} (wrong guesses are discarded). Runs entirely on the GPUs.
+
+In llama.cpp this is the ${c_b}--spec-type${c_0} option. You do not have to remember it —
+there are two ready-made ways built into 'llm add':
+
+${c_y}1) --ngram  (safe to try, works ALWAYS)${c_0}
+   Guesses the next tokens from the text so far. ${c_g}No draft model, any model.${c_0}
+   Especially strong on code and repetitive text.
+       ${c_g}llm add --ngram bartowski/Qwen2.5-Coder-14B-Instruct-GGUF Q5_K_M${c_0}
+
+${c_y}2) --mtp  (multi-token prediction, only some models)${c_0}
+   Uses MTP heads built INTO the model. Only for models like
+   ${c_b}Qwen3.x, DeepSeek V3/R1, Gemma 4${c_0} — and the GGUF must actually contain the
+   MTP tensors. If it does not, the server refuses to start → use --ngram.
+       ${c_g}llm add --mtp unsloth/Qwen3-30B-A3B-GGUF Q4_K_M${c_0}
+
+${c_y}How do I know whether it helps?${c_0}
+   Every response carries the numbers. Ask for one without streaming and look at
+   the 'timings' object:
+       ${c_g}predicted_per_second${c_0}                 tokens per second
+       ${c_g}draft_n_accepted / draft_n${c_0}           how many guesses were right
+
+   Measured here on Qwen3.8-27B-Q6_K, 2x R9700, MTP with --spec-draft-n-max 2:
+
+       task            without MTP    with MTP     guesses accepted
+       code             21.9 tok/s    43 tok/s     88 %
+       German prose     21.9 tok/s    30.5 tok/s   45 %
+
+   So it roughly doubles on code and gains about 40 % on prose. Raising
+   --spec-draft-n-max to 4 made code slightly faster (46 tok/s) but prose clearly
+   slower (25.8 tok/s, acceptance down to 31 %) — 2 is the better all-rounder.
+
+${c_y}Careful with what it does NOT fix${c_0}
+   Token prediction speeds up generation, not thinking. A reasoning model whose
+   template defaults to a high effort level writes far more tokens before the
+   answer, and that dominates how fast it feels. Clients can set the OpenAI field
+   ${c_b}reasoning_effort${c_0} per request ('none' switches thinking off entirely).
+
+${c_y}What is happening underneath?${c_0}
+   The macros 'server-ngram' / 'server-mtp' in config/llama-swap.yaml set
+   --spec-type ngram-simple resp. --spec-type draft-mtp. Further methods (eagle3,
+   dflash, …) are listed in llama.cpp/docs/speculative.md. More: docs/FLAGS.md
+EOF
+}
+
+# --- Service control (one service, a generic action) ------------------------
+svc_ctl(){ # $1=unit  $2=action  $3=plain name
+  local u="$1" a="${2:-status}" n="${3:-$1}"
+  case "$a" in
+    on|start)  systemctl --user start   "$u" && ok "$n started";;
+    off|stop)  systemctl --user stop    "$u" && ok "$n stopped";;
+    restart)   systemctl --user restart "$u" && ok "$n restarted";;
+    status|"") systemctl --user status  "$u" --no-pager 2>/dev/null || warn "$n is not installed";;
+    logs)      journalctl --user -u "$u" -n 60 -f;;
+    *) err "which action? $n <on|off|restart|status|logs>";;
+  esac
+}
+
+# --- Dashboard: the whole picture -------------------------------------------
+cmd_dash(){
+  printf "%s\n" "${c_b}Services:${c_0}"
+  local rows=("llama-swap|LLM API |8080" "llm-api|Registry|8081" "open-webui|Chat UI |3000" "comfyui|Images  |8188")
+  for r in "${rows[@]}"; do
+    IFS='|' read -r unit label port <<<"$r"
+    local st code dot
+    st=$(systemctl --user is-active "$unit" 2>/dev/null)
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$port/" 2>/dev/null)
+    if [ "$st" = active ]; then dot="${c_g}●${c_0}"; else dot="${c_r}○${c_0}"; fi
+    printf "  %b %-8s  Port %-4s  %-8s (HTTP %s)\n" "$dot" "$label" "$port" "$st" "$code"
+  done
+  echo
+  # The models REALLY loaded come from /running - /v1/models only lists the
+  # configured ones, which used to look as if one were always loaded.
+  local run
+  run=$(curl -s "$API/running" 2>/dev/null | grep -o '"model":"[^"]*"' | sed 's/"model":"//;s/"//' | paste -sd', ' -)
+  [[ -z "$run" ]] && run="${c_y}(none loaded)${c_0}"
+  printf "%s %b\n" "${c_b}Loaded model:${c_0}" "$run"
+  printf "%s\n" "${c_b}Cards:${c_0}"
+  # One source for the card list (lib/llmreg.py). This used to be a second
+  # rocm-smi parser in awk, with its own iGPU rule that decided differently.
+  reg gpus --table 2>/dev/null
+  # Does the config still match the hardware? After a card change a -ts with
+  # the wrong arity would otherwise quietly stay in place.
+  local want have
+  want=$(reg hw 2>/dev/null | sed -n 's/.*"tensorSplit": *"\([^"]*\)".*/\1/p')
+  have=$(sed -n 's/^\s*-ts \([0-9,]*\)\s*$/\1/p' "$CONFIG" 2>/dev/null | head -1)
+  [[ -n "$want$have" && "$want" != "$have" ]] && \
+    warn "  cards do not match the config (-ts '${have:-none}', expected '${want:-none}') → llm gpu sync"
+  # Version hint: read from the cache ONLY (never wait on GitHub). A stale cache
+  # is refreshed in the background, so the next call has fresh numbers.
+  local la lw sa sw wa ww hint=""
+  la=$(lcpp_active); lw=$(upd_get llama); sa=$(swap_active); sw=$(upd_get swap)
+  wa=$(wcpp_active); ww=$(upd_get whisper)
+  [[ -n "$lw" && -n "$la" && "$la" != "$lw" ]] && hint="llama.cpp $lw (llm update llama)"
+  [[ -n "$sw" && -n "$sa" && "$sa" != "$sw" ]] && hint="${hint:+$hint, }llama-swap $sw (llm update swap)"
+  [[ -n "$ww" && -n "$wa" && "$wa" != "$ww" ]] && hint="${hint:+$hint, }whisper.cpp $ww (llm update whisper)"
+  local ua uu ca cu extra=""
+  ua=$(owui_active); uu=$(upd_get ui); ca=$(comfy_active); cu=$(upd_get comfy)
+  [[ -n "$ua" ]] && extra="Open WebUI $ua$([[ -n "$uu" && "$ua" != "$uu" ]] && echo " → $uu")"
+  [[ -n "$ca" ]] && extra="${extra:+$extra · }ComfyUI $ca$([[ -n "$cu" && "${ca#v}" != "${cu#v}" ]] && echo " → $cu")"
+  [[ -n "$uu" && -n "$ua" && "$ua" != "$uu" ]] && hint="${hint:+$hint, }Open WebUI $uu (llm update ui)"
+  [[ -n "$cu" && -n "$ca" && "${ca#v}" != "${cu#v}" ]] && hint="${hint:+$hint, }ComfyUI $cu (llm update comfy)"
+  printf "%s llama.cpp %s · llama-swap %s" "${c_b}Versions:${c_0}" "${la:-?}" "${sa:-?}"
+  [[ -n "$wa" ]] && printf " · whisper.cpp %s" "$wa"
+  if [[ -n "$hint" ]]; then printf "  %s\n" "${c_y}→ new: $hint${c_0}"; else printf "  %s\n" "${c_g}up to date${c_0}"; fi
+  [[ -n "$extra" ]] && printf "%s %s\n" "${c_b}Services:${c_0}" "$extra"
+  upd_stale && ( upd_refresh >/dev/null 2>&1 & )
+  echo
+  echo "  More:  llm help   |   Addresses:  llm url"
+}
+
+# --- Service helpers (systemd --user; no sudo needed) -----------------------
+svc(){ systemctl --user "$1" "$SERVICE" 2>/dev/null; }
+svc_active(){ systemctl --user is-active --quiet "$SERVICE"; }
+reload_swap(){
+  if systemctl --user list-unit-files "$SERVICE.service" &>/dev/null && \
+     systemctl --user cat "$SERVICE" &>/dev/null; then
+    if svc_active; then info "reloading llama-swap ..."; svc restart; sleep 1; fi
+  else
+    warn "Service '$SERVICE' is not installed yet (see setup-system.sh). The configuration was saved."
+  fi
+}
+
+# ============================================================================
+#  UPDATES  —  llama.cpp (built here) + llama-swap (prebuilt binary)
+# ============================================================================
+#  The idea: every llama.cpp version gets its OWN build directory
+#  (build-bXXXXX/), and 'build' is only a symlink to it. Switching and rolling
+#  back is therefore a symlink change - seconds, no rebuild.
+#  Before switching, a smoke test runs with a real model.
+
+lcpp_active(){                                  # before the migration: git HEAD
+  if [[ -L "$LCPP/build" ]]; then basename "$(readlink -f "$LCPP/build")" | sed 's/^build-//'
+  elif [[ -d "$LCPP/build" ]]; then git -C "$LCPP" rev-parse --short HEAD 2>/dev/null
+  fi
+}
+# directories only, newest first (the repo also contains e.g. build-xcframework.sh)
+lcpp_builds(){ find "$LCPP" -maxdepth 1 -type d -name 'build-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-; }
+swap_active(){ "$SWAP_BIN" --version 2>/dev/null | sed -n 's/^version: *\(v*[0-9][^ ]*\).*/\1/p'; }
+
+# The latest upstream versions (cached; upd_refresh asks again right now)
+#  Set one key in the cache without losing the others. This used to be a single
+#  printf: if one source failed, the whole cache came out empty.
+cache_set(){ # $1=key $2=value (empty = do nothing)
+  [[ -z "${2:-}" ]] && return 0
+  touch "$UPD_CACHE"
+  local tmp="$UPD_CACHE.tmp"
+  { grep -v "^$1=" "$UPD_CACHE" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$tmp" \
+    && mv "$tmp" "$UPD_CACHE"
+}
+#  '-L' matters: a moved GitHub repo answers 301, and without -L the query
+#  silently returns an empty value, so 'llm update' claims "up to date".
+#  The ComfyUI repository does exactly this today.
+gh_tag(){ curl -sfL --max-time 10 "$1" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1; }
+pypi_version(){ curl -sfL --max-time 10 "$1" | python3 -c '
+import json,sys
+try: print(json.load(sys.stdin)["info"]["version"])
+except Exception: pass' 2>/dev/null; }
+
+upd_refresh(){
+  local d; d=$(mktemp -d)
+  ( gh_tag "$GH_LCPP"  > "$d/llama"   ) &
+  ( gh_tag "$GH_SWAP"  > "$d/swap"    ) &
+  ( gh_tag "$GH_WCPP"  > "$d/whisper" ) &
+  ( gh_tag "$GH_COMFY" > "$d/comfy"   ) &
+  ( pypi_version "$PYPI_OWUI" > "$d/ui" ) &
+  wait
+  local k
+  for k in llama swap whisper comfy ui; do
+    cache_set "$k" "$(tr -d '\n' < "$d/$k" 2>/dev/null)"
+  done
+  rm -rf "$d"
+}
+upd_stale(){
+  [[ -f "$UPD_CACHE" ]] || return 0
+  [[ $(( $(date +%s) - $(stat -c %Y "$UPD_CACHE") )) -gt $UPD_MAXAGE ]]
+}
+upd_get(){ sed -n "s/^$1=//p" "$UPD_CACHE" 2>/dev/null; }   # llama|swap|whisper|ui|comfy
+st_get(){ sed -n "s/^$1=//p" "$UPD_STATE" 2>/dev/null; }
+st_set(){ # $1=key $2=value
+  touch "$UPD_STATE"
+  local tmp="$UPD_STATE.tmp"
+  { grep -v "^$1=" "$UPD_STATE" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$tmp" \
+    && mv "$tmp" "$UPD_STATE"
+}
+
+# --- whisper.cpp: speech to text, its own project next to llama.cpp --------
+#  Built the same way as llama.cpp: build-<tag>/ plus a symlink build/, so a
+#  rollback is only a symlink change. Serves /v1/audio/transcriptions.
+wcpp_active(){
+  if [[ -L "$WCPP/build" ]]; then basename "$(readlink -f "$WCPP/build")" | sed 's/^build-//'
+  elif [[ -d "$WCPP/build" ]]; then git -C "$WCPP" rev-parse --short HEAD 2>/dev/null
+  fi
+}
+wcpp_builds(){ find "$WCPP" -maxdepth 1 -type d -name 'build-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-; }
+
+# Tests a whisper build BEFORE it becomes active by transcribing the bundled
+# sample. If that fails, the old build stays active.
+wcpp_smoke(){ # $1=build directory
+  local bd="$1" model out
+  [[ -x "$bd/bin/whisper-server" ]] || { err "no whisper-server in $bd/bin"; return 1; }
+  [[ -f "$WCPP/samples/jfk.wav" ]] || { warn "no sample to test with - skipped."; return 0; }
+  model=$(grep -oE '\-m +[^ "]+\.bin' "$CONFIG" 2>/dev/null | awk '{print $2}' | head -1)
+  [[ -f "$model" ]] || { warn "no whisper model in the configuration - smoke test skipped."; return 0; }
+  info "smoke-testing whisper with $(basename "$model") ..."
+  out=$(LD_LIBRARY_PATH="$bd/bin" "$bd/bin/whisper-cli" -m "$model" -f "$WCPP/samples/jfk.wav" -nt 2>/dev/null)
+  if [[ -z "${out// /}" ]]; then err "whisper-cli returned no text."; return 1; fi
+  ok "smoke test passed: ${out:0:60}..."
+}
+
+wcpp_switch(){ # $1=target version
+  local tgt="build-$1" prev; prev=$(wcpp_active)
+  [[ -d "$WCPP/$tgt" ]] || { err "build directory $tgt is missing."; return 1; }
+  local was_active=no; svc_active && was_active=yes
+  [[ "$was_active" == yes ]] && { info "stopping llama-swap ..."; svc stop; }
+  ln -sfn "$tgt" "$WCPP/build" || { err "could not set the symlink."; return 1; }
+  [[ "$was_active" == yes ]] && { info "starting llama-swap ..."; svc start; }
+  ok "active: whisper.cpp $1  (was: ${prev:-?})"
+}
+
+update_whisper(){ # $1=target tag (empty = the latest release)
+  command -v cmake >/dev/null || { err "cmake is missing."; return 1; }
+  if [[ ! -d "$WCPP/.git" ]]; then
+    info "whisper.cpp is not installed - fetching it into $WCPP ..."
+    git clone --quiet https://github.com/ggml-org/whisper.cpp.git "$WCPP" || { err "git clone failed."; return 1; }
+  fi
+  local tgt="${1:-}" act
+  if [[ -z "$tgt" ]]; then upd_refresh; tgt=$(upd_get whisper); fi
+  [[ -z "$tgt" ]] && { err "could not determine the latest version (network?)."; return 1; }
+  act=$(wcpp_active)
+  [[ "$act" == "$tgt" ]] && { ok "whisper.cpp is up to date ($act)."; return 0; }
+  if [[ -n "$(git -C "$WCPP" status --porcelain 2>/dev/null)" ]]; then
+    err "the whisper.cpp repository has local changes - please clean up first."; return 1
+  fi
+  if [[ -d "$WCPP/build-$tgt" ]]; then
+    info "build $tgt already exists - testing it, then switching."
+    wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+    wcpp_switch "$tgt"; return $?
+  fi
+  info "fetching whisper.cpp $tgt ..."
+  # A shallow clone (--depth 1) does not have the objects of other tags, so a
+  # later 'checkout' would fail. Fetch the full history once.
+  if [[ "$(git -C "$WCPP" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    info "repository is a shallow clone - fetching the full history ..."
+    git -C "$WCPP" fetch --unshallow --quiet origin || { err "git fetch --unshallow failed."; return 1; }
+  fi
+  git -C "$WCPP" fetch --tags --quiet origin || { err "git fetch failed."; return 1; }
+  git -C "$WCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
+  local log="$LLM_HOME/.build-whisper-$tgt.log" t0=$SECONDS
+  info "building whisper.cpp $tgt with $(nproc) threads (log: $log) ..."
+  # The same detected HIP flags as llama.cpp (hip_flags) - only the
+  # project-specific test option differs.
+  hip_flags || return 1
+  if ! cmake -S "$WCPP" -B "$WCPP/build-$tgt" -DCMAKE_BUILD_TYPE=Release "${HIP_FLAGS[@]}" \
+        -DGGML_NATIVE=ON -DWHISPER_BUILD_TESTS=OFF -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON > "$log" 2>&1; then
+    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$WCPP/build-$tgt"; return 1
+  fi
+  if ! cmake --build "$WCPP/build-$tgt" -j "$(nproc)" >> "$log" 2>&1; then
+    err "build failed:"; grep -iE "error" "$log" | tail -8 >&2
+    warn "the active build (${act:-none}) is untouched - nothing is broken."
+    rm -rf "$WCPP/build-$tgt"; return 1
+  fi
+  ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
+  wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+  wcpp_switch "$tgt"
+}
+
+# One-time migration: the existing real build/ becomes build-<sha>/
+lcpp_migrate(){
+  [[ -L "$LCPP/build" ]] && return 0
+  [[ -d "$LCPP/build" ]] || return 0
+  local cur; cur=$(git -C "$LCPP" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  info "one-time migration to versioned builds: build/ -> build-$cur/"
+  mv "$LCPP/build" "$LCPP/build-$cur" && ln -sfn "build-$cur" "$LCPP/build" || {
+    err "migration failed."; return 1; }
+  ok "the previous build stays as a fallback: $cur"
+}
+
+# Test a new build BEFORE it becomes active: load the smallest available model,
+# wait for /health, force a tiny answer. LD_LIBRARY_PATH matters because older
+# builds carry an absolute RUNPATH to .../build/bin.
+smoke_test(){ # $1=build directory
+  local bd="$1" model port=5987 log="$LLM_HOME/.smoke.log" pid code i out
+  [[ -x "$bd/bin/llama-server" ]] || { err "no llama-server in $bd/bin"; return 1; }
+  # Take a model from the configuration (an entry's '-m') and pick the smallest.
+  # Not simply the smallest GGUF in the directory: that would be the MTP drafter,
+  # which cannot be loaded on its own.
+  model=$(grep -oE '\-m +[^ "]+\.gguf' "$CONFIG" 2>/dev/null | awk '{print $2}' | sort -u \
+          | while read -r f; do [[ -f "$f" ]] && printf "%s %s\n" "$(stat -c %s "$f")" "$f"; done \
+          | sort -n | head -1 | cut -d' ' -f2-)
+  if [[ -z "$model" ]]; then warn "no loadable model in the configuration - smoke test skipped."; return 0; fi
+  info "smoke test with $(basename "$model") ..."
+  LD_LIBRARY_PATH="$bd/bin" HIP_VISIBLE_DEVICES="$(hw_get HIP_VISIBLE_DEVICES)" \
+    "$bd/bin/llama-server" \
+    -m "$model" -c 512 -ngl 99 -fa on --device ROCm0 -sm none -mg 0 \
+    --host 127.0.0.1 --port "$port" --no-webui > "$log" 2>&1 &
+  pid=$!
+  code=""
+  for i in $(seq 1 180); do
+    sleep 2
+    if ! kill -0 "$pid" 2>/dev/null; then
+      err "the test server died. Last lines ($log):"; tail -6 "$log" >&2; return 1
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null)
+    [[ "$code" == 200 ]] && break
+  done
+  if [[ "$code" != 200 ]]; then
+    err "the test server never became ready (6 min). Last lines ($log):"; tail -6 "$log" >&2
+    kill "$pid" 2>/dev/null; return 1
+  fi
+  out=$(curl -s --max-time 120 "http://127.0.0.1:$port/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d '{"max_tokens":16,"messages":[{"role":"user","content":"Reply with just: ok"}]}' 2>/dev/null)
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  if ! grep -q '"content"' <<<"$out"; then
+    err "the test server returned no answer."; return 1
+  fi
+  ok "smoke test passed (load + answer)."
+}
+
+# Move the symlink, restart the service, check that the API answers again
+lcpp_switch(){ # $1=target version
+  local tgt="build-$1" prev; prev=$(lcpp_active)
+  [[ -d "$LCPP/$tgt" ]] || { err "build directory $tgt is missing."; return 1; }
+  local was_active=no; svc_active && was_active=yes
+  [[ "$was_active" == yes ]] && { info "stopping llama-swap ..."; svc stop; }
+  ln -sfn "$tgt" "$LCPP/build" || { err "could not set the symlink."; return 1; }
+  if [[ "$was_active" == yes ]]; then
+    info "starting llama-swap ..."; svc start; sleep 2
+    if ! curl -sf --max-time 10 "$API/v1/models" >/dev/null; then
+      err "the API stopped answering - rolling back to $prev."
+      ln -sfn "build-$prev" "$LCPP/build"; svc restart; return 1
+    fi
+  fi
+  ok "active: llama.cpp $1  (was: ${prev:-?})"
+}
+
+# Clean up old builds: the active one plus KEEP_BUILDS-1 fallbacks stay
+lcpp_prune(){
+  local act d n keep=$KEEP_BUILDS
+  act=$(lcpp_active)
+  for d in $(lcpp_builds); do
+    n=$(basename "$d"); n="${n#build-}"
+    [[ "$n" == "$act" ]] && continue
+    if [[ $keep -gt 1 ]]; then keep=$((keep-1)); continue; fi
+    info "removing the old build: $n ($(du -sh "$d" 2>/dev/null | cut -f1))"; rm -rf "$d"
+  done
+}
+
+update_llama(){ # $1=target tag (empty = the latest release)
+  command -v cmake >/dev/null || { err "cmake is missing.  sudo apt-get install cmake build-essential"; return 1; }
+  #  On a first run llama.cpp is not there at all - fetch it instead of failing.
+  #  That makes 'llm update llama' the setup command too: clone, build, smoke
+  #  test, switch. (The same pattern as update_whisper.)
+  if [[ ! -d "$LCPP/.git" ]]; then
+    if [[ -e "$LCPP" && ! -L "$LCPP" ]]; then
+      err "$LCPP exists but is not a git repository - please move it aside."; return 1
+    fi
+    info "llama.cpp is not here - fetching it into $LCPP ..."
+    git clone --quiet https://github.com/ggml-org/llama.cpp.git "$LCPP" || {
+      err "git clone failed."; return 1; }
+  fi
+  lcpp_migrate || return 1
+  local tgt="${1:-}" act free
+  if [[ -z "$tgt" ]]; then upd_refresh; tgt=$(upd_get llama); fi
+  [[ -z "$tgt" ]] && { err "could not determine the latest version (network?)."; return 1; }
+  act=$(lcpp_active)
+  if [[ "$act" == "$tgt" ]]; then ok "llama.cpp is up to date ($act)."; return 0; fi
+  free=$(df --output=avail -BG "$LCPP" | tail -1 | tr -dc 0-9)
+  [[ ${free:-0} -lt 8 ]] && { err "not enough disk space (${free}G free, ~8G needed)."; return 1; }
+  if [[ -n "$(git -C "$LCPP" status --porcelain 2>/dev/null)" ]]; then
+    err "the llama.cpp repository has local changes - please clean up first."; return 1
+  fi
+  # Already built? Test it anyway - the directory may be left over from a
+  # failed attempt.
+  if [[ -d "$LCPP/build-$tgt" ]]; then
+    info "build $tgt already exists - testing it, then switching."
+    smoke_test "$LCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+    lcpp_switch "$tgt" && lcpp_prune; return $?
+  fi
+
+  info "fetching llama.cpp $tgt ..."
+  git -C "$LCPP" fetch --tags --quiet origin || { err "git fetch failed."; return 1; }
+  git -C "$LCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
+
+  local log="$LLM_HOME/.build-$tgt.log" t0=$SECONDS
+  info "building $tgt with $(nproc) threads (takes a while; log: $log) ..."
+  hip_flags || return 1
+  if ! cmake -S "$LCPP" -B "$LCPP/build-$tgt" "${LCPP_CMAKE_FLAGS[@]}" "${HIP_FLAGS[@]}" \
+       > "$log" 2>&1; then
+    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$LCPP/build-$tgt"; return 1
+  fi
+  if ! cmake --build "$LCPP/build-$tgt" -j "$(nproc)" >> "$log" 2>&1; then
+    err "build failed:"; grep -iE "error" "$log" | tail -8 >&2
+    warn "the active build ($act) is untouched - nothing is broken."
+    rm -rf "$LCPP/build-$tgt"; return 1
+  fi
+  ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
+
+  if ! smoke_test "$LCPP/build-$tgt"; then
+    err "smoke test failed - $tgt will NOT be activated."
+    warn "$act stays active. The build directory is kept: $LCPP/build-$tgt"
+    return 1
+  fi
+  lcpp_switch "$tgt" || return 1
+  lcpp_prune
+}
+
+update_swap(){ # $1=target version (empty = the latest)
+  local cur want url tmp
+  cur=$(swap_active)
+  want="${1:-}"
+  if [[ -z "$want" ]]; then upd_refresh; want=$(upd_get swap); fi
+  [[ -z "$want" ]] && { err "could not determine the latest llama-swap version."; return 1; }
+  [[ "$cur" == "$want" ]] && { ok "llama-swap is up to date ($cur)."; return 0; }
+  url=$(curl -sf --max-time 10 "$GH_SWAP" \
+        | sed -n 's/.*"browser_download_url": *"\([^"]*linux_amd64[^"]*\)".*/\1/p' | head -1)
+  [[ -z "$url" ]] && { err "no linux_amd64 download in release $want."; return 1; }
+  tmp=$(mktemp -d); info "downloading llama-swap $want ..."
+  if ! curl -sfL --max-time 120 "$url" -o "$tmp/s.tar.gz"; then err "the download failed."; rm -rf "$tmp"; return 1; fi
+  tar -xzf "$tmp/s.tar.gz" -C "$tmp" || { err "the archive is broken."; rm -rf "$tmp"; return 1; }
+  local new; new=$(find "$tmp" -type f -name 'llama-swap' | head -1)
+  [[ -z "$new" ]] && { err "no llama-swap inside the archive."; rm -rf "$tmp"; return 1; }
+  chmod +x "$new"
+  if ! "$new" --version >/dev/null 2>&1; then err "the new binary does not run."; rm -rf "$tmp"; return 1; fi
+  cp -f "$SWAP_BIN" "$LLM_HOME/bin/llama-swap-$cur" 2>/dev/null && info "old version kept: llama-swap-$cur"
+  install -m 755 "$new" "$SWAP_BIN"; rm -rf "$tmp"
+  # Check the configuration with the new binary, then restart the service
+  svc_active && { svc restart; sleep 2; }
+  if svc_active && ! curl -sf --max-time 10 "$API/v1/models" >/dev/null; then
+    err "llama-swap $want does not answer - rolling back."
+    install -m 755 "$LLM_HOME/bin/llama-swap-$cur" "$SWAP_BIN"; svc restart; return 1
+  fi
+  ok "llama-swap $want is active (was $cur)."
+}
+
+# ============================================================================
+#  Keeping Open WebUI (the chat UI) and ComfyUI current
+# ============================================================================
+#  The same pattern as llama.cpp: determine the version, save a way back,
+#  update, smoke test, roll back automatically on failure.
+#  The difference: instead of a directory per version we save two small things:
+#    * 'uv pip freeze'  = the COMPLETE dependency closure
+#    * webui.db         = the database (only ~1 MB)
+#  The database is the reason. Open WebUI runs alembic migrations at startup and
+#  those only go forward, so downgrading the code against an already-migrated
+#  database is not safe without this snapshot. Disk space is NOT the reason: uv
+#  hardlinks from ~/.cache/uv, so a second venv shares most of its bytes with the
+#  first. That also means 'du -sh venv-webui' (~6.6 GB here) is the logical size,
+#  not what deleting it would give back.
+
+owui_active(){
+  [[ -x "$VENV_UI/bin/python" ]] || return 0
+  "$VENV_UI/bin/python" -c 'import importlib.metadata as m; print(m.version("open-webui"))' 2>/dev/null
+}
+owui_smoke(){   # waits until the UI answers
+  local i
+  for i in $(seq 1 40); do
+    curl -sf -m 3 http://127.0.0.1:3000/health >/dev/null 2>&1 && return 0
+    sleep 3
+  done
+  return 1
+}
+update_owui(){ # $1=target version (empty = the latest)
+  need_uv || return 1
+  [[ -x "$VENV_UI/bin/python" ]] || { err "no venv for the chat UI - run:  llm setup"; return 1; }
+  local tgt="${1:-}" act
+  if [[ -z "$tgt" ]]; then upd_refresh; tgt=$(upd_get ui); fi
+  [[ -z "$tgt" ]] && { err "could not determine the latest version (network?)."; return 1; }
+  act=$(owui_active)
+  [[ "$act" == "$tgt" ]] && { ok "Open WebUI is up to date ($act)."; return 0; }
+  info "Open WebUI $act -> $tgt"
+
+  # Save the way back BEFORE touching anything
+  local frz="$LLM_HOME/.venv-freeze-$act.txt" bak="$OWUI_DATA.bak-$act"
+  "$UV" pip freeze --python "$VENV_UI/bin/python" > "$frz" 2>/dev/null || {
+    err "could not save the current state - aborting."; rm -f "$frz"; return 1; }
+  if [[ -d "$OWUI_DATA" ]]; then
+    rm -rf "$bak"; mkdir -p "$bak"
+    cp -a "$OWUI_DATA"/webui.db* "$bak"/ 2>/dev/null || true
+  fi
+  st_set owui_prev "$act"
+  info "way back saved: $(basename "$frz") + $(basename "$bak")"
+
+  if ! "$UV" pip install --python "$VENV_UI/bin/python" "open-webui==$tgt" 2>&1 | tail -3; then
+    err "installation failed - restoring the previous state."
+    "$UV" pip install --quiet --python "$VENV_UI/bin/python" -r "$frz" >/dev/null 2>&1
+    return 1
+  fi
+  local was_active=no; systemctl --user is-active open-webui >/dev/null 2>&1 && was_active=yes
+  if [[ "$was_active" == yes ]]; then
+    systemctl --user restart open-webui
+    if ! owui_smoke; then
+      err "the chat UI does not answer after the update - rolling back."
+      rollback_owui "$act"; return 1
+    fi
+    # The registry runs in its OWN venv - check it anyway.
+    curl -sf -m 5 http://127.0.0.1:8081/api/health >/dev/null 2>&1 \
+      || warn "the registry does not answer - please check: llm api status"
+  fi
+  ok "Open WebUI is now $tgt.  (back: llm rollback ui)"
+  # Clean up old snapshots (small, but not unlimited)
+  ls -1t "$LLM_HOME"/.venv-freeze-*.txt 2>/dev/null | tail -n +$((KEEP_BUILDS + 1)) | xargs -r rm -f
+  ls -1dt "$OWUI_DATA".bak-* 2>/dev/null | tail -n +$((KEEP_BUILDS + 1)) | xargs -r rm -rf
+}
+rollback_owui(){ # $1=target version
+  local v="${1:-$(st_get owui_prev)}"
+  [[ -z "$v" ]] && { err "no saved version (llm versions)."; return 1; }
+  local frz="$LLM_HOME/.venv-freeze-$v.txt" bak="$OWUI_DATA.bak-$v"
+  [[ -f "$frz" ]] || { err "no snapshot for $v: $frz"; return 1; }
+  info "rolling Open WebUI back to $v ..."
+  "$UV" pip install --quiet --python "$VENV_UI/bin/python" -r "$frz" || return 1
+  #  The database MUST come back too: the migrations only go forward.
+  if [[ -d "$bak" ]]; then
+    systemctl --user stop open-webui 2>/dev/null || true
+    cp -a "$bak"/webui.db* "$OWUI_DATA"/ 2>/dev/null || true
+    info "database restored from $(basename "$bak")"
+  else
+    warn "no database snapshot - the chat history may cause trouble."
+  fi
+  systemctl --user is-enabled open-webui >/dev/null 2>&1 && systemctl --user start open-webui
+  ok "Open WebUI is back at $v."
+}
+
+# --- ComfyUI: git checkout plus dependencies --------------------------------
+comfy_active(){
+  [[ -d "$COMFY/.git" ]] || return 0
+  git -C "$COMFY" describe --tags --exact-match HEAD 2>/dev/null \
+    || sed -n 's/^__version__ = "\(.*\)"/\1/p' "$COMFY/comfyui_version.py" 2>/dev/null
+}
+#  A shallow clone has no tags - the same trap as with whisper.cpp.
+git_prepare_tags(){ # $1=directory
+  if [[ "$(git -C "$1" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    info "repository is a shallow clone - fetching the full history ..."
+    git -C "$1" fetch --unshallow --quiet origin || return 1
+  fi
+  git -C "$1" fetch --tags --quiet origin
+}
+comfy_smoke(){
+  "$COMFY/venv/bin/python" -c 'import torch
+assert torch.cuda.is_available(), "no GPU visible"
+assert torch.version.hip, "torch without ROCm"' 2>&1 | tail -2
+}
+update_comfy(){ # $1=target tag
+  [[ -d "$COMFY/.git" ]] || { err "ComfyUI is not installed ($COMFY). First: bash bin/install-comfyui.sh"; return 1; }
+  local tgt="${1:-}" act
+  if [[ -z "$tgt" ]]; then upd_refresh; tgt=$(upd_get comfy); fi
+  [[ -z "$tgt" ]] && { err "could not determine the latest version (network?)."; return 1; }
+  act=$(comfy_active)
+  [[ "${act#v}" == "${tgt#v}" ]] && { ok "ComfyUI is up to date ($act)."; return 0; }
+  #  -uno: your own custom_nodes/, models/, output/ are normal and must not block
+  #  the update - only real changes to tracked files should.
+  if [[ -n "$(git -C "$COMFY" status --porcelain -uno 2>/dev/null)" ]]; then
+    err "the ComfyUI repository has changes to tracked files - please clean up first."; return 1
+  fi
+  git_prepare_tags "$COMFY" || { err "git fetch failed."; return 1; }
+  local prev; prev=$(git -C "$COMFY" rev-parse --short HEAD)
+  st_set comfy_prev "$prev"
+  info "ComfyUI $act -> $tgt  (back would be: $prev)"
+  local was_active=no; systemctl --user is-active comfyui >/dev/null 2>&1 && was_active=yes
+  [[ "$was_active" == yes ]] && systemctl --user stop comfyui
+  if ! git -C "$COMFY" checkout --quiet "$tgt"; then
+    err "tag '$tgt' not found."; [[ "$was_active" == yes ]] && systemctl --user start comfyui; return 1
+  fi
+  #  Do NOT rebuild the dependencies here - the installer knows the ROCm index.
+  bash "$LLM_HOME/bin/install-comfyui.sh" --deps-only || {
+    err "dependencies failed - rolling back."
+    git -C "$COMFY" checkout --quiet "$prev"
+    bash "$LLM_HOME/bin/install-comfyui.sh" --deps-only >/dev/null 2>&1
+    [[ "$was_active" == yes ]] && systemctl --user start comfyui
+    return 1; }
+  if ! comfy_smoke; then
+    err "torch no longer sees the GPU - rolling back."
+    rollback_comfy "$prev"; return 1
+  fi
+  #  If the service was off it stays off: ComfyUI holds VRAM while it runs.
+  [[ "$was_active" == yes ]] && systemctl --user start comfyui
+  ok "ComfyUI is now $tgt.  (back: llm rollback comfy)"
+  warn "your custom_nodes may expect a newer ComfyUI API - worth a look."
+}
+rollback_comfy(){ # $1=target ref
+  local v="${1:-$(st_get comfy_prev)}"
+  [[ -z "$v" ]] && { err "no saved version (llm versions)."; return 1; }
+  info "rolling ComfyUI back to $v ..."
+  systemctl --user stop comfyui 2>/dev/null || true
+  git -C "$COMFY" checkout --quiet "$v" || return 1
+  bash "$LLM_HOME/bin/install-comfyui.sh" --deps-only >/dev/null 2>&1
+  ok "ComfyUI is back at $v."
+}
+
+# ============================================================================
+#  Setting up and checking
+# ============================================================================
+cmd_setup(){
+  need_uv || return 1
+  local rc=0
+  #  Two venvs, deliberately separate - see config/requirements-*.txt.
+  local pairs="api:$VENV_API:requirements-api.txt ui:$VENV_UI:requirements-webui.txt"
+  local spec name dir req
+  for spec in $pairs; do
+    name="${spec%%:*}"; dir="${spec#*:}"; req="${dir#*:}"; dir="${dir%%:*}"
+    req="$LLM_HOME/config/$req"
+    [[ -f "$req" ]] || { err "missing: $req"; rc=1; continue; }
+    if [[ ! -x "$dir/bin/python" ]]; then
+      info "creating venv ($name, Python $VENV_PY): $dir"
+      "$UV" venv --python "$VENV_PY" "$dir" >/dev/null || { err "creating the venv failed."; rc=1; continue; }
+    fi
+    info "installing $(basename "$req") into $(basename "$dir") ..."
+    "$UV" pip install --quiet --python "$dir/bin/python" -r "$req" || { err "the installation failed."; rc=1; }
+  done
+  [[ -f "$CONFIG" ]] || { warn "no configuration yet."; echo "  Create it:  llm init"; }
+  [[ -d "$LCPP/.git" || -x "$LLAMA_SERVER" ]] || {
+    warn "llama.cpp is missing."; echo "  Fetch and build:  llm update llama"; }
+  [[ $rc -eq 0 ]] && ok "setup complete.  Next:  llm doctor"
+  return $rc
+}
+
+#  One place that walks through everything that has broken here before, and for
+#  each failure names the command that fixes it.
+cmd_doctor(){
+  local fails=0 warns=0
+  _ok(){   printf '  %b %s\n' "${c_g}ok${c_0}" "$1"; }
+  _warn(){ printf '  %b %s\n' "${c_y}hm${c_0}" "$1"; echo "       -> $2"; warns=$((warns+1)); }
+  _bad(){  printf '  %b %s\n' "${c_r}!!${c_0}" "$1"; echo "       -> $2"; fails=$((fails+1)); }
+
+  info "Tools"
+  local t
+  for t in git curl cmake python3; do
+    command -v "$t" >/dev/null && _ok "$t: $(command -v "$t")" \
+      || _bad "$t is missing" "sudo apt-get install $t"
+  done
+  [[ -x "$UV" ]] && _ok "uv: $UV" || _bad "uv is missing" "curl -LsSf https://astral.sh/uv/install.sh | sh"
+  for t in rocm-smi hipcc; do
+    command -v "$t" >/dev/null && _ok "$t: $(command -v "$t")" \
+      || _bad "$t is missing (ROCm)" "sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs"
+  done
+
+  info "GPU access"
+  local grp; grp=$(id -nG)
+  [[ " $grp " == *" render "* ]] && _ok "group render" || _bad "not in group render" "sudo usermod -aG render,video $USER  (then log out and in)"
+  [[ " $grp " == *" video "*  ]] && _ok "group video"  || _bad "not in group video"  "sudo usermod -aG render,video $USER  (then log out and in)"
+
+  info "Cards"
+  local n; n=$(reg hw 2>/dev/null | grep -c '"smiIndex"')
+  if [[ "${n:-0}" -gt 0 ]]; then
+    _ok "$n compute card(s) detected"
+    reg gpus --table 2>/dev/null | sed 's/^/    /'
+    #  Does llama.cpp see the same number? If not, HIP_VISIBLE_DEVICES is wrong.
+    if [[ -x "$LLAMA_SERVER" ]]; then
+      local seen
+      seen=$(HIP_VISIBLE_DEVICES="$(hw_get HIP_VISIBLE_DEVICES)" "$LLAMA_SERVER" --list-devices 2>/dev/null | grep -c '^  ROCm')
+      [[ "${seen:-0}" -eq "$n" ]] && _ok "llama.cpp sees the same $n card(s)" \
+        || _warn "llama.cpp sees $seen instead of $n card(s)" "llm gpu sync"
+    fi
+    local want have
+    want=$(reg hw 2>/dev/null | sed -n 's/.*"tensorSplit": *"\([^"]*\)".*/\1/p')
+    have=$(sed -n 's/^\s*-ts \([0-9,]*\)\s*$/\1/p' "$CONFIG" 2>/dev/null | head -1)
+    [[ "$want" == "$have" ]] && _ok "-ts matches (${want:-none})" \
+      || _warn "-ts is '${have:-none}', expected '${want:-none}'" "llm gpu sync"
+  else
+    _bad "no compute card detected" "run rocm-smi by hand; check the render/video groups"
+  fi
+  [[ -f "$HW_ENV" ]] && _ok "config/hardware.env present" \
+    || _warn "config/hardware.env missing - services then see every device incl. the iGPU" "llm gpu sync"
+
+  info "Configuration"
+  [[ -f "$CONFIG" ]] && _ok "$CONFIG" || _bad "configuration missing" "llm init"
+  [[ -f "$CONFIG" ]] && { grep -q '@LLM_HOME@' "$CONFIG" \
+    && _bad "the placeholder @LLM_HOME@ is still in the configuration" "move it aside and run  llm init" \
+    || _ok "no placeholders left"; }
+
+  info "Engines"
+  [[ -x "$LLAMA_SERVER" ]] && _ok "llama-server: $(lcpp_active)" || _bad "llama-server is missing" "llm update llama"
+  [[ -x "$SWAP_BIN" ]] && _ok "llama-swap: $(swap_active)" || _bad "llama-swap is missing" "llm update swap"
+
+  info "Python environments"
+  local d v
+  for d in "$VENV_API" "$VENV_UI"; do
+    if [[ -x "$d/bin/python" ]]; then
+      v=$("$d/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)
+      if [[ "$d" == "$VENV_UI" ]] && [[ "$v" != "3.11" && "$v" != "3.12" ]]; then
+        _bad "$(basename "$d"): Python $v - Open WebUI needs >=3.11 and <3.13" "rm -rf $d && llm setup"
+      else
+        _ok "$(basename "$d"): Python $v"
+      fi
+    else
+      _bad "$(basename "$d") is missing" "llm setup"
+    fi
+  done
+  [[ -x "$VENV_API/bin/python" ]] && { "$VENV_API/bin/python" -c 'from mcp.server.fastmcp import FastMCP' 2>/dev/null \
+    && _ok "registry: fastapi and mcp import cleanly" \
+    || _bad "registry imports failed (mcp 2.x is not compatible)" "llm setup"; }
+  [[ -d "$LLM_HOME/venv" ]] && _warn "the old shared venv/ is still here ($(du -sh "$LLM_HOME/venv" 2>/dev/null | cut -f1))" "once everything works:  rm -rf $LLM_HOME/venv"
+
+  info "Services"
+  local u
+  for u in llama-swap llm-api open-webui; do
+    [[ -f "$HOME/.config/systemd/user/$u.service" ]] && _ok "$u installed ($(systemctl --user is-active "$u"))" \
+      || _warn "$u is not installed" "sudo bash $LLM_HOME/setup-system.sh"
+  done
+
+  echo
+  if [[ $fails -eq 0 && $warns -eq 0 ]]; then ok "Everything checks out."
+  elif [[ $fails -eq 0 ]]; then warn "$warns note(s), but nothing broken."
+  else err "$fails problem(s), $warns note(s)."; fi
+  return $((fails > 0))
+}
+
+cmd_update(){
+  local what="${1:-}" ver="${2:-}"
+  case "$what" in
+    llama|llama.cpp) update_llama "$ver";;
+    swap|llama-swap) update_swap  "$ver";;
+    whisper|whisper.cpp) update_whisper "$ver";;
+    ui|webui|open-webui|openwebui) update_owui "$ver";;
+    comfy|comfyui)   update_comfy "$ver";;
+    all)             update_llama; update_swap
+                     #  Each one only if it is installed here at all.
+                     [[ -d "$WCPP/.git" ]]        && update_whisper
+                     [[ -x "$VENV_UI/bin/python" ]] && update_owui
+                     [[ -d "$COMFY/.git" ]]      && update_comfy;;
+    ""|status)
+      upd_refresh
+      local la ls_ lw sw wa ww
+      la=$(lcpp_active); lw=$(upd_get llama); ls_=$(swap_active); sw=$(upd_get swap)
+      wa=$(wcpp_active); ww=$(upd_get whisper)
+      printf "%-12s %-16s %-16s %s\n" "" "active" "latest" ""
+      if [[ -n "$lw" && "$la" != "$lw" ]]; then
+        printf "%-12s %-16s %-16s %s\n" "llama.cpp" "${la:-?}" "$lw" "${c_y}update: llm update llama${c_0}"
+      else printf "%-12s %-16s %-16s %s\n" "llama.cpp" "${la:-?}" "${lw:-?}" "${c_g}up to date${c_0}"; fi
+      if [[ -n "$sw" && "$ls_" != "$sw" ]]; then
+        printf "%-12s %-16s %-16s %s\n" "llama-swap" "${ls_:-?}" "$sw" "${c_y}update: llm update swap${c_0}"
+      else printf "%-12s %-16s %-16s %s\n" "llama-swap" "${ls_:-?}" "${sw:-?}" "${c_g}up to date${c_0}"; fi
+      if [[ -n "$wa" ]]; then
+        if [[ -n "$ww" && "$wa" != "$ww" ]]; then
+          printf "%-12s %-16s %-16s %s\n" "whisper.cpp" "$wa" "$ww" "${c_y}update: llm update whisper${c_0}"
+        else printf "%-12s %-16s %-16s %s\n" "whisper.cpp" "$wa" "${ww:-?}" "${c_g}up to date${c_0}"; fi
+      fi
+      local ua uu ca cu
+      ua=$(owui_active); uu=$(upd_get ui); ca=$(comfy_active); cu=$(upd_get comfy)
+      if [[ -n "$ua" ]]; then
+        if [[ -n "$uu" && "$ua" != "$uu" ]]; then
+          printf "%-12s %-16s %-16s %s\n" "Open WebUI" "$ua" "$uu" "${c_y}update: llm update ui${c_0}"
+        else printf "%-12s %-16s %-16s %s\n" "Open WebUI" "$ua" "${uu:-?}" "${c_g}up to date${c_0}"; fi
+      fi
+      if [[ -n "$ca" ]]; then
+        if [[ -n "$cu" && "${ca#v}" != "${cu#v}" ]]; then
+          printf "%-12s %-16s %-16s %s\n" "ComfyUI" "$ca" "$cu" "${c_y}update: llm update comfy${c_0}"
+        else printf "%-12s %-16s %-16s %s\n" "ComfyUI" "$ca" "${cu:-?}" "${c_g}up to date${c_0}"; fi
+      fi
+      echo
+      echo "  llm update all        update everything (smoke test before each switch)"
+      echo "  llm versions          installed builds and versions"
+      echo "  llm rollback llama    back one version"
+      ;;
+    *) err "llm update [llama|swap|whisper|ui|comfy|all] [version]";;
+  esac
+}
+
+cmd_versions(){
+  local act d n
+  act=$(lcpp_active)
+  info "llama.cpp builds ($LCPP):"
+  if [[ -z "$(lcpp_builds)" ]]; then
+    warn "  no versioned builds yet (the first 'llm update llama' creates one)"
+    [[ -d "$LCPP/build" ]] && echo "  current: build/ (unversioned, HEAD $(git -C "$LCPP" rev-parse --short HEAD 2>/dev/null))"
+  fi
+  for d in $(lcpp_builds); do
+    n=$(basename "$d"); n="${n#build-}"
+    if [[ "$n" == "$act" ]]; then
+      printf "  %b %-18s %6s  %s\n" "${c_g}●${c_0}" "$n" "$(du -sh "$d" 2>/dev/null|cut -f1)" "active"
+    else
+      printf "  ○ %-18s %6s  llm rollback llama %s\n" "$n" "$(du -sh "$d" 2>/dev/null|cut -f1)" "$n"
+    fi
+  done
+  echo
+  info "llama-swap:"
+  printf "  %b %-18s %s\n" "${c_g}●${c_0}" "$(swap_active)" "active"
+  local sa; sa=$(swap_active)
+  for d in "$LLM_HOME"/bin/llama-swap-*; do
+    [[ -f "$d" ]] || continue
+    n=$(basename "$d" | sed 's/^llama-swap-//')
+    [[ "$n" == "$sa" ]] && continue          # the active version is not a fallback
+    printf "  ○ %-18s llm rollback swap\n" "$n"
+  done
+  local ua; ua=$(owui_active)
+  if [[ -n "$ua" ]]; then
+    echo
+    info "Open WebUI (venv: $VENV_UI):"
+    printf "  %b %-18s %6s  %s\n" "${c_g}●${c_0}" "$ua" "$(du -sh "$VENV_UI" 2>/dev/null | cut -f1)" "active"
+    local f v
+    for f in "$LLM_HOME"/.venv-freeze-*.txt; do
+      [[ -f "$f" ]] || continue
+      v=$(basename "$f"); v="${v#.venv-freeze-}"; v="${v%.txt}"
+      [[ "$v" == "$ua" ]] && continue
+      printf "  ○ %-18s %6s  llm rollback ui %s\n" "$v" \
+        "$([[ -d "$OWUI_DATA.bak-$v" ]] && echo "+DB" || echo "-")" "$v"
+    done
+  fi
+  local ca; ca=$(comfy_active)
+  if [[ -n "$ca" ]]; then
+    echo
+    info "ComfyUI ($COMFY):"
+    printf "  %b %-18s %6s  %s\n" "${c_g}●${c_0}" "$ca" "$(du -sh "$COMFY/venv" 2>/dev/null | cut -f1)" "active"
+    local cp; cp=$(st_get comfy_prev)
+    [[ -n "$cp" && "$cp" != "$ca" ]] && printf "  ○ %-18s        llm rollback comfy\n" "$cp"
+  fi
+  if [[ -n "$(wcpp_builds)" ]]; then
+    echo
+    info "whisper.cpp builds ($WCPP):"
+    local wact; wact=$(wcpp_active)
+    for d in $(wcpp_builds); do
+      n=$(basename "$d"); n="${n#build-}"
+      if [[ "$n" == "$wact" ]]; then
+        printf "  %b %-18s %6s  %s\n" "${c_g}●${c_0}" "$n" "$(du -sh "$d" 2>/dev/null|cut -f1)" "active"
+      else
+        printf "  ○ %-18s %6s  llm rollback whisper %s\n" "$n" "$(du -sh "$d" 2>/dev/null|cut -f1)" "$n"
+      fi
+    done
+  fi
+}
+
+cmd_rollback(){
+  local what="${1:-}" ver="${2:-}"
+  case "$what" in
+    llama|llama.cpp)
+      local act d n cand=""
+      act=$(lcpp_active)
+      if [[ -n "$ver" ]]; then cand="$ver"
+      else
+        for d in $(lcpp_builds); do n=$(basename "$d"); n="${n#build-}"
+          [[ "$n" != "$act" ]] && { cand="$n"; break; }; done
+      fi
+      [[ -z "$cand" ]] && { err "no other build available (llm versions)."; return 1; }
+      info "rolling llama.cpp back: $act -> $cand"
+      lcpp_switch "$cand" || return 1
+      git -C "$LCPP" checkout --quiet "$cand" 2>/dev/null && info "source checked out at $cand as well"
+      ;;
+    swap|llama-swap)
+      local b; b=$(ls -1t "$LLM_HOME"/bin/llama-swap-* 2>/dev/null | head -1)
+      [[ -z "$b" ]] && { err "no saved llama-swap version available."; return 1; }
+      local cur; cur=$(swap_active)
+      info "rolling llama-swap back: $cur -> $(basename "$b" | sed 's/^llama-swap-//')"
+      cp -f "$SWAP_BIN" "$LLM_HOME/bin/llama-swap-$cur" 2>/dev/null
+      install -m 755 "$b" "$SWAP_BIN" && { svc_active && svc restart; ok "rolled back."; }
+      ;;
+    whisper|whisper.cpp)
+      local act d n cand=""
+      act=$(wcpp_active)
+      if [[ -n "$ver" ]]; then cand="$ver"
+      else
+        for d in $(wcpp_builds); do n=$(basename "$d"); n="${n#build-}"
+          [[ "$n" != "$act" ]] && { cand="$n"; break; }; done
+      fi
+      [[ -z "$cand" ]] && { err "no other whisper build available (llm versions)."; return 1; }
+      info "rolling whisper.cpp back: $act -> $cand"
+      wcpp_switch "$cand" || return 1
+      git -C "$WCPP" checkout --quiet "$cand" 2>/dev/null && info "source checked out at $cand as well"
+      ;;
+    ui|webui|open-webui|openwebui) rollback_owui "$ver";;
+    comfy|comfyui)  rollback_comfy "$ver";;
+    *) err "llm rollback <llama|swap|whisper|ui|comfy> [version]   (choices: llm versions)";;
+  esac
+}
+
+# --- Determine exactly the GGUF files of one quant (Hugging Face API) -------
+#  Why not simply "*Q4_K_M*.gguf"? Because that also matches UD-Q4_K_M, Q4_K_M_L etc.
+#  A wrong match means downloading twice (e.g. 98 GB instead of 49 GB). So we
+#  match exactly against "<modelname>-<quant>" and understand shards and subdirs.
+hf_files(){ # $1=repo $2=quant  ->  paths, one per line (empty = could not tell)
+  curl -sf "https://huggingface.co/api/models/$1" 2>/dev/null \
+    | python3 -c '
+import json,re,sys
+repo,quant=sys.argv[1],sys.argv[2]
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(1)
+base=repo.split("/")[-1]
+for suf in ("-GGUF","-gguf"):
+    if base.endswith(suf): base=base[:-len(suf)]
+want=base+"-"+quant
+shard=re.compile(r"-\d{5}-of-\d{5}$")
+files=[s["rfilename"] for s in data.get("siblings",[]) if s.get("rfilename","").endswith(".gguf")]
+stem=lambda p: shard.sub("", p.split("/")[-1][:-5])
+hits=[f for f in files if stem(f)==want]                    # flat, possibly sharded
+if not hits: hits=[f for f in files if f.startswith(want+"/")]   # subdirectory layout
+if not hits: hits=[f for f in files if stem(f).endswith("-"+quant)]  # last resort
+# Some publishers use lowercase (ggml-org: qwen3-reranker-0.6b-q8_0.gguf) or a dot
+# as the separator (mradermacher: Model.Q8_0.gguf). Without this nothing is found,
+# and the glob fallback in cmd_add comes up empty on case-sensitive Hugging Face.
+if not hits:
+    q=quant.lower()
+    hits=[f for f in files if stem(f).lower().endswith(("-"+q, "."+q))]
+print("\n".join(sorted(hits)))
+' "$1" "$2" 2>/dev/null
+}
+
+# --- Regenerate the GPU groups from the model entries -----------------------
+#  Models with "--device ROCmN" end up in group gpuN. Groups carry
+#  swap:false + exclusive:false, so two cards can each hold a model AT THE SAME
+#  TIME instead of evicting one another.
+#  The logic lives in lib/llmreg.py so the CLI and the registry API share it.
+sync_groups(){ python3 "$REG" sync-groups; }
+
+# --- Build the name from repo+quant (lowercase, no special characters) ------
+mk_name(){ # $1=repo $2=quant
+  local base="${1##*/}"; base="${base%-GGUF}"; base="${base%-gguf}"
+  printf "%s-%s" "$base" "$2" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | sed 's/-\+/-/g;s/-$//'
+}
+
+cmd_add(){
+  local macro="server" tag="" ctx="8192" extra="" gpu="" ttl="900"
+  while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+      --mtp)      macro="server-mtp";   tag=" [MTP]";   shift;;
+      --ngram)    macro="server-ngram"; tag=" [ngram]"; shift;;
+      # Service models (RAG): stay loaded, otherwise every search after 15 idle
+      # minutes pays for a reload. Override with --ttl.
+      --embed)    macro="server-embed";  tag=" [embed]";  ttl=0; shift;;
+      --rerank)   macro="server-rerank"; tag=" [rerank]"; ttl=0; shift;;
+      --ttl)      ttl="$2"; shift 2;;
+      --gpu)      gpu="$2"; shift 2;;
+      --gpu0)     gpu=0; shift;;
+      --gpu1)     gpu=1; shift;;
+      -c)         ctx="$2"; shift 2;;
+      -t|--temp)  extra="$extra --temp $2"; shift 2;;
+      *) err "unknown option: $1"; return 1;;
+    esac
+  done
+  if [[ -n "$gpu" && "$gpu" != all && "$gpu" != both ]]; then
+    local ncards; ncards=$(reg hw 2>/dev/null | grep -c '"smiIndex"')
+    if ! [[ "$gpu" =~ ^[0-9]+$ ]] || { [[ "$ncards" -gt 0 ]] && [[ "$gpu" -ge "$ncards" ]]; }; then
+      err "--gpu needs a card number 0..$(( ${ncards:-1} - 1 )); detected: ${ncards:-0} card(s) (llm gpu list)"
+      return 1
+    fi
+    # Use only this card; -sm none/-mg 0 disables the macro's -ts.
+    extra="$extra --device ROCm$gpu -sm none -mg 0"
+    # A separate MTP drafter needs the card stated SEPARATELY, or llama-server
+    # aborts with ggml_abort while measuring the draft model.
+    [[ "$macro" == "server-mtp" ]] && extra="$extra --spec-draft-device ROCm$gpu"
+    tag="$tag [GPU$gpu]"
+  elif [[ "$gpu" == all || "$gpu" == both ]]; then
+    gpu=""                                  # across all cards = the macro default
+  fi
+  local repo="${1:-}" quant="${2:-Q4_K_M}"
+  [[ -z "$repo" ]] && { err "usage: llm add [--mtp|--ngram|--embed|--rerank] [--gpu N|all] [-c CTX] [-t TEMP] [--ttl SEC] <hf-repo> [quant] [-- <extra flags>]"; return 1; }
+  # everything after '--' becomes additional llama-server flags
+  if [[ "$quant" == "--" ]]; then           # 'llm add repo -- flags'  (no quant given)
+    quant="Q4_K_M"; shift 2; extra="$extra $*"
+  elif [[ "${3:-}" == "--" ]]; then          # 'llm add repo quant -- flags'
+    shift 3; extra="$extra $*"
+  fi
+
+  local name dir; name="$(mk_name "$repo" "$quant")"; dir="$MODELS/$name"
+  if grep -q "# >>> llm:$name" "$CONFIG" 2>/dev/null; then
+    warn "model '$name' is already configured. (llm rm $name to remove it)"; return 1
+  fi
+
+  info "downloading '$repo' ($quant) to $dir ..."
+  mkdir -p "$dir"
+  # Work out exactly the files of this quant (see hf_files) and fetch only those.
+  local -a inc=(); local f
+  while IFS= read -r f; do [[ -n "$f" ]] && inc+=("$f"); done < <(hf_files "$repo" "$quant")
+  if [[ ${#inc[@]} -eq 0 ]]; then
+    warn "file list not available - falling back to *${quant}*.gguf (may pull variants)."
+    inc=("*${quant}*.gguf")
+  else
+    info "files: ${inc[*]}"
+  fi
+  need_uv || return 1
+  if ! HF_HUB_DISABLE_XET=1 "$UVX" --from huggingface_hub hf download "$repo" \
+        --include "${inc[@]}" --local-dir "$dir" 2>&1 | tail -3; then
+    err "download failed. Check the repo and quant (llm search <name>)."
+    # do not leave an empty directory behind (the API can trigger 'add' too)
+    find "$dir" -type f -name '*.gguf' -o -name '*.bin' 2>/dev/null | grep -q . \
+      || rm -rf "${MODELS:?}/${name:?}"
+    return 1
+  fi
+
+  # Find the GGUF, subdirectories included; with shards sort puts -00001-of- first
+  local file
+  file="$(find "$dir" -type f -name '*.gguf' 2>/dev/null | sort | head -1)"
+  if [[ -z "$file" ]]; then
+    err "no .gguf found for quant '$quant'."
+    warn "check the available quants at: https://huggingface.co/$repo/tree/main"
+    rmdir "$dir" 2>/dev/null; return 1
+  fi
+
+  # --- Pick up a separate MTP drafter automatically ---------------------------
+  #  With --mtp there are two cases:
+  #   a) the MTP heads are built INTO the main model (e.g. Qwen3.6 *-MTP-GGUF)
+  #      -> nothing more needed, 'server-mtp' already sets --spec-type draft-mtp.
+  #   b) the repo ships a SEPARATE drafter (e.g. Gemma 4: MTP/mtp-*.gguf)
+  #      -> fetch the small Q8_0 drafter and append --model-draft.
+  #  We detect (b) automatically and extend the command accordingly.
+  if [[ "$macro" == "server-mtp" ]]; then
+    HF_HUB_DISABLE_XET=1 "$UVX" --from huggingface_hub hf download "$repo" \
+        --include "MTP/*Q8_0*.gguf" --local-dir "$dir" >/dev/null 2>&1 || true
+    local draft; draft="$(ls "$dir"/MTP/*.gguf 2>/dev/null | head -1)"
+    if [[ -z "$draft" ]]; then          # fallback: drafter in the root directory
+      HF_HUB_DISABLE_XET=1 "$UVX" --from huggingface_hub hf download "$repo" \
+          --include "mtp-*.gguf" --local-dir "$dir" >/dev/null 2>&1 || true
+      draft="$(ls "$dir"/mtp-*.gguf 2>/dev/null | head -1)"
+    fi
+    if [[ -n "$draft" ]]; then
+      extra="$extra --model-draft $draft"; tag=" [MTP+drafter]"
+      info "found a separate MTP drafter: ${draft##*/}"
+    fi
+  fi
+
+  # Append the block at the end of the configuration (models: is the last section)
+  cfg_lock
+  {
+    echo ""
+    echo "# >>> llm:$name"
+    echo "  \"$name\":"
+    echo "    cmd: \"\${$macro} -m $file -c $ctx$extra\""
+    echo "    ttl: $ttl"
+    echo "# <<< llm:$name"
+  } >> "$CONFIG"
+
+  sync_groups
+  cfg_unlock
+  # Record the provenance (repo, quant, commit, file checksums) so it stays
+  # traceable WHICH quant from WHICH publisher is sitting here.
+  python3 "$LLM_HOME/lib/llmreg.py" record-add "$name" "$repo" "$quant" >/dev/null 2>&1 \
+    || warn "could not record the provenance (llm meta backfill $name)"
+  ok "added:${tag} ${c_b}$name${c_0}"
+  echo "  file:   $file"
+  echo "  use:    model = \"$name\" against $API/v1"
+  [[ -n "$gpu" ]] && echo "  card:   ROCm$gpu only (group gpu$gpu - runs alongside the other cards)"
+  reload_swap
+}
+
+# --- First run: render the live configuration from the template -------------
+#  The template (config/llama-swap.example.yaml) is in the repository and carries
+#  placeholders; the live configuration belongs to the machine and is therefore
+#  NOT in the repository. Absolute paths are deliberate: llama-swap does not
+#  expand environment variables inside cmd lines, and lib/llmreg.py reads real
+#  file paths out of those same lines (GGUF header, VRAM estimate).
+CONFIG_EXAMPLE="$LLM_HOME/config/llama-swap.example.yaml"
+
+cmd_init(){
+  [[ -f "$CONFIG_EXAMPLE" ]] || { err "template missing: $CONFIG_EXAMPLE"; return 1; }
+  if [[ -f "$CONFIG" ]]; then
+    warn "there is already a configuration: $CONFIG"
+    echo  "  It will NOT be overwritten. Move it aside to start over."
+    return 1
+  fi
+  local wh="${LLM_WHISPER_HOME:-$HOME/whisper.cpp}"
+  sed -e "s|@LLM_HOME@|$LLM_HOME|g" -e "s|@WHISPER_HOME@|$wh|g" \
+      "$CONFIG_EXAMPLE" > "$CONFIG" || return 1
+  chmod 644 "$CONFIG"
+  ok "configuration created: $CONFIG"
+  reg gpu-sync >/dev/null 2>&1 && info "cards detected and written (llm gpu list)"
+  echo "  Next:  llm add <hf-repo> <quant>     then:  llm restart"
+}
+
+#  Without a configuration almost every command is pointless - better to say once
+#  what is missing than to print half an answer.
+require_config(){
+  [[ -f "$CONFIG" ]] && return 0
+  err "no configuration yet: $CONFIG"
+  echo "  Create it once:  llm init" >&2
+  return 1
+}
+
+cmd_rm(){
+  local name="${1:-}"; [[ -z "$name" ]] && { err "usage: llm rm <name>"; return 1; }
+  # 'groups' is the marker block of the GPU groups, not a model.
+  [[ "$name" == "groups" ]] && { err "'groups' is not a model (it is the GPU group block). See docs/FLAGS.md"; return 1; }
+  grep -q "# >>> llm:$name" "$CONFIG" || { err "model '$name' not found. (llm ls)"; return 1; }
+  # Delete the marker block
+  cfg_lock
+  sed -i "/# >>> llm:$name/,/# <<< llm:$name/d" "$CONFIG"
+  ok "removed from the configuration: $name"
+  sync_groups
+  cfg_unlock
+  if [[ -d "$MODELS/$name" ]]; then
+    read -r -p "Delete the model files as well ($MODELS/$name)? [y/N] " a
+    [[ "$a" == [yY] ]] && { rm -rf "${MODELS:?}/$name"; ok "files deleted."; } || info "files kept."
+  fi
+  reload_swap
+}
+
+cmd_ls(){
+  info "Configured models (${CONFIG#$HOME/}):"
+  if ! grep -q "# >>> llm:" "$CONFIG" 2>/dev/null; then
+    warn "  (none yet — add one with 'llm add <repo>')"; return 0
+  fi
+  grep "# >>> llm:" "$CONFIG" | grep -v "llm:groups" | sed 's/# >>> llm:/  - /'
+  echo
+  if svc_active; then
+    info "llama-swap is running. Currently available according to the API:"
+    curl -s "$API/v1/models" 2>/dev/null | grep -o '"id":"[^"]*"' | sed 's/"id":"/    /;s/"$//' || true
+  fi
+}
+
+# ============================================================================
+#  REGISTRY  —  model catalog, provenance, API service
+# ============================================================================
+#  The actual work happens in lib/llmreg.py (one source for the CLI, the HTTP API
+#  and MCP). What follows are only the short commands around it.
+#
+#  Individual models can deviate from the automatic derivation with a
+#  '# pi: ...' line in their marker block - the list of possible lines is in
+#  docs/PI.md, section "When the derivation is wrong".
+cmd_export(){
+  case "${1:-}" in
+    ""|-|--stdout) reg pi-json;;
+    *) err "usage: llm export        (models.json for pi on stdout)"
+       warn "Better: let the agent read everything live from  http://$(hostname -I 2>/dev/null | awk '{print $1}'):8081/api/models  - see docs/PI.md"
+       return 1;;
+  esac
+}
+
+cmd_meta(){
+  case "${1:-}" in
+    backfill) shift; info "working out the provenance of the existing models (Hugging Face)..."; reg backfill "$@";;
+    show)     shift; reg meta "${1:?usage: llm meta show <directory>}";;
+    ""|list)  reg catalog | python3 -c '
+import json,sys
+for m in json.load(sys.stdin):
+    s = m.get("source") or {}
+    print("  %-34s %-42s %s" % (m["id"], s.get("repo") or "(provenance unknown)",
+                                s.get("quant") or ""))';;
+    *) err "usage: llm meta [list|backfill [--force] [directory] [repo]|show <directory>]"; return 1;;
+  esac
+}
+
+cmd_api(){
+  case "${1:-status}" in
+    token) info "Token for write access (config/api-token):"; reg token;;
+    url)   local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+           echo "Catalog : http://$ip:8081/api/models"
+           echo "MCP     : http://$ip:8081/mcp"
+           echo "Docs    : http://$ip:8081/docs";;
+    # Ready-made text for setting up a client machine - once per machine, after
+    # which the agent fetches everything itself.
+    client)
+           local ip tok; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; tok="$(reg token)"
+           cat <<EOF
+${c_b}Once on the client machine - for the pi agent:${c_0}
+
+  pi install $LLM_REPO_URL
+  export LLM_BOX_URL=http://$ip:8081
+
+  ${c_y}# only needed if the agent may also CHANGE things (card, context, load):${c_0}
+  echo '{"url": "http://$ip:8081", "token": "$tok"}' > ~/.pi/agent/llm-box.json
+
+  ${c_y}# leftovers, if the server used to be configured there by hand:${c_0}
+  mv ~/.pi/agent/models.json ~/.pi/agent/models.json.old
+  # and delete the key "enabledModels" in ~/.pi/agent/settings.json -
+  # old model names in there otherwise show up as "unavailable".
+
+${c_b}Only if you also use Claude Code there:${c_0}
+
+  claude mcp add --transport http llm-box http://$ip:8081/mcp \\
+    --header "X-LLM-Token: $tok"
+
+${c_b}Check:${c_0}  pi --list-models   -> only the provider 'llm-box', no warnings
+${c_b}Updating later:${c_0}  pi update --extensions   (the extension only; the model
+                 catalog keeps itself current)
+
+${c_y}Note:${c_0} this only works if port 8081 is reachable from that machine.
+      The services ship bound to 127.0.0.1 - see SECURITY.md.
+
+Details and troubleshooting: docs/PI.md
+EOF
+           ;;
+    *)     svc_ctl llm-api "${1:-status}" "registry API";;
+  esac
+}
+
+cmd_search(){
+  local total cards
+  cards=$(reg hw 2>/dev/null | grep -c '"smiIndex"')
+  total=$(reg gpus 2>/dev/null | python3 -c '
+import json,sys
+try: print(int(sum(c.get("vramTotalBytes") or 0 for c in json.load(sys.stdin))/2**30))
+except Exception: print("")' 2>/dev/null)
+  local per
+  per=$(reg gpus 2>/dev/null | python3 -c '
+import json,sys
+try:
+    cs=json.load(sys.stdin); print(int((cs[0].get("vramTotalBytes") or 0)/2**30))
+except Exception: print("")' 2>/dev/null)
+  cat <<EOF
+${c_b}Finding GGUF models:${c_0}
+  1) Search https://huggingface.co/models?library=gguf for '${1:-<name>}'.
+  2) Publishers with good ready-made GGUFs: ${c_y}unsloth${c_0}, ${c_y}bartowski${c_0}, ${c_y}ggml-org${c_0}
+  3) Copy the repo id (e.g. 'unsloth/Qwen3-8B-GGUF') and run:
+       ${c_g}llm add unsloth/Qwen3-8B-GGUF Q4_K_M${c_0}
+
+  Rule of thumb for quants (this machine: ${cards:-?} card(s), ${total:-?} GB VRAM total):
+    Q4_K_M = good default   |   Q5_K_M/Q6_K = better quality, larger
+    A model needs roughly the size of its file. Up to about ${per:-?} GB it fits on
+    ONE card (so --gpu N is possible), up to about ${total:-?} GB across all of them.
+    'llm add' checks the real numbers from the GGUF header before writing anything.
+EOF
+}
+
+case "${1:-}" in
+  # Models
+  init)    cmd_init;;
+  setup)   cmd_setup;;
+  doctor)  cmd_doctor;;
+  add)     require_config || exit 1; shift; cmd_add "$@";;
+  rm)      shift; cmd_rm "$@";;
+  ls|list) require_config || exit 1; cmd_ls;;
+  search)  shift; cmd_search "$@";;
+  edit)    require_config || exit 1; "${EDITOR:-nano}" "$CONFIG"; warn "do not forget:  llm llama restart";;
+  export|pi) shift; cmd_export "$@";;
+  meta)    shift; cmd_meta "$@";;
+  api)     shift; cmd_api "$@";;
+  speed|predict|mtp) cmd_speed;;
+  update)   shift; cmd_update "$@";;
+  versions) cmd_versions;;
+  rollback) shift; cmd_rollback "$@";;
+
+  # Individual services
+  llama|llm|api)   shift; svc_ctl llama-swap "${1:-status}" "LLM API";;
+  comfy|comfyui)   shift; svc_ctl comfyui    "${1:-status}" "ComfyUI";;
+  ui|webui|chat)   shift; svc_ctl open-webui "${1:-status}" "chat UI";;
+
+  # Shorthands for the LLM API
+  start)   svc_ctl llama-swap on      "LLM API";;
+  stop)    svc_ctl llama-swap off     "LLM API";;
+  restart) svc_ctl llama-swap restart "LLM API";;
+  logs)    journalctl --user -u "$SERVICE" -n 60 -f;;
+
+  # Everything on / everything off
+  on)      info "starting the LLM API + registry + chat UI ..."; systemctl --user start llama-swap llm-api open-webui 2>/dev/null; ok "on. (ComfyUI separately: llm comfy on)";;
+  off)     info "Stopping ALL services (the GPUs become free) ..."; systemctl --user stop comfyui open-webui llm-api llama-swap 2>/dev/null; ok "Everything off.";;
+
+  # Overview / monitoring
+  status|st) cmd_dash;;
+  gpu)     case "${2:-}" in
+             list)  reg gpus --table;;
+             sync)  if [[ "${3:-}" == "--dry-run" ]]; then
+                      reg gpu-sync --dry-run | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["diff"] or "  Configuration already matches the hardware (%d card(s), -ts %s)." % (d["cards"], d["tensorSplit"] or "none"))'
+                    else
+                      cfg_lock; reg gpu-sync; cfg_unlock
+                      ok "configuration and config/hardware.env brought in line with the hardware."
+                      warn "for the services to see it:  llm restart"
+                    fi;;
+             ""|show) rocm-smi;;
+             *)     err "llm gpu [list|sync [--dry-run]]";;
+           esac;;
+  watch)   command -v watch >/dev/null && watch -n 2 rocm-smi || { warn "'watch' is missing"; rocm-smi; };;
+  ps)      curl -s "$API/running" 2>/dev/null || curl -s "$API/v1/models" 2>/dev/null; echo;;
+  url)     printf 'API     : http://%s:8080/v1\n' "$PUBLIC_HOST"
+           printf 'Chat    : http://%s:3000\n'    "$PUBLIC_HOST"
+           printf 'Images  : http://%s:8188\n'    "$PUBLIC_HOST"
+           printf 'Registry: http://%s:8081/api/models  (agents, MCP)\n' "$PUBLIC_HOST";;
+
+  ""|help|-h|--help) usage;;
+  *) err "unknown command: $1"; echo; usage; return 2 2>/dev/null || exit 2;;
+esac

@@ -1,0 +1,12 @@
+[Unit]
+Description=Enable Wake-on-LAN on %i (Magic Packet)
+After=network.target
+
+[Service]
+# %i is the network adapter from the unit name, e.g. 'wol@eth0'.
+# That way the adapter name is no longer part of the filename.
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -s %i wol g
+
+[Install]
+WantedBy=multi-user.target

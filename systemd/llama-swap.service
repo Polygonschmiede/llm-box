@@ -1,0 +1,22 @@
+# setup-system.sh renders this file into ~/.config/systemd/user/ and fills in the
+# repository path and the listen address on the way (LLM_HOME, LLM_BIND - the
+# default is 127.0.0.1, see SECURITY.md). Copying it by hand leaves the
+# placeholders in place. Local changes belong in a drop-in, because the next run
+# of that script overwrites the rendered copy:  systemctl --user edit <unit>
+[Unit]
+Description=llama-swap — OpenAI-compatible LLM proxy (llama.cpp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Which cards are visible is detected by 'llm gpu sync' and written there, so
+# this unit stays machine-independent. The '-' means: if the file is missing the
+# service still starts (and ggml then sees every device, iGPU included).
+# 'llm doctor' reports that.
+EnvironmentFile=-@LLM_HOME@/config/hardware.env
+ExecStart=@LLM_HOME@/bin/llama-swap --config @LLM_HOME@/config/llama-swap.yaml --listen @LLM_BIND@:8080
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

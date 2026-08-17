@@ -1,0 +1,13 @@
+# Registry (bin/llm-api.py, port 8081) - the HTTP catalog and MCP for agents.
+#
+# Deliberately separate from the chat UI's environment: Open WebUI pulls in over
+# 500 packages, and an upgrade there moves fastapi/pydantic/mcp. With both in one
+# environment, an 'llm update ui' could take every agent offline.
+# lib/llmreg.py itself needs nothing but the standard library.
+fastapi
+uvicorn
+
+# mcp 2.0 renamed 'mcp.server.fastmcp' to 'mcp.server.mcpserver' - bin/llm-api.py
+# imports FastMCP and does not start with 2.x. Until that import is migrated, the
+# 1.x series is required.
+mcp>=1.27,<2

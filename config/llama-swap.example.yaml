@@ -1,0 +1,159 @@
+# ============================================================================
+#  llama-swap configuration  —  ONE OpenAI-compatible endpoint for every model
+# ============================================================================
+#  Docs: docs/MODELS.md  |  every flag explained: docs/FLAGS.md
+#
+#  How it works:
+#   - "macros" = the long llama-server commands live HERE, exactly once.
+#   - "models" = each model is a short block that references a macro.
+#   - You do NOT add models by hand; use:  llm add <repo> <quant>
+#     (which appends a block at the end of this file).
+#
+#  THIS FILE IS THE TEMPLATE. 'llm init' substitutes @LLM_HOME@/@WHISPER_HOME@
+#  and writes config/llama-swap.yaml from it — that one belongs to the machine
+#  and is therefore not in the repository.
+#
+#  Endpoint afterwards:  http://<server-ip>:8080/v1   ('llm url' prints it)
+# ============================================================================
+
+healthCheckTimeout: 300          # seconds to wait for a model to come up
+logLevel: info
+
+macros:
+  # --- plain server (the default for most models) ---------------------------
+  server: >
+    @LLM_HOME@/llama.cpp/build/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on --no-webui --jinja
+    -ts 1,1
+
+  # --- MTP / multi-token prediction -----------------------------------------
+  #  Uses the MTP heads INSIDE the main model (only on MTP-capable models:
+  #  Qwen3.x, DeepSeek V3/R1, Gemma 4 ...). Measured 1.4-2x faster.
+  #  The GGUF has to contain the MTP tensors (see docs/FLAGS.md).
+  server-mtp: >
+    @LLM_HOME@/llama.cpp/build/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on --no-webui --jinja
+    --spec-type draft-mtp
+    -ts 1,1
+
+  # --- n-gram speculation (universal, needs NO extra model) -----------------
+  #  Strongest on code and repetitive text, and works with ANY model.
+  #  When in doubt, this variant is always safe.
+  server-ngram: >
+    @LLM_HOME@/llama.cpp/build/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on --no-webui --jinja
+    --spec-type ngram-simple --spec-draft-n-max 16
+    -ts 1,1
+
+  # --- embedding (text -> vector, for RAG / knowledge bases) ----------------
+  #  NOT a chat model. Serves /v1/embeddings. Embedding models compute
+  #  non-causally: -b/-ub must be >= the context or the server will not start.
+  server-embed: >
+    @LLM_HOME@/llama.cpp/build/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on --no-webui --embedding -b 8192 -ub 8192
+
+  # --- reranking (sorts RAG hits by real relevance) -------------------------
+  #  Serves /v1/rerank. Needs a reranker model - see docs/FLAGS.md, the GGUF
+  #  has to carry cls.output.weight and a rerank chat template.
+  server-rerank: >
+    @LLM_HOME@/llama.cpp/build/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on --no-webui --embedding --pooling rank --reranking -b 8192 -ub 8192
+
+# ============================================================================
+#  GPU GROUPS  —  maintained automatically by 'llm add --gpu N' / 'llm gpu sync'
+# ============================================================================
+#  Models with  --device ROCmN  end up in group gpuN.
+#   swap: false      -> models in the same group do not evict each other
+#   exclusive: false -> and do not evict anything from other groups
+#  Only this lets two cards each hold a model at the same time. Ungrouped
+#  (large) models use every card and unload the pinned ones while they run -
+#  that is intended.  DO NOT edit by hand:
+# >>> llm:groups
+# <<< llm:groups
+
+# ============================================================================
+#  MODELS  ('models' stays the LAST section — 'llm add' appends at the bottom)
+# ============================================================================
+models:
+
+# --- From here on 'llm add' / 'llm rm' manage the entries automatically. ----
+#
+#  PROVEN ENTRIES, all commented out (= inactive).
+#  These are settings that were measured to work well on 2x Radeon AI PRO R9700
+#  (32 GB each), including the MTP flags. Take a block as a reference, download
+#  the model with 'llm add <hf-repo> <quant>' and compare. Un-commenting alone
+#  does NOT work: without the matching GGUF file llama-swap will not start.
+#
+#  An entry looks like this:
+#    "gemma-3-4b":
+#      cmd: "${server} -m @LLM_HOME@/models/gemma-3-4b/gemma-3-4b-it-Q4_K_M.gguf -c 8192"
+#      ttl: 900      # unload after 900s without use (frees VRAM); 0 = never
+
+
+
+# --- qwen3.6-35b-a3b-mtp-q4_k_m ---
+#  "qwen3.6-35b-a3b-mtp-q4_k_m":
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.6-35b-a3b-mtp-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -c 200000 --spec-draft-n-max 2"
+#    ttl: 900
+
+
+
+
+# --- qwen3-coder-next-ud-q4_k_m ---
+#  "qwen3-coder-next-ud-q4_k_m":
+#    cmd: "${server-ngram} -m @LLM_HOME@/models/qwen3-coder-next-ud-q4_k_m/Qwen3-Coder-Next-UD-Q4_K_M.gguf -c 65536 --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0 --no-context-shift"
+#    ttl: 900
+
+
+
+# --- qwen3.8-27b-q8_0 ---
+#  "qwen3.8-27b-q8_0":
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q8_0/Qwen3.8-27B-Q8_0.gguf -c 262144 --spec-draft-n-max 2 --parallel 1 -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0"
+#    ttl: 900
+
+# --- qwen3.8-27b-q6_k ---
+#  "qwen3.8-27b-q6_k":
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q6_k/Qwen3.8-27B-Q6_K.gguf -c 131072 --spec-draft-n-max 2 --parallel 1 -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --device ROCm0 -sm none -mg 0 --spec-draft-device ROCm0"
+#    ttl: 900
+
+# --- qwen3-reranker-0.6b-q8_0 ---
+#  "qwen3-reranker-0.6b-q8_0":
+#    cmd: "${server-rerank} -m @LLM_HOME@/models/qwen3-reranker-0.6b-q8_0/qwen3-reranker-0.6b-q8_0.gguf -c 8192 --device ROCm1 -sm none -mg 0"
+#    ttl: 0
+
+# --- whisper-large-v3-turbo ---
+#  "whisper-large-v3-turbo":
+#    cmd: "@WHISPER_HOME@/build/bin/whisper-server -m @LLM_HOME@/models/whisper-large-v3-turbo/ggml-large-v3-turbo-q8_0.bin --host 127.0.0.1 --port ${PORT} --request-path /v1/audio --inference-path /transcriptions -l auto -t 4"
+#    env:
+#      - "HIP_VISIBLE_DEVICES=1"
+#    checkEndpoint: "/v1/audio/health"
+#    ttl: 900
+
+# --- qwen3.5-4b-q4_k_m ---
+#  "qwen3.5-4b-q4_k_m":
+#    cmd: "${server} -m @LLM_HOME@/models/qwen3.5-4b-q4_k_m/Qwen3.5-4B-Q4_K_M.gguf -c 8192 --device ROCm1 -sm none -mg 0 -rea off"
+#    ttl: 900
+#  # pi: skip          # service model (titles/tags) - not useful in an agent
+
+# --- whisper-large-v3-turbo-german ---
+#  "whisper-large-v3-turbo-german":
+#    cmd: "@WHISPER_HOME@/build/bin/whisper-server -m @LLM_HOME@/models/whisper-large-v3-turbo-german/ggml-model.bin --host 127.0.0.1 --port ${PORT} --request-path /v1/audio --inference-path /transcriptions -l de -t 4"
+#    env:
+#      - "HIP_VISIBLE_DEVICES=1"
+#    checkEndpoint: "/v1/audio/health"
+#    ttl: 900
+
+# --- qwen3-embedding-4b-q8_0 ---
+#  "qwen3-embedding-4b-q8_0":
+#    cmd: "${server-embed} -m @LLM_HOME@/models/qwen3-embedding-4b-q8_0/Qwen3-Embedding-4B-Q8_0.gguf -c 8192 --device ROCm1 -sm none -mg 0"
+#    ttl: 0
+
+# --- gemma-4-26b-a4b-it-ud-q4_k_xl ---
+#  "gemma-4-26b-a4b-it-ud-q4_k_xl":
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/gemma-4-26b-a4b-it-ud-q4_k_xl/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -c 65536 --mmproj @LLM_HOME@/models/mmproj-gemma-4-26b/mmproj-F16.gguf --model-draft @LLM_HOME@/models/gemma-4-26b-a4b-it-ud-q4_k_xl/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
+#    ttl: 900

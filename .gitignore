@@ -1,0 +1,58 @@
+# ============================================================================
+#  Not in the repository: large, downloaded, machine-specific or runtime things.
+#  What is tracked is the configuration template, the scripts and the docs.
+# ============================================================================
+
+# Model files (GGUFs, often tens of GB) — restore with 'llm add'
+models/
+
+# Python environments — recreate with 'llm setup'
+venv/
+venv-api/
+venv-webui/
+
+# Open WebUI runtime data (database, chats, possibly API keys) — do NOT share
+openwebui-data/
+openwebui-data.bak-*
+
+# Prebuilt binaries (release downloads, not source)
+bin/llama-swap
+bin/llama-swap-*
+
+# The inference engines are not shipped: 'llm update llama' / 'llm update whisper'
+# fetch and build them, or put a symlink here pointing at your own clone.
+/llama.cpp
+/whisper.cpp
+
+# Caches and compiled files
+__pycache__/
+*.pyc
+.cache/
+*.log
+
+# Key for write access to the registry API (machine-specific)
+config/api-token
+
+# Live configuration: rendered from config/llama-swap.example.yaml by 'llm init',
+# contains absolute paths of this machine.
+config/llama-swap.yaml
+
+# Lock file for concurrent configuration changes (runtime)
+config/.llama-swap.lock
+
+# Written by 'llm gpu sync' — belongs to this machine
+config/hardware.env
+config/comfyui.env
+
+# Update cache, rollback state, build and smoke logs (runtime)
+.update-cache
+.update-state
+.venv-freeze-*.txt
+.smoke.log
+.build-*.log
+
+# npm leftovers, in case someone builds the pi extension here
+node_modules/
+
+# Local editor/agent settings (contain paths and addresses of this machine)
+.claude/settings.local.json

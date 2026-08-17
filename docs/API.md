@@ -1,0 +1,213 @@
+# The registry API — the server tells agents what exists
+
+Port **8081**, next to the actual LLM API on 8080. Any agent — pi, Claude Code, a
+script — asks here **which models exist right now, how they are configured, where
+they came from** and what is free on the cards. And it can change them without
+logging in.
+
+Nothing is exported or cached: every response is built on the spot from
+`config/llama-swap.yaml`, the provenance files and llama-swap's live state. A deleted
+model is gone immediately; a moved model is moved immediately.
+
+```bash
+llm api status | on | off | restart | logs
+llm api url        # the addresses
+llm api token      # the key for making changes
+llm api client     # ready-made setup line to paste on a client machine
+```
+
+## Reading
+
+| Endpoint | Content |
+|---|---|
+| `GET /api/health` | is everything up? versions, model count, what is loaded, **`problems`** (missing files, unknown provenance) |
+| `GET /api/models` | **the catalog** — everything about every model (fields below) |
+| `GET /api/models?slim=true` | short form, good for agents and `jq` |
+| `GET /api/models?role=chat` | filter by role (`chat`, `embed`, `rerank`, `stt`) |
+| `GET /api/models/{id}` | one model |
+| `GET /api/gpus` | per card: VRAM total/used/free, temperature, name, pinned models |
+| `GET /api/state` | what is loaded, on which port, plus the cards |
+| `GET /api/pi-models.json` | the same catalog as a ready `models.json` for pi (fallback) |
+| `GET /api/events` | SSE stream announcing configuration and load-state changes (the pi extension listens on this) |
+| `GET /docs` | interactive OpenAPI interface |
+
+```bash
+curl -s 'http://<server-ip>:8081/api/models?slim=true' | jq -r \
+  '.[] | "\(.id)  \(.gpu)  ctx=\(.contextWindow)  \(.source.repo)"'
+```
+
+## What the catalog contains
+
+```jsonc
+{
+  "id": "qwen3.8-27b-q6_k",
+  "role": "chat",                       // chat | embed | rerank | stt
+  "state": "ready",                     // ready | unloaded | unknown
+  "ttl": 900,                           // idle seconds before unloading (0 = never)
+  "runtime": {
+    "macro": "server-mtp",
+    "contextWindow": 131072,
+    "gpu": { "mode": "single", "device": 0, "group": "gpu0", "via": "flag" },
+    "specDecoding": "mtp",              // mtp | ngram | none
+    "kvCacheQuant": "q8_0", "parallel": 1,
+    "mmproj": "…/mmproj-Qwen3.8-27B-f16.gguf",
+    "cmd": "…"                          // the complete llama-server line
+  },
+  "capabilities": { "chat": true, "tools": true, "vision": true, "reasoning": true, … },
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "files": { "model": { "path": "…", "sizeBytes": 23463130720, "sha256": "…" } },
+  "vram": { "weightsBytes": …, "kvCacheBytes": …, "estimatedBytes": … },
+  "source": { "repo": "bartowski/Qwen3.8-27B-GGUF", "quant": "Q6_K",
+              "revision": "f0eec4a4bb49…", "verified": true,
+              "url": "https://huggingface.co/bartowski/Qwen3.8-27B-GGUF",
+              "addedAt": "2026-08-16T15:02:11Z" },
+  "architecture": { "arch": "qwen35", "layers": 65, "nativeContext": 262144 },
+  "endpoints": { "base": "http://<server-ip>:8080/v1", "path": "/chat/completions" },
+  "pi": { … }                           // ready-made models.json entry for pi
+}
+```
+
+Everything except `source` is **derived** from the `cmd` line and the GGUF header —
+there is no second list that could go stale. `source` comes from
+`models/<name>/.llm-model.json` (see below).
+
+The `slim=true` form additionally carries `gpuMode` and `gpuDevice` as separate
+fields, so an agent does not have to parse the human-readable `gpu` string.
+
+**The VRAM figure is calculated, not guessed:** from the GGUF header (layers, KV
+heads, key/value length) plus the KV quantisation, including the awkward cases —
+hybrid models with `full_attention_interval` (Qwen3.x: only every 4th layer has a KV
+cache) and sliding-window layers (Gemma 4). Cross-check: for Qwen3.8-27B-Q6_K at
+131k context the estimate says 29.3 GB and the measurement is 30.7 GB.
+
+### About card numbers
+
+Two numbering spaces exist and the API always reports the **logical** one — the
+position among the discrete cards, which is also the `N` in `--device ROCmN`.
+`HIP_VISIBLE_DEVICES` uses **absolute** indices as `rocm-smi` counts them, and those
+can differ when a machine has an iGPU. `GET /api/gpus` returns both (`index` and
+`smiIndex`), and the translation happens inside the server so callers never have to
+do it.
+
+## Changing (header `X-LLM-Token`)
+
+The key lives in `config/api-token`, generated on first start, readable only by you:
+`llm api token`.
+
+| Endpoint | Effect |
+|---|---|
+| `PATCH /api/models/{id}` | `gpu`, `contextWindow`, `ttl`, `sampling`, `piOverrides`, `force` |
+| `PATCH /api/models/{id}?dryRun=true` | check and show before/after — change nothing |
+| `POST /api/models/{id}/load` | pull a model into VRAM |
+| `POST /api/unload` | unload everything (llama-swap only knows all-or-nothing) |
+| `POST /api/models` | fetch a new model from Hugging Face → returns a job |
+| `GET /api/jobs`, `GET /api/jobs/{id}` | progress and log of downloads |
+| `DELETE /api/models/{id}?files=true` | remove a model, optionally with its files |
+
+**Putting a model on one card or on all of them** — exactly the question an agent
+cannot otherwise answer from outside:
+
+```bash
+T=$(ssh <user>@<server-ip> llm api token)
+curl -X PATCH http://<server-ip>:8081/api/models/qwen3.8-27b-q6_k \
+     -H "X-LLM-Token: $T" -H 'Content-Type: application/json' \
+     -d '{"gpu":"both"}'        # "both" | a card number
+```
+
+What happens: `--device ROCmN -sm none -mg 0` (and for MTP models
+`--spec-draft-device ROCmN`) is set or removed, the GPU groups are regenerated, and
+llama-swap restarts. Whisper models steer their card through `HIP_VISIBLE_DEVICES`,
+which the same PATCH handles — translating the logical number you sent into the
+absolute one that variable needs.
+
+**It checks first whether the model fits**, and it checks **per card**, not as a sum:
+with an even tensor split a 30 GB model needs 15 GB on *each* card, so plenty of free
+space on one of them does not make it fit. If it does not, you get `409` in plain
+words:
+
+```
+409 {"detail":"needs about 51.3 GB on all 2 cards, i.e. 25.6 GB per card -
+     card 0 has only 3.3 GB free"}
+```
+
+`{"force": true}` overrides that.
+
+## Provenance: which quant from which publisher
+
+Publishers genuinely differ (bartowski with imatrix, unsloth with UD quants,
+mradermacher, ggml-org). So every model directory carries a
+`models/<name>/.llm-model.json`:
+
+```json
+{ "repo": "bartowski/Qwen3.8-27B-GGUF", "revision": "f0eec4a4bb49…", "quant": "Q6_K",
+  "files": [{ "name": "Qwen3.8-27B-Q6_K.gguf", "sizeBytes": 23463130720, "sha256": "7d59…" }],
+  "source": "llm add", "verified": true, "addedAt": "2026-08-16T15:02:11Z" }
+```
+
+- `llm add` writes it automatically.
+- For models that were already there: `llm meta backfill`. The commit hash from the
+  Hugging Face cache is verified against `api/models/{repo}/revision/{sha}` — that is
+  **proof**, not a guess (`verified: true`).
+- `llm meta` shows the overview, `llm meta show <dir>` a single file.
+
+## MCP (Claude Code and others)
+
+The same service speaks MCP over `http://<server-ip>:8081/mcp` (streamable HTTP):
+
+```bash
+claude mcp add --transport http llm-box http://<server-ip>:8081/mcp \
+  --header "X-LLM-Token: $(ssh <user>@<server-ip> llm api token)"
+```
+
+Tools: `list_models`, `get_model`, `gpu_status`, `set_model_config`, `load_model`,
+`unload_models`, `add_model`, `remove_model`, `job_status`. Reading needs no token;
+anything that changes state demands one and says exactly what is missing otherwise.
+
+> **MCP answering `421 Misdirected Request`?** The MCP transport checks the `Host`
+> header as protection against DNS rebinding. Allowed are `localhost`, `127.0.0.1`,
+> the machine's hostname and its LAN addresses, each with and without port. If you
+> reach the server under a different name (a VPN name, `*.local`, a reverse proxy),
+> add it in the unit:
+> `Environment=LLM_API_ALLOWED_HOSTS=myhost:8081,llm.your-tailnet.ts.net:8081` — or
+> `*` to switch the check off. The plain HTTP API (`/api/...`) is unaffected.
+
+pi does not need MCP — it has an extension, see [PI.md](PI.md).
+
+## Security
+
+Reads are unauthenticated by default; writes need the token. If you do not want the
+registry reachable at all: `llm api off` — the LLM API on 8080 keeps running, only
+agents lose the catalog. See [../SECURITY.md](../SECURITY.md) for the full picture.
+
+Input is validated before anything reaches the configuration: `repo` must be
+`publisher/name`, `quant` alphanumeric, `extraFlags` must contain no shell
+metacharacters, and `gpu` must be `both` or a card number that actually exists.
+Otherwise `400`.
+
+## Operating it
+
+- **Firewall.** If `ufw` is active, port 8081 has to be open for your LAN, or nothing
+  arrives from another machine — and it fails *silently*: the service runs, the log
+  says nothing, because the packets never get there. `setup-system.sh` adds the rules;
+  by hand:
+  ```bash
+  sudo ufw allow from <your-subnet> to any port 8081 proto tcp comment 'llm registry'
+  sudo ufw status | grep 8081
+  ```
+  Note that a test **on the server itself** goes over `lo` and succeeds even with the
+  firewall blocking — it proves nothing about reachability from outside.
+- **Service:** `systemd/llm-api.service` (user unit, autostart). Logs: `llm api logs`.
+  `llm on`/`llm off` include it, so after `llm off` the catalog is gone too — which is
+  honest, since nothing could be running anyway.
+- **Python environment:** the registry has its **own** `venv-api/` with just
+  `fastapi`, `uvicorn` and `mcp` (~33 MB). It used to share the 6.4 GB environment
+  with Open WebUI, which meant an Open WebUI upgrade could move `fastapi`/`pydantic`/
+  `mcp` underneath it and take every agent offline. Note that `mcp` is pinned below
+  2.0: mcp 2.0 renamed `mcp.server.fastmcp` to `mcp.server.mcpserver` and the server
+  does not start with it.
+- **During an update** (`llm update llama|swap`) llama-swap is briefly stopped. The
+  registry keeps running, reports `swapUp: false` for that moment, and the catalog
+  stays readable.
+- **Concurrent changes:** `llm add`/`llm rm` on the server and a `PATCH` from outside
+  take the same lock file (`config/.llama-swap.lock`), so no half-written
+  configuration can happen regardless of who gets there first.

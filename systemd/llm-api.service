@@ -1,0 +1,23 @@
+# setup-system.sh renders this file into ~/.config/systemd/user/ and fills in the
+# repository path and the listen address on the way (LLM_HOME, LLM_BIND - the
+# default is 127.0.0.1, see SECURITY.md). Copying it by hand leaves the
+# placeholders in place. Local changes belong in a drop-in, because the next run
+# of that script overwrites the rendered copy:  systemctl --user edit <unit>
+[Unit]
+Description=llm-box registry — model catalog for agents (HTTP + MCP)
+After=network-online.target llama-swap.service
+Wants=network-online.target
+
+[Service]
+# Reads the llama-swap configuration, queries llama-swap and rocm-smi, and may
+# change both. Reading is unauthenticated, writing needs config/api-token.
+# Its own venv (venv-api, ~33 MB), so an Open WebUI upgrade can no longer move
+# the fastapi/mcp versions underneath the registry.
+ExecStart=@LLM_HOME@/venv-api/bin/python @LLM_HOME@/bin/llm-api.py
+Environment=LLM_API_PORT=8081
+Environment=LLM_API_HOST=@LLM_BIND@
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,26 @@
+# setup-system.sh renders this file into ~/.config/systemd/user/ and fills in the
+# repository path and the listen address on the way (LLM_HOME, LLM_BIND - the
+# default is 127.0.0.1, see SECURITY.md). Copying it by hand leaves the
+# placeholders in place. Local changes belong in a drop-in, because the next run
+# of that script overwrites the rendered copy:  systemctl --user edit <unit>
+[Unit]
+Description=Open WebUI — chat interface for the local LLMs
+After=network-online.target llama-swap.service
+Wants=network-online.target
+
+[Service]
+# Backend = llama-swap (ONE endpoint for every model)
+Environment=OPENAI_API_BASE_URL=http://127.0.0.1:8080/v1
+Environment=OPENAI_API_KEY=sk-local
+#  Shipped WITH authentication: the database under DATA_DIR holds every chat and
+#  every API key anyone pastes into one. To open it deliberately, set False here -
+#  see SECURITY.md.
+Environment=WEBUI_AUTH=True
+Environment=DATA_DIR=@LLM_HOME@/openwebui-data
+Environment=HF_HUB_OFFLINE=0
+ExecStart=@LLM_HOME@/venv-webui/bin/open-webui serve --host @LLM_BIND@ --port 3000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

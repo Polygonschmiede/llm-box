@@ -1,0 +1,21 @@
+# setup-system.sh renders this file into ~/.config/systemd/user/ and fills in the
+# repository path and the listen address on the way (LLM_HOME, LLM_BIND - the
+# default is 127.0.0.1, see SECURITY.md). Copying it by hand leaves the
+# placeholders in place. Local changes belong in a drop-in, because the next run
+# of that script overwrites the rendered copy:  systemctl --user edit <unit>
+[Unit]
+Description=ComfyUI — image and video generation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ComfyUI holds VRAM for as long as it runs and therefore gets only ONE card.
+# Which one is decided by 'llm gpu sync' (settable via LLM_COMFY_GPU).
+EnvironmentFile=-@LLM_HOME@/config/comfyui.env
+WorkingDirectory=%h/comfyui
+ExecStart=%h/comfyui/venv/bin/python %h/comfyui/main.py --listen @LLM_BIND@ --port 8188
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
