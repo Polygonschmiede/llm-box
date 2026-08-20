@@ -130,6 +130,60 @@ can differ when a machine has an iGPU. `GET /api/gpus` returns both (`index` and
 `smiIndex`), and the translation happens inside the server so callers never have to
 do it.
 
+## The endpoints the settings page needs
+
+Four reads that nothing exposed before, which is why the configuration had no
+interface but the CLI:
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/versions` | active version, what is newer, and what you can roll back to, per engine. "Newer" comes from the cache `llm update` refreshes — never a live GitHub call, so this never blocks. |
+| `GET /api/config` | the parts of the YAML that are not per-model: the macros, and the groups with their `swap`/`exclusive`/`persistent` flags. llama-swap has no `/api/config` at all, so the eviction semantics were visible only by opening the file. |
+| `GET /api/config/diff` | what `llm gpu sync` would change. An empty diff means the configuration matches the cards. |
+| `GET /api/roles` | the roles as configured. |
+
+And roles became writable, which they were not — `llm role` on the server was
+the only way in, so a UI or a remote agent could see a role and not change it:
+
+| Endpoint | Effect |
+|---|---|
+| `PUT /api/roles/{name}` | create or replace. `?dryRun=true` validates and returns the result without writing. |
+| `DELETE /api/roles/{name}` | remove it. |
+
+```bash
+curl -X PUT http://<server-ip>:8081/api/roles/coder \
+     -H "X-LLM-Token: $T" -H 'Content-Type: application/json' \
+     -d '{"strategy":"spillover","targets":["big-model","small-model"],"spillover":2}'
+```
+
+The same rules the CLI enforces apply: the strategy must be `warm`, `pin` or
+`spillover`, every target must be a configured model, a role's name must not
+collide with a model's, and `spillover` targets have to share one routing group.
+Removing a *model* also prunes it from every role that pointed at it and deletes
+a role left with no targets — llama-swap validates selector targets at startup,
+so leaving one behind would take the endpoint down on the next restart.
+
+## Sessions (so a page need not hold a secret)
+
+`POST /api/session` with `{"token": "..."}` returns an `HttpOnly`,
+`SameSite=Strict` cookie that counts as the token for writes. `GET /api/session`
+reports `canWrite` — the page asks before it draws a single button — and
+`DELETE /api/session` ends it. Sessions live in memory, so a restart of the
+registry ends them all.
+
+The cookie is **not** marked `Secure`: this project serves plain HTTP, and the
+flag would make the cookie unusable rather than the connection safe. Over an
+untrusted network use the SSH tunnel from [REMOTE.md](REMOTE.md).
+
+**Reads stay open by default.** That is deliberate rather than an oversight: the
+pi extension fetches `/api/models`, `/api/gpus`, `/api/health` and `/api/jobs`
+without a token, and [PI.md](PI.md) tells people the token is only for changes.
+Set `LLM_API_REQUIRE_AUTH=1` in the service environment to require it for reads
+too — worth doing if port 8081 is reachable beyond your own machine, since reads
+return every model path, checksum and Hugging Face repo along with live VRAM.
+`/api/health` and `/api/pi-models.json` stay open either way, or nothing could
+check reachability.
+
 ## Changing (header `X-LLM-Token`)
 
 The key lives in `config/api-token`, generated on first start, readable only by you:

@@ -112,6 +112,7 @@ llm api client                 # ready-made setup line for a client machine
 ## How it fits together
 
 ```
+Settings ──►  page       :8081/ui
 Browser  ──►  Open WebUI :3000  ─┐
 Code     ──►  API        :8080  ─┼─►  llama-swap  ──►  loads and swaps the
 Images   ──►  ComfyUI    :8188  ─┘                     right model onto the cards
@@ -121,6 +122,11 @@ Agent    ──►  Registry   :8081  ────►  catalog + configuration +
 llama-swap is the switchboard: clients talk to **one** endpoint, it starts the
 requested model and frees the VRAM again when the model goes unused. Open WebUI
 loads nothing itself — it is just another client of port 8080.
+
+There is a **settings page** at `http://<server>:8081/ui`, served by the
+registry: models with their VRAM budget and provenance, roles, cards, versions —
+and the buttons to change them. It is one file with no build step, and writing
+needs the registry token once.
 
 llama-swap also ships its **own** web interface at `http://<server>:8080/ui`:
 live state, per-request tok/s, logs, GPU charts and a playground. It knows

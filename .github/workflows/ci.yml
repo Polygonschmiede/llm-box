@@ -64,8 +64,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # tests/ui-matrix.sh runs the control page's script under node against a
+      # generated configuration. Without node it skips, which would mean the
+      # page is never checked at all in CI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       # tests/api-matrix.sh skips itself without this; building it means the
-      # registry's 36 checks actually run.
+      # registry's checks actually run.
       - name: registry environment
         run: |
           python -m venv venv-api

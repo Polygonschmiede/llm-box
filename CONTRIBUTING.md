@@ -18,9 +18,15 @@ safe to run on a live server.
 | `tests/config-matrix.sh` | marker blocks, card groups, roles, `patch_model`, the flag primitives |
 | `tests/vram-matrix.sh` | KV cache size for the three layouts, and the per-card fit |
 | `tests/api-matrix.sh` | the registry's HTTP surface, both catalog shapes, auth |
+| `tests/ui-matrix.sh` | that `web/index.html` really renders, and fetches nothing external |
 
 `tests/api-matrix.sh` needs `venv-api`; without it those checks report as
 **skipped** rather than failing. `bash bin/llm setup` builds it.
+`tests/ui-matrix.sh` additionally needs `node`, and skips the same way — it runs
+the page's script under a minimal DOM (`tests/dom-stub.js`) against payloads
+generated from a throwaway `LLM_HOME`. Curling `/ui` would not do: it answers
+200 whatever the JavaScript does, and the first version of that check passed
+while every element on the page read `[object Object]`.
 
 Individual suites run on their own (`bash tests/config-matrix.sh`), which is
 what you want while working on one area.

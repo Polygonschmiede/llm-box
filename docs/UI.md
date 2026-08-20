@@ -6,10 +6,41 @@ contradicts another number.
 
 | Where | Port | Good for | Blind to |
 |---|---|---|---|
+| **The settings page** | `:8081/ui` | what is configured and changing it: models, roles, cards, versions | anything about a request in flight |
 | **llama-swap's own UI** | `:8080/ui` | live state, per-request telemetry, logs, GPU charts, a playground | every setting, and the card list is wrong here (see below) |
 | **Open WebUI** | `:3000` | chatting, RAG, documents | hardware, contexts, load state, provenance |
 | **The registry** | `:8081/docs` | every configured detail, as JSON | it is Swagger, not a dashboard |
 | **`llm` on the server** | — | the whole picture, correctly | one-shot text, no live refresh |
+
+## The settings page
+
+`http://<server-ip>:8081/ui`. One file, no build step, no external requests, same
+origin as the API. Four views:
+
+- **Models** — the table from `llm ls`, and per model: **VRAM estimated against
+  what is free**, per card rather than as a sum (with an even tensor split a
+  30 GB model needs 15 GB on *each* card, and room on one of them does not
+  help); provenance with a link to the Hugging Face repo; the configured context
+  against what the model was trained for; slots with a sentence on what `-kvu`
+  means; which `reasoning_effort` values the template accepts and what this
+  server sends when the client sends nothing; and the full command line.
+  Changing a card, context, slot count or ttl goes through `?dryRun=true` first,
+  so you approve a before/after diff — or read why it would not fit.
+- **Roles** — create, edit and delete, with the **effective context** in front:
+  a role reports the smallest of its targets, so adding one small model shrinks
+  the whole role. That trap is the reason this view exists.
+- **Cards** — the filtered card list with what is pinned where, the `llm gpu
+  sync` diff when the configuration has drifted, and the groups with their
+  `swap`/`exclusive`/`persistent` flags spelled out.
+- **System** — versions with what is newer and what you can roll back to, and
+  links to the other interfaces.
+
+Reading needs nothing. Writing needs the token once: **sign in** exchanges the
+contents of `config/api-token` for an `HttpOnly` session cookie, so the token
+never sits in a form field. `llm api token` prints it on the server.
+
+Deliberately absent: charts, logs, a playground, per-request telemetry. That is
+llama-swap's UI below, and it does it better.
 
 ## llama-swap's UI — the one nobody mentions
 
@@ -61,8 +92,10 @@ llm versions    # installed builds and what you can roll back to
 llm doctor      # everything that can be misconfigured, with the fixing command
 ```
 
-None of that is reachable over HTTP today, which is why the answer to "is there
-a UI for the settings" is currently "the CLI, or Swagger".
+`llm doctor` in particular is still server-side only: what it checks — tools on
+`PATH`, group membership, the venvs, the systemd units — is not meaningful over
+HTTP, so the settings page links to the command rather than pretending to
+replace it.
 
 ## The registry's Swagger page
 

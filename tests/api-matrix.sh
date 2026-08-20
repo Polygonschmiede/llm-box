@@ -35,8 +35,11 @@ add_block "$H" embed  '${server-embed} -m /home/x/models/embed/e.gguf -c 4096 --
 add_block "$H" whisper '/bin/whisper-server -m /home/x/models/w/w.bin --request-path /v1/audio' \
   '    env:
       - "HIP_VISIBLE_DEVICES=1"'
-LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" \
-  pyx "llmreg.set_selector('mix', 'warm', ['big', 'spread'])" >/dev/null
+LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+  pyx "
+llmreg.set_selector('mix', 'warm', ['big', 'spread'])
+#  the group block is generated, not written by hand - the page reads it
+llmreg._write_config(llmreg.sync_groups())" >/dev/null
 printf 'testtoken\n' > "$H/config/api-token"
 
 api(){ # $1=python body with `c` = TestClient, prints what you print
@@ -140,5 +143,89 @@ mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 from fastapi.testclient import TestClient
 r = TestClient(mod.app, raise_server_exceptions=False).get('/api/models')
 print(r.status_code != 500)")"
+
+section "the endpoints the control page needs"
+check "/api/versions"          "200" "$(api "print(c.get('/api/versions').status_code)")"
+check "it names llm-box"       "True" \
+  "$(api "print('llmBox' in c.get('/api/versions').json())")"
+check "/api/config"            "200" "$(api "print(c.get('/api/config').status_code)")"
+check "macros come through"    "True" \
+  "$(api "print('server' in c.get('/api/config').json()['macros'])")"
+check "groups carry persistent" "True" \
+  "$(api "
+g = c.get('/api/config').json()['groups']
+print(all('persistent' in v for v in g.values()) if g else 'no groups')")"
+check "/api/config/diff"       "200" "$(api "print(c.get('/api/config/diff').status_code)")"
+check "/api/roles"             "200" "$(api "print(c.get('/api/roles').status_code)")"
+check "the role is listed"     "mix"  \
+  "$(api "print(' '.join(c.get('/api/roles').json()))")"
+check "/ui is served"          "200" "$(api "print(c.get('/ui').status_code)")"
+check "/ui is html"            "True" \
+  "$(api "print('text/html' in c.get('/ui').headers['content-type'])")"
+check "the index points at it" "/ui" \
+  "$(api "print(c.get('/').json()['ui'])")"
+
+#  Roles were CLI-only until now, which meant a UI could show them and not
+#  change them.
+section "roles over HTTP"
+check "PUT needs the token"    "401" \
+  "$(api "print(c.put('/api/roles/r', json={'strategy':'pin','targets':['big']}).status_code)")"
+check "DELETE needs the token" "401" "$(api "print(c.delete('/api/roles/mix').status_code)")"
+check "an unknown strategy"    "400" \
+  "$(api "print(c.put('/api/roles/r', json={'strategy':'bogus','targets':['big']}, headers=TOK).status_code)")"
+check "targets must be a list" "400" \
+  "$(api "print(c.put('/api/roles/r', json={'strategy':'pin','targets':'big'}, headers=TOK).status_code)")"
+check "an unknown target"      "400" \
+  "$(api "print(c.put('/api/roles/r', json={'strategy':'pin','targets':['ghost']}, headers=TOK).status_code)")"
+check "a bad spillover count"  "400" \
+  "$(api "print(c.put('/api/roles/r', json={'strategy':'spillover','targets':['big','spread'],'spillover':0}, headers=TOK).status_code)")"
+check "a name with a space"    "400" \
+  "$(api "print(c.put('/api/roles/bad name', json={'strategy':'pin','targets':['big']}, headers=TOK).status_code)")"
+check "a name colliding with a model" "400" \
+  "$(api "print(c.put('/api/roles/big', json={'strategy':'pin','targets':['big']}, headers=TOK).status_code)")"
+check "dryRun writes nothing"  "False" \
+  "$(api "
+c.put('/api/roles/probe?dryRun=true', json={'strategy':'pin','targets':['big']}, headers=TOK)
+print('probe' in c.get('/api/roles').json())")"
+check "a real PUT persists"    "True" \
+  "$(api "
+c.put('/api/roles/probe', json={'strategy':'pin','targets':['big']}, headers=TOK)
+print('probe' in c.get('/api/roles').json())")"
+check "and appears as a model" "role" \
+  "$(api "
+c.put('/api/roles/probe', json={'strategy':'pin','targets':['big']}, headers=TOK)
+print(c.get('/api/models/probe').json()['kind'])")"
+check "DELETE removes it"      "False" \
+  "$(api "
+c.put('/api/roles/probe', json={'strategy':'pin','targets':['big']}, headers=TOK)
+c.delete('/api/roles/probe', headers=TOK)
+print('probe' in c.get('/api/roles').json())")"
+check "DELETE of an unknown role" "404" \
+  "$(api "print(c.delete('/api/roles/ghost', headers=TOK).status_code)")"
+
+#  The page exchanges the token for a cookie once, so it never keeps a secret
+#  in a form field.
+section "sessions"
+check "no session, no write"   "False" \
+  "$(api "print(c.get('/api/session').json()['canWrite'])")"
+check "a wrong token"          "401" \
+  "$(api "print(c.post('/api/session', json={'token':'nope'}).status_code)")"
+check "the right token"        "200" \
+  "$(api "print(c.post('/api/session', json={'token':'testtoken'}).status_code)")"
+check "the cookie grants write" "True" \
+  "$(api "
+c.post('/api/session', json={'token':'testtoken'})
+print(c.get('/api/session').json()['canWrite'])")"
+check "and a write goes through" "200" \
+  "$(api "
+c.post('/api/session', json={'token':'testtoken'})
+print(c.patch('/api/models/spread?dryRun=true', json={'ttl': 60}).status_code)")"
+check "signing out revokes it" "401" \
+  "$(api "
+c.post('/api/session', json={'token':'testtoken'})
+c.delete('/api/session')
+print(c.patch('/api/models/big', json={'ttl': 60}).status_code)")"
+check "reads stay open by default" "False" \
+  "$(api "print(c.get('/api/session').json()['readNeedsAuth'])")"
 
 summary

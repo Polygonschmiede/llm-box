@@ -1,0 +1,740 @@
+<!--
+  llm-box control page  —  served by bin/llm-api.py at /ui
+  ===========================================================================
+  One file, no build step, no external requests. That is deliberate: this
+  project installs llama.cpp and two venvs and nothing else, and a page that
+  needed npm would be the only reason to add a toolchain. Same origin as the
+  API, so there is no CORS to configure either.
+
+  What it deliberately does NOT do: charts, logs, a playground, per-request
+  telemetry. llama-swap's own UI on :8080/ui does all of that better, and this
+  page links to it. What lives here is the CONFIGURATION - the half neither
+  llama-swap nor Open WebUI can see (see docs/UI.md).
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-box</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --line: #e4e4e1; --ink: #1b1b19;
+    --dim: #6b6b66; --accent: #2f6f4f; --warn: #8a5a00; --bad: #a33;
+    --code: #f4f4f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --panel: #1e2022; --line: #2f3235; --ink: #e8e8e6;
+      --dim: #9a9a94; --accent: #7fc4a0; --warn: #d8a441; --bad: #e58a86;
+      --code: #14161a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+  header .ver { color: var(--dim); font-size: 12px; }
+  header .grow { flex: 1; }
+  nav { display: flex; gap: 4px; padding: 0 20px; border-bottom: 1px solid var(--line);
+        background: var(--panel); overflow-x: auto; }
+  nav button {
+    background: none; border: 0; border-bottom: 2px solid transparent; color: var(--dim);
+    padding: 9px 12px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+  main { padding: 20px; max-width: 1100px; }
+  section[hidden] { display: none; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin: 26px 0 10px; font-weight: 600; }
+  h2:first-child { margin-top: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          margin-bottom: 10px; }
+  .row { display: flex; gap: 12px; align-items: center; padding: 10px 14px;
+         flex-wrap: wrap; }
+  .row + .body { border-top: 1px solid var(--line); padding: 12px 14px; }
+  .name { font-weight: 600; }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px;
+         border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+  .tag.on { color: var(--accent); border-color: currentColor; }
+  .tag.warn { color: var(--warn); border-color: currentColor; }
+  .tag.bad { color: var(--bad); border-color: currentColor; }
+  .grow { flex: 1; }
+  .dim { color: var(--dim); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { text-align: left; padding: 3px 12px 3px 0; vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; white-space: nowrap; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px;
+        padding: 10px 12px; overflow-x: auto; font-size: 12px; margin: 8px 0 0; }
+  button.act, .act {
+    font: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button.act:hover { border-color: var(--accent); }
+  button.act:disabled { opacity: .45; cursor: not-allowed; }
+  input, select { font: inherit; padding: 4px 7px; border-radius: 6px;
+                  border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  input[type=number] { width: 8.5em; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden;
+         min-width: 120px; flex: 1; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.warn { background: var(--warn); }
+  .bar > i.bad { background: var(--bad); }
+  .note { border-left: 3px solid var(--warn); padding: 8px 12px; margin: 10px 0;
+          background: var(--panel); color: var(--dim); font-size: 13px; }
+  .note.bad { border-left-color: var(--bad); }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+           color: var(--ink); max-width: 640px; width: 92vw; padding: 0; }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog .row { border-bottom: 1px solid var(--line); }
+  dialog .foot { border-top: 1px solid var(--line); justify-content: flex-end; }
+  .fields { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px;
+            align-items: center; padding: 14px; }
+  .err { color: var(--bad); }
+  .ok { color: var(--accent); }
+</style>
+
+<header>
+  <h1>llm-box</h1>
+  <span class="ver" id="ver"></span>
+  <span class="grow"></span>
+  <span id="who" class="ver"></span>
+  <button class="act" id="auth">sign in</button>
+  <button class="act" id="reload">refresh</button>
+</header>
+
+<nav>
+  <button data-tab="models" aria-selected="true">Models</button>
+  <button data-tab="roles">Roles</button>
+  <button data-tab="cards">Cards</button>
+  <button data-tab="system">System</button>
+</nav>
+
+<main>
+  <div id="banner"></div>
+  <section id="tab-models"></section>
+  <section id="tab-roles" hidden></section>
+  <section id="tab-cards" hidden></section>
+  <section id="tab-system" hidden></section>
+</main>
+
+<dialog id="dlg"></dialog>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const el = (t, a = {}, ...kids) => {
+  const n = document.createElement(t);
+  for (const [k, v] of Object.entries(a)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false)
+    n.append(k.nodeType ? k : document.createTextNode(k));
+  return n;
+};
+const gb = b => (b || 0) / 1024 ** 3;
+const fmt = (b, d = 1) => gb(b).toFixed(d) + " GB";
+const num = n => n === null || n === undefined ? "–" : n.toLocaleString("en-US");
+
+let S = { models: [], gpus: [], versions: null, config: null, diff: null,
+          roles: {}, jobs: [], session: { canWrite: false } };
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  const text = await r.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = { detail: text }; }
+  if (!r.ok) throw new Error((body && body.detail) || r.status + " " + r.statusText);
+  return body;
+}
+
+function banner(msg, kind = "bad") {
+  $("#banner").replaceChildren(msg ? el("div", { class: "note " + kind }, msg) : "");
+}
+
+async function load() {
+  const want = {
+    session: "/api/session", models: "/api/models", gpus: "/api/gpus",
+    versions: "/api/versions", config: "/api/config", diff: "/api/config/diff",
+    roles: "/api/roles", jobs: "/api/jobs",
+  };
+  const problems = [];
+  await Promise.all(Object.entries(want).map(async ([k, p]) => {
+    try { S[k] = await api(p); } catch (e) { problems.push(p + ": " + e.message); }
+  }));
+  //  Reads can be gated (LLM_API_REQUIRE_AUTH) - then everything but /api/health
+  //  needs the session, and saying so beats four identical 401s.
+  banner(problems.length
+    ? (S.session && S.session.readNeedsAuth && !S.session.canWrite
+        ? "Reading needs a session on this server. Use “sign in”."
+        : "Could not read: " + problems.join(" · "))
+    : "");
+  $("#ver").textContent = S.versions ? "v" + S.versions.llmBox : "";
+  $("#who").textContent = S.session.canWrite ? "signed in" : "read only";
+  $("#auth").textContent = S.session.canWrite ? "sign out" : "sign in";
+  render();
+}
+
+// --------------------------------------------------------------------------
+//  Sign in: the token is exchanged for an HttpOnly cookie once, so it never
+//  sits in a form field or in localStorage.
+// --------------------------------------------------------------------------
+$("#auth").onclick = async () => {
+  if (S.session.canWrite) { await api("/api/session", { method: "DELETE" }); return load(); }
+  const d = $("#dlg");
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: "Sign in" })),
+    el("div", { class: "fields" },
+      el("label", { text: "Token", for: "tok" }),
+      el("input", { id: "tok", type: "password", placeholder: "contents of config/api-token",
+                    autocomplete: "off" }),
+      el("span", {}), el("span", { class: "dim",
+        text: "On the server: llm api token" })),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "authErr" }),
+      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "act", onclick: submit }, "sign in")));
+  d.showModal();
+  $("#tok").focus();
+  $("#tok").onkeydown = e => { if (e.key === "Enter") submit(); };
+  async function submit() {
+    try {
+      await api("/api/session", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: $("#tok").value }) });
+      d.close(); load();
+    } catch (e) { $("#authErr").textContent = e.message; }
+  }
+};
+$("#reload").onclick = () => load();
+
+for (const b of document.querySelectorAll("nav button")) b.onclick = () => {
+  for (const o of document.querySelectorAll("nav button"))
+    o.setAttribute("aria-selected", String(o === b));
+  for (const s of document.querySelectorAll("main section"))
+    s.hidden = s.id !== "tab-" + b.dataset.tab;
+};
+
+// --------------------------------------------------------------------------
+//  A change is always previewed first. Every write goes through
+//  PATCH/PUT ?dryRun=true, whose answer carries the before/after command line
+//  or the reason it does not fit - which is the whole point of having it.
+// --------------------------------------------------------------------------
+async function confirmWrite(title, path, body, method = "PATCH") {
+  const d = $("#dlg");
+  const sep = path.includes("?") ? "&" : "?";
+  let preview, error = null;
+  try {
+    preview = await api(path + sep + "dryRun=true", { method,
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch (e) { error = e.message; }
+  const diff = preview && preview.before && preview.after
+    ? "before:\n  " + preview.before.cmd + "\n\nafter:\n  " + preview.after.cmd
+    : preview ? JSON.stringify(preview.after || preview, null, 2) : "";
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: title })),
+    el("div", { class: "body" },
+      error ? el("div", { class: "note bad" }, error) : el("pre", { text: diff }),
+      preview && preview.fit && preview.fit.ok === false
+        ? el("div", { class: "note" }, preview.fit.reason) : null),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "wErr" }),
+      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "act", disabled: !!error, onclick: apply }, "apply")));
+  d.showModal();
+  async function apply() {
+    try {
+      await api(path, { method, headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body) });
+      d.close(); load();
+    } catch (e) { $("#wErr").textContent = e.message; }
+  }
+}
+
+async function act(path, method = "POST", body = null) {
+  try {
+    await api(path, { method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : null });
+    load();
+  } catch (e) { banner(e.message); }
+}
+
+function render() { models(); roles(); cards(); system(); }
+
+// ==========================================================================
+//  Models
+// ==========================================================================
+function models() {
+  const w = S.session.canWrite;
+  const list = S.models.filter(m => m.kind !== "role");
+  const cardUsed = {};
+  for (const c of S.gpus) cardUsed[c.index] = c;
+  const out = [el("h2", { text: "Models" })];
+  for (const m of list) {
+    const r = m.runtime || {}, g = r.gpu || {}, v = m.vram || {};
+    const loaded = m.state === "ready" || m.state === "loading";
+    const card = g.device !== null && g.device !== undefined ? "card " + g.device
+      : g.mode === "both" ? "all cards" : "–";
+    //  A model pinned to a card but in no group is evicted by anything else -
+    //  the same warning llm ls prints with a bang.
+    const ungrouped = g.device !== null && g.device !== undefined && !g.group;
+    out.push(el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("span", { class: "name", text: m.id }),
+        el("span", { class: "tag" + (loaded ? " on" : ""), text: m.state }),
+        el("span", { class: "tag", text: m.role }),
+        el("span", { class: "tag" + (ungrouped ? " warn" : ""),
+                     title: ungrouped ? "pinned but in no group: anything else evicts it" : "",
+                     text: card + (ungrouped ? " !" : "") }),
+        r.contextWindow ? el("span", { class: "tag", text: num(r.contextWindow) + " ctx" }) : null,
+        r.parallel ? el("span", { class: "tag",
+          title: "requests served at the same time" + (r.kvUnified ? "; one shared KV pool" : ""),
+          text: r.parallel + " slots" + (r.kvUnified ? "*" : "") }) : null,
+        el("span", { class: "grow" }),
+        el("button", { class: "act", onclick: e => {
+          const b = e.target.closest(".card").querySelector(".body");
+          b.hidden = !b.hidden;
+        } }, "details"),
+        w ? el("button", { class: "act", onclick: () => loaded
+            ? act("/api/models/" + encodeURIComponent(m.id) + "/unload")
+            : act("/api/models/" + encodeURIComponent(m.id) + "/load") },
+          loaded ? "unload" : "load") : null),
+      el("div", { class: "body", hidden: true }, modelBody(m, cardUsed, w))));
+  }
+  if (w) out.push(el("div", { class: "row" },
+    el("button", { class: "act", onclick: addModel }, "+ fetch a model from Hugging Face")));
+  if (S.jobs && S.jobs.length) {
+    out.push(el("h2", { text: "Downloads" }));
+    for (const j of S.jobs) out.push(el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("span", { class: "name", text: (j.argv || []).slice(1).join(" ") || j.kind }),
+        el("span", { class: "tag" + (j.state === "failed" ? " bad"
+          : j.state === "done" ? " on" : " warn"), text: j.state }),
+        el("span", { class: "grow" }),
+        el("button", { class: "act", onclick: () => jobLog(j.id) }, "log"))));
+  }
+  $("#tab-models").replaceChildren(...out);
+}
+
+function modelBody(m, cardUsed, w) {
+  const r = m.runtime || {}, v = m.vram || {}, src = m.source || {}, a = m.architecture || {};
+  const g = r.gpu || {};
+  const rows = [];
+  const add = (k, val) => val !== null && val !== undefined && val !== "" &&
+    rows.push(el("tr", {}, el("th", { text: k }), el("td", {}, val)));
+
+  //  Estimated against measured. The registry knows what a model needs and
+  //  /api/gpus knows what is free; nothing put the two side by side, and
+  //  "will this fit next to what is already loaded" was answerable only
+  //  inside llm add.
+  if (v.estimatedBytes) {
+    //  What counts is the share PER CARD, not the sum. With an even tensor
+    //  split a 30 GB model needs 15 GB on each of two cards, and plenty of
+    //  room on one of them does not help - the same mistake check_fit() had.
+    const pinned = g.device !== null && g.device !== undefined ? cardUsed[g.device] : null;
+    const over = pinned ? [pinned] : S.gpus;
+    const share = v.estimatedBytes / Math.max(1, over.length);
+    const tight = over.reduce((a, c) =>
+      !a || (c.vramFreeBytes || 0) < (a.vramFreeBytes || 0) ? c : a, null);
+    const frac = tight && tight.vramTotalBytes ? share / tight.vramTotalBytes : 0;
+    add("VRAM", el("div", { class: "row", style: "padding:0;gap:10px" },
+      el("span", { class: "mono", text: fmt(v.estimatedBytes) + " estimated" }),
+      el("span", { class: "bar" }, el("i", {
+        class: frac > .95 ? "bad" : frac > .85 ? "warn" : "",
+        style: "width:" + Math.min(100, frac * 100).toFixed(1) + "%" })),
+      el("span", { class: "dim mono", text: pinned
+        ? "of " + fmt(pinned.vramTotalBytes, 0) + " on card " + pinned.index
+          + " · " + fmt(pinned.vramFreeBytes) + " free right now"
+        : fmt(share) + " on each of " + over.length + " cards · tightest is card "
+          + (tight ? tight.index + " with " + fmt(tight.vramFreeBytes) + " free" : "?") })));
+    add("", el("span", { class: "dim",
+      text: "weights " + fmt(v.weightsBytes) + " + KV " + fmt(v.kvCacheBytes)
+            + " + 8 % for compute buffers"
+            + (frac > 1 ? " — does not fit as things stand" : "") }));
+  }
+  add("Context", r.contextWindow ? num(r.contextWindow)
+      + (a.nativeContext && a.nativeContext !== r.contextWindow
+         ? "  (the model was trained for " + num(a.nativeContext) + ")" : "") : null);
+  add("Slots", r.parallel ? r.parallel + (r.kvUnified
+      ? " — the context above is one shared pool, so a single request may use all of it"
+      : " — each slot gets a hard " + num(Math.floor(r.contextWindow / r.parallel)) + " share")
+      : null);
+  add("KV cache", r.kvCacheQuant || "f16 (unquantised)");
+  add("Token prediction", r.specDecoding === "none" ? null : r.specDecoding);
+  //  Skip it for models that do not think: "no fixed set of values" is noise
+  //  next to a model whose capabilities say reasoning: false.
+  if (r.reasoningEffort && ((m.capabilities || {}).reasoning
+      || r.reasoningEffort.serverDefault || r.reasoningEffort.accepts)) {
+    const re = r.reasoningEffort;
+    add("Thinking", el("span", {}, re.accepts
+      ? "accepts " + re.accepts.join(", ")
+      : "no fixed set of values",
+      re.serverDefault ? el("span", { class: "dim",
+        text: " · this server sends " + re.serverDefault + " when the client sends nothing" })
+        : re.templateDefault ? el("span", { class: "dim",
+        text: " · defaults to " + re.templateDefault }) : null,
+      re.preserveThinking === false ? el("span", { class: "dim",
+        text: " · earlier thinking is dropped" }) : null));
+  }
+  add("Idle unload", m.ttl === 0 ? "never" : m.ttl ? m.ttl + " s" : null);
+  add("Group", g.group ? g.group + " (pinned models do not evict each other)" : null);
+  if (src.repo) add("Came from", el("span", {}, el("a", {
+    href: src.url || ("https://huggingface.co/" + src.repo), target: "_blank",
+    rel: "noreferrer noopener" }, src.repo),
+    src.quant ? " · " + src.quant : "",
+    src.revision ? el("span", { class: "dim mono", text: " · " + src.revision.slice(0, 12) }) : null,
+    src.verified ? el("span", { class: "tag on", text: "checksums verified" }) : null));
+  else add("Came from", el("span", { class: "dim",
+    text: "unknown — on the server: llm meta backfill" }));
+  add("Architecture", a.arch ? a.arch + (a.layers ? " · " + a.layers + " layers" : "") : null);
+  if (m.issues && m.issues.length) add("Problems",
+    el("span", { class: "err", text: m.issues.join(" · ") }));
+
+  const body = [el("table", {}, el("tbody", {}, rows)), el("pre", { text: r.cmd || "" })];
+  if (w) {
+    const cards = S.gpus.map(c => String(c.index));
+    body.push(el("div", { class: "row", style: "padding:12px 0 0" },
+      el("span", { class: "dim", text: "change:" }),
+      pick("card", ["both", ...cards], g.mode === "both" ? "both" : String(g.device),
+        val => confirmWrite("Move " + m.id, "/api/models/" + encodeURIComponent(m.id),
+          { gpu: val === "both" ? "both" : Number(val) })),
+      numBox("context", r.contextWindow, val => confirmWrite("Context of " + m.id,
+        "/api/models/" + encodeURIComponent(m.id), { contextWindow: val })),
+      numBox("slots", r.parallel, val => confirmWrite("Slots of " + m.id,
+        "/api/models/" + encodeURIComponent(m.id), { parallel: val })),
+      numBox("ttl", m.ttl, val => confirmWrite("Idle unload of " + m.id,
+        "/api/models/" + encodeURIComponent(m.id), { ttl: val })),
+      el("span", { class: "grow" }),
+      el("button", { class: "act", onclick: () => removeModel(m) }, "remove")));
+  }
+  return body;
+}
+
+function pick(label, opts, cur, onpick) {
+  const s = el("select", { onchange: e => onpick(e.target.value) },
+    ...opts.map(o => el("option", { value: o, selected: o === cur }, o)));
+  return el("label", { class: "dim" }, label + " ", s);
+}
+function numBox(label, cur, onset) {
+  const i = el("input", { type: "number", min: "0", value: cur ?? "" });
+  i.onkeydown = e => { if (e.key === "Enter" && i.value !== "") onset(Number(i.value)); };
+  return el("label", { class: "dim", title: "type a value and press Enter" }, label + " ", i);
+}
+
+function removeModel(m) {
+  const d = $("#dlg");
+  const chk = el("input", { type: "checkbox", id: "delf" });
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: "Remove " + m.id })),
+    el("div", { class: "body" },
+      el("div", {}, "The block goes out of the configuration. Any role pointing at "
+        + "this model loses the target, and a role left with none is removed too."),
+      el("label", { class: "row", style: "padding:10px 0 0" }, chk,
+        " also delete the files on disk"
+        + (m.vram && m.vram.weightsBytes ? " (" + fmt(m.vram.weightsBytes, 0) + ")" : ""))),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "rmErr" }),
+      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "act", onclick: async () => {
+        try {
+          await api("/api/models/" + encodeURIComponent(m.id) + "?files=" + chk.checked,
+                    { method: "DELETE" });
+          d.close(); load();
+        } catch (e) { $("#rmErr").textContent = e.message; }
+      } }, "remove")));
+  d.showModal();
+}
+
+function addModel() {
+  const d = $("#dlg");
+  const f = {};
+  const field = (k, node) => { f[k] = node; return [el("label", { text: k }), node]; };
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: "Fetch a model from Hugging Face" })),
+    el("div", { class: "fields" },
+      ...field("repo", el("input", { placeholder: "unsloth/Qwen3-8B-GGUF" })),
+      ...field("quant", el("input", { value: "Q4_K_M" })),
+      ...field("context", el("input", { type: "number", value: "8192" })),
+      ...field("card", el("select", {}, el("option", { value: "both" }, "all cards"),
+        ...S.gpus.map(c => el("option", { value: String(c.index) }, "card " + c.index)))),
+      ...field("slots", el("input", { type: "number", placeholder: "4 (llama.cpp default)" })),
+      el("span", {}), el("span", { class: "dim",
+        text: "Nothing downloads until you press fetch. Progress appears under Downloads." })),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "addErr" }),
+      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "act", onclick: async () => {
+        const body = { repo: f.repo.value.trim(), quant: f.quant.value.trim() || "Q4_K_M",
+                       contextWindow: Number(f.context.value) || 8192 };
+        if (f.card.value !== "both") body.gpu = Number(f.card.value);
+        if (f.slots.value) body.slots = Number(f.slots.value);
+        try {
+          await api("/api/models", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+          d.close(); load();
+        } catch (e) { $("#addErr").textContent = e.message; }
+      } }, "fetch")));
+  d.showModal();
+}
+
+async function jobLog(id) {
+  const d = $("#dlg");
+  const pre = el("pre", { text: "…" });
+  d.replaceChildren(el("div", { class: "row" }, el("b", { text: "Download log" })),
+    el("div", { class: "body" }, pre),
+    el("div", { class: "row foot" }, el("button", { class: "act",
+      onclick: () => { clearInterval(t); d.close(); load(); } }, "close")));
+  d.showModal();
+  const tick = async () => {
+    try {
+      const j = await api("/api/jobs/" + encodeURIComponent(id));
+      pre.textContent = (j.log || []).join("\n") || j.state;
+      pre.scrollTop = pre.scrollHeight;
+      if (j.state !== "running") clearInterval(t);
+    } catch (e) { pre.textContent = e.message; clearInterval(t); }
+  };
+  const t = setInterval(tick, 1500); tick();
+}
+
+// ==========================================================================
+//  Roles
+// ==========================================================================
+function roles() {
+  const w = S.session.canWrite;
+  const byId = {}; for (const m of S.models) byId[m.id] = m;
+  const out = [el("h2", { text: "Roles" }),
+    el("div", { class: "note" },
+      "A role is one name in front of several models; llama-swap picks a target per "
+      + "request. Its context is the SMALLEST of its targets and its capabilities are the "
+      + "intersection — pair a 131k model with an 8k one and the role is 8k, because a "
+      + "client that trusted the larger number would fail on every second request.")];
+  const names = Object.keys(S.roles || {}).sort();
+  if (!names.length) out.push(el("div", { class: "card" },
+    el("div", { class: "row dim" }, "No roles yet.")));
+  for (const n of names) {
+    const r = S.roles[n], cat = byId[n] || {}, rt = cat.runtime || {};
+    const eff = rt.contextWindow;
+    const weakest = r.targets.map(t => (byId[t] || {}).runtime)
+      .filter(Boolean).map(x => x.contextWindow).filter(Boolean);
+    const shrunk = weakest.length > 1 && Math.min(...weakest) < Math.max(...weakest);
+    out.push(el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("span", { class: "name", text: n }),
+        el("span", { class: "tag", text: r.strategy
+          + (r.strategy === "spillover" ? "/" + ((r.settings || {}).spillover || 1) : "") }),
+        eff ? el("span", { class: "tag" + (shrunk ? " warn" : ""),
+          title: shrunk ? "smaller than its largest target" : "",
+          text: num(eff) + " ctx" }) : null,
+        (cat.activeTargets || []).length
+          ? el("span", { class: "tag on", text: cat.activeTargets.length + "/"
+              + r.targets.length + " loaded" })
+          : el("span", { class: "tag", text: "0/" + r.targets.length + " loaded" }),
+        el("span", { class: "grow" }),
+        w ? el("button", { class: "act", onclick: () => roleForm(n, r) }, "edit") : null,
+        w ? el("button", { class: "act", onclick: () => act(
+          "/api/roles/" + encodeURIComponent(n), "DELETE") }, "delete") : null),
+      el("div", { class: "body" },
+        el("table", {}, el("tbody", {},
+          ...r.targets.map((t, i) => el("tr", {},
+            el("th", { text: i === 0 ? "targets" : "" }),
+            el("td", {}, t, " ",
+              el("span", { class: "dim", text: (byId[t] && byId[t].runtime
+                ? num(byId[t].runtime.contextWindow) + " ctx" : "not a configured model") }))),
+          ),
+          r.description ? el("tr", {}, el("th", { text: "note" }),
+            el("td", { text: r.description })) : null)))));
+  }
+  if (w) out.push(el("div", { class: "row" },
+    el("button", { class: "act", onclick: () => roleForm("", null) }, "+ new role")));
+  $("#tab-roles").replaceChildren(...out);
+}
+
+function roleForm(name, cur) {
+  const d = $("#dlg");
+  const chat = S.models.filter(m => m.kind !== "role" && m.role === "chat").map(m => m.id);
+  const nameI = el("input", { value: name, placeholder: "coder" });
+  const stratI = el("select", {}, ...["warm", "pin", "spillover"].map(s =>
+    el("option", { value: s, selected: cur && cur.strategy === s }, s)));
+  const spillI = el("input", { type: "number", min: "1",
+    value: (cur && cur.settings && cur.settings.spillover) || 2 });
+  const descI = el("input", { value: (cur && cur.description) || "" });
+  const boxes = chat.map(id => {
+    const c = el("input", { type: "checkbox", value: id,
+      checked: cur && cur.targets.includes(id) });
+    return el("label", { class: "row", style: "padding:2px 0" }, c, " " + id);
+  });
+  const targets = () => boxes.map(b => b.querySelector("input"))
+    .filter(i => i.checked).map(i => i.value);
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: name ? "Edit role " + name : "New role" })),
+    el("div", { class: "fields" },
+      el("label", { text: "name" }), nameI,
+      el("label", { text: "strategy" }), stratI,
+      el("label", { text: "spillover" }), spillI,
+      el("label", { text: "note" }), descI,
+      el("label", { text: "targets" }), el("div", {}, ...boxes),
+      el("span", {}), el("span", { class: "dim",
+        text: "Order matters: warm and pin try the first target first, spillover fills it "
+              + "to the reservation count before starting the next. Spillover targets must "
+              + "sit in one routing group — pinned models do." })),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "roleErr" }),
+      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "act", onclick: save }, "save")));
+  d.showModal();
+  async function save() {
+    const body = { strategy: stratI.value, targets: targets(),
+                   description: descI.value || null };
+    if (stratI.value === "spillover") body.spillover = Number(spillI.value) || 1;
+    const n = nameI.value.trim();
+    if (!n) { $("#roleErr").textContent = "a role needs a name"; return; }
+    try {
+      await api("/api/roles/" + encodeURIComponent(n) + "?dryRun=true",
+        { method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body) });
+      if (name && name !== n) await api("/api/roles/" + encodeURIComponent(name),
+        { method: "DELETE" });
+      await api("/api/roles/" + encodeURIComponent(n), { method: "PUT",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      d.close(); load();
+    } catch (e) { $("#roleErr").textContent = e.message; }
+  }
+}
+
+// ==========================================================================
+//  Cards
+// ==========================================================================
+function cards() {
+  const out = [el("h2", { text: "Cards" }),
+    el("div", { class: "note" },
+      "This is the filtered view: integrated graphics are left out and the numbers are "
+      + "the logical ones, the N in --device ROCmN. llama-swap's own hardware page shows "
+      + "every device the driver exposes, so on a machine with an iGPU it lists one card "
+      + "too many.")];
+  for (const c of S.gpus) {
+    const frac = c.vramTotalBytes ? c.vramUsedBytes / c.vramTotalBytes : 0;
+    out.push(el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("span", { class: "name", text: "card " + c.index }),
+        el("span", { class: "tag", text: c.name || "?" }),
+        c.gfx ? el("span", { class: "tag", text: c.gfx }) : null,
+        c.tempJunctionC !== null && c.tempJunctionC !== undefined
+          ? el("span", { class: "tag", text: c.tempJunctionC + " °C" }) : null,
+        c.smiIndex !== c.index ? el("span", { class: "tag warn",
+          title: "HIP_VISIBLE_DEVICES uses this number, --device ROCmN uses the other",
+          text: "rocm-smi calls it " + c.smiIndex }) : null),
+      el("div", { class: "body" },
+        el("div", { class: "row", style: "padding:0;gap:10px" },
+          el("span", { class: "bar" }, el("i", {
+            class: frac > .95 ? "bad" : frac > .85 ? "warn" : "",
+            style: "width:" + (frac * 100).toFixed(1) + "%" })),
+          el("span", { class: "mono dim",
+            text: fmt(c.vramUsedBytes) + " of " + fmt(c.vramTotalBytes, 0) + " in use" })),
+        (c.pinnedModels || []).length
+          ? el("div", { class: "dim", style: "margin-top:8px" },
+              "pinned here: " + c.pinnedModels.join(", "))
+          : el("div", { class: "dim", style: "margin-top:8px" }, "nothing pinned here"))));
+  }
+  const d = S.diff;
+  if (d) {
+    out.push(el("h2", { text: "Configuration vs hardware" }));
+    out.push(d.diff
+      ? el("div", { class: "card" }, el("div", { class: "body" },
+          el("div", { class: "note" },
+            "The configuration no longer matches the cards. On the server: llm gpu sync"),
+          el("pre", { text: d.diff })))
+      : el("div", { class: "card" }, el("div", { class: "row ok" },
+          "matches — " + d.cards + " card(s), -ts " + (d.tensorSplit || "none"))));
+  }
+  const cfg = S.config;
+  if (cfg) {
+    out.push(el("h2", { text: "Groups" }));
+    for (const [g, v] of Object.entries(cfg.groups || {})) out.push(el("div", { class: "card" },
+      el("div", { class: "row" }, el("span", { class: "name", text: g }),
+        el("span", { class: "tag" + (v.swap === false ? " on" : ""),
+          title: "false: members run together instead of replacing each other",
+          text: "swap " + v.swap }),
+        el("span", { class: "tag" + (v.exclusive === false ? " on" : ""),
+          title: "false: starting a member leaves other groups alone",
+          text: "exclusive " + v.exclusive }),
+        el("span", { class: "tag" + (v.persistent ? " on" : " warn"),
+          title: "true: no other group may unload these",
+          text: "persistent " + v.persistent })),
+      el("div", { class: "body dim", text: (v.members || []).join(", ") })));
+    out.push(el("h2", { text: "Macros" }),
+      el("div", { class: "card" }, el("div", { class: "body" },
+        el("div", { class: "dim" },
+          "The long llama-server command lines, written once. A model's cmd references one."),
+        ...Object.entries(cfg.macros || {}).map(([k, v]) =>
+          el("div", {}, el("div", { class: "name", style: "margin-top:10px", text: k }),
+            el("pre", { text: v }))))));
+  }
+  $("#tab-cards").replaceChildren(...out);
+}
+
+// ==========================================================================
+//  System
+// ==========================================================================
+function system() {
+  const v = S.versions;
+  const out = [el("h2", { text: "Versions" })];
+  if (v) {
+    const names = { llamaCpp: "llama.cpp", whisperCpp: "whisper.cpp",
+                    llamaSwap: "llama-swap", openWebUI: "Open WebUI", comfyUI: "ComfyUI" };
+    const rows = Object.entries(v.engines).map(([k, e]) => el("tr", {},
+      el("th", { text: names[k] || k }),
+      el("td", { class: "mono", text: e.active || "–" }),
+      el("td", {}, e.upToDate === false
+        ? el("span", { class: "tag warn", text: "newer: " + e.latest })
+        : e.upToDate ? el("span", { class: "tag on", text: "up to date" })
+        : el("span", { class: "dim", text: "–" })),
+      el("td", { class: "dim", text: (e.rollbackTo || []).length
+        ? "can go back to " + e.rollbackTo.join(", ")
+          + (e.snapshotWithDatabase ? " (with its database)" : "")
+        : "" }),
+      el("td", { class: "dim mono", text: (e.rollbackTo || []).length ? e.rollbackCommand : "" })));
+    out.push(el("div", { class: "card" }, el("div", { class: "body" },
+      el("table", {}, el("tbody", {}, rows)),
+      el("div", { class: "dim", style: "margin-top:10px" },
+        "“newer” comes from the cache that llm update refreshes"
+        + (v.cacheAgeSeconds !== null && v.cacheAgeSeconds !== undefined
+           ? ", last checked " + Math.round(v.cacheAgeSeconds / 3600) + " h ago" : "")
+        + " — this page never calls GitHub. Updating and rolling back are "
+        + "server-side operations with a smoke test: llm update, llm rollback."))));
+  }
+  out.push(el("h2", { text: "Elsewhere" }));
+  out.push(el("div", { class: "card" }, el("div", { class: "body" },
+    el("table", {}, el("tbody", {},
+      el("tr", {}, el("th", { text: "Runtime, logs, telemetry" }),
+        el("td", {}, el("a", { href: location.protocol + "//" + location.hostname + ":8080/ui",
+          target: "_blank", rel: "noreferrer noopener" }, "llama-swap on :8080/ui"),
+          el("div", { class: "dim", text: "live state, per-request tok/s, logs, GPU charts, "
+            + "a playground. It has no configuration view, and its hardware page does not "
+            + "filter integrated graphics." }))),
+      el("tr", {}, el("th", { text: "Chat" }),
+        el("td", {}, el("a", { href: location.protocol + "//" + location.hostname + ":3000",
+          target: "_blank", rel: "noreferrer noopener" }, "Open WebUI on :3000"))),
+      el("tr", {}, el("th", { text: "API reference" }),
+        el("td", {}, el("a", { href: "/docs", target: "_blank",
+          rel: "noreferrer noopener" }, "Swagger on this port"))),
+      el("tr", {}, el("th", { text: "Diagnosis" }),
+        el("td", {}, el("span", { class: "mono", text: "llm doctor" }),
+          el("div", { class: "dim", text: "Still server-side only: it checks tool "
+            + "availability, group membership, the venvs and the systemd units, none of "
+            + "which is meaningful over HTTP." }))))))));
+  $("#tab-system").replaceChildren(...out);
+}
+
+load();
+setInterval(() => { if (!$("#dlg").open) load(); }, 15000);
+</script>

@@ -11,6 +11,29 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 
 ### Added
 
+- **A settings page** at `:8081/ui`, served by the registry. One file, no build
+  step, no external requests, same origin as the API. Models with their VRAM
+  budget *per card* rather than as a sum, provenance, slots and thinking depth
+  explained rather than just numbered; roles with their effective context in
+  front, because a role reports the smallest of its targets; the card list with
+  the `gpu sync` diff and the group flags; versions with rollback candidates.
+  Every change previews through `?dryRun=true` first. Charts, logs and a
+  playground are deliberately absent — llama-swap's own UI does those better.
+- **Roles are writable over HTTP**: `PUT`/`DELETE /api/roles/{name}`. Until now
+  `llm role` on the server was the only way in, so a UI or a remote agent could
+  see a role and not change it.
+- `GET /api/versions`, `GET /api/config` (macros and groups, which llama-swap
+  cannot show at all) and `GET /api/config/diff`.
+- **Session cookies** so a page need not keep the token in a form field:
+  `POST /api/session` exchanges it for an `HttpOnly` cookie, `GET /api/session`
+  reports `canWrite`, `DELETE` ends it. Reads stay open by default — the pi
+  extension reads without a token — and `LLM_API_REQUIRE_AUTH=1` requires it for
+  reads too, which is worth setting if 8081 is reachable beyond your own machine.
+- `tests/ui-matrix.sh` runs the page's script under a minimal DOM against
+  payloads from a throwaway `LLM_HOME`. Curling `/ui` would not do: it answers
+  200 whatever the JavaScript does, and the first version of that check passed
+  while every element on the page read `[object Object]`.
+
 - The registry reports **which** `reasoning_effort` values a model's chat
   template accepts, read out of the GGUF header, plus the default and whether
   thinking is preserved across turns: `runtime.reasoningEffort` and

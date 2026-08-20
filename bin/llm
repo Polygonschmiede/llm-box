@@ -314,6 +314,8 @@ cmd_dash(){
   [[ -n "$extra" ]] && printf "%s %s\n" "${c_b}Services:${c_0}" "$extra"
   upd_stale && ( upd_refresh >/dev/null 2>&1 & )
   echo
+  printf '  Settings:  http://%s:8081/ui   |   Runtime:  http://%s:8080/ui
+' "$PUBLIC_HOST" "$PUBLIC_HOST"
   echo "  More:  llm help   |   Addresses:  llm url"
 }
 
@@ -1118,10 +1120,14 @@ case "${1:-}" in
            esac;;
   watch)   command -v watch >/dev/null && watch -n 2 rocm-smi || { warn "'watch' is missing"; rocm-smi; };;
   ps)      curl -s "$API/running" 2>/dev/null || curl -s "$API/v1/models" 2>/dev/null; echo;;
-  url)     printf 'API     : http://%s:8080/v1\n' "$PUBLIC_HOST"
-           printf 'Chat    : http://%s:3000\n'    "$PUBLIC_HOST"
-           printf 'Images  : http://%s:8188\n'    "$PUBLIC_HOST"
-           printf 'Registry: http://%s:8081/api/models  (agents, MCP)\n' "$PUBLIC_HOST";;
+  #  No 'llm web on': the page is served by the registry, so there is no
+  #  separate service to start. If port 8081 answers, the page is there.
+  url)     printf 'API      : http://%s:8080/v1\n'   "$PUBLIC_HOST"
+           printf 'Settings : http://%s:8081/ui       (models, roles, cards)\n' "$PUBLIC_HOST"
+           printf 'Runtime  : http://%s:8080/ui       (llama-swap: state, logs, telemetry)\n' "$PUBLIC_HOST"
+           printf 'Chat     : http://%s:3000\n'      "$PUBLIC_HOST"
+           printf 'Images   : http://%s:8188\n'      "$PUBLIC_HOST"
+           printf 'Registry : http://%s:8081/api/models  (agents, MCP)\n' "$PUBLIC_HOST";;
 
   ""|help|-h|--help) usage;;
   *) err "unknown command: $1"; echo; usage; return 2 2>/dev/null || exit 2;;

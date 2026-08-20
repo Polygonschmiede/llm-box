@@ -1831,6 +1831,154 @@ def record_add(dirname: str, repo: str, quant: str, extra: dict | None = None) -
 
 
 # ---------------------------------------------------------------------------
+#  Engine versions and what there is to roll back to
+# ---------------------------------------------------------------------------
+#  Read here rather than in bash so the CLI and the HTTP API cannot disagree -
+#  the same reason the card list moved. The update MACHINERY stays in
+#  lib/update.sh; this is only the reporting side of it.
+UPDATE_CACHE = os.path.join(LLM_HOME, ".update-cache")
+UPDATE_STATE = os.path.join(LLM_HOME, ".update-state")
+
+
+def _kv_file(path: str) -> dict:
+    """A 'key=value' file, or {} when it is missing."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                k, _, v = line.partition("=")
+                if v:
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def engine_versions() -> dict:
+    """Active version, installed alternatives and rollback command per engine.
+
+    'latest' comes from .update-cache, which 'llm update' refreshes in the
+    background - never from a live GitHub call, because this is also what
+    `llm status` prints and it must not block on the network.
+    """
+    latest = _kv_file(UPDATE_CACHE)
+    prev = _kv_file(UPDATE_STATE)
+    out = {}
+
+    def entry(active, installed, latest_key, rollback):
+        others = [v for v in installed if v != active]
+        return {"active": active, "latest": latest.get(latest_key),
+                "upToDate": None if not (active and latest.get(latest_key))
+                else active == latest.get(latest_key),
+                "rollbackTo": others, "rollbackCommand": rollback}
+
+    #  llama.cpp and whisper.cpp: one build directory per version, 'build' a
+    #  symlink to the active one, so switching back is a symlink change.
+    for key, root, cmd in (("llamaCpp", os.path.join(LLM_HOME, "llama.cpp"), "llm rollback llama"),
+                           ("whisperCpp", os.path.join(os.path.expanduser("~"), "whisper.cpp"),
+                            "llm rollback whisper")):
+        real = os.path.realpath(root)
+        active = os.path.basename(os.path.realpath(os.path.join(real, "build"))) \
+            .replace("build-", "") or None
+        builds = sorted(os.path.basename(d).replace("build-", "")
+                        for d in glob.glob(os.path.join(real, "build-*"))
+                        if os.path.isdir(d))
+        out[key] = entry(active if active and active != "build" else None, builds,
+                         "llama" if key == "llamaCpp" else "whisper", cmd)
+
+    #  llama-swap: prebuilt binaries kept side by side as bin/llama-swap-<ver>.
+    swap_active = None
+    try:
+        r = subprocess.run([os.path.join(LLM_HOME, "bin", "llama-swap"), "--version"],
+                           capture_output=True, text=True, timeout=10)
+        swap_active = (r.stdout or "").split("\n")[0].replace("version: ", "").strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if swap_active:
+        swap_active = swap_active.split(" ")[0]
+    swaps = sorted(os.path.basename(f).replace("llama-swap-", "")
+                   for f in glob.glob(os.path.join(LLM_HOME, "bin", "llama-swap-*")))
+    out["llamaSwap"] = entry(swap_active, swaps, "swap", "llm rollback swap")
+
+    #  Open WebUI and ComfyUI: the previous version is remembered in
+    #  .update-state, and a matching data snapshot may sit next to it.
+    ui_active = None
+    try:
+        r = subprocess.run([os.path.join(LLM_HOME, "venv-webui", "bin", "python"), "-c",
+                            "import importlib.metadata as m; print(m.version('open-webui'))"],
+                           capture_output=True, text=True, timeout=20)
+        ui_active = (r.stdout or "").strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    ui_prev = prev.get("owui_prev")
+    out["openWebUI"] = entry(ui_active, [v for v in (ui_active, ui_prev) if v], "ui",
+                             "llm rollback ui")
+    out["openWebUI"]["snapshotWithDatabase"] = bool(ui_prev and os.path.isdir(
+        os.path.join(LLM_HOME, "openwebui-data.bak-%s" % ui_prev)))
+    out["comfyUI"] = entry(None, [v for v in (prev.get("comfy_prev"),) if v], "comfy",
+                           "llm rollback comfy")
+    return {"llmBox": _read_version(), "engines": out,
+            "cacheAgeSeconds": int(time.time() - os.path.getmtime(UPDATE_CACHE))
+            if os.path.exists(UPDATE_CACHE) else None}
+
+
+def _read_version() -> str:
+    try:
+        with open(os.path.join(LLM_HOME, "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def config_overview() -> dict:
+    """The parts of llama-swap.yaml that are NOT per-model: macros and groups.
+
+    The eviction semantics live there - swap, exclusive, persistent - and the
+    config comments spend ten lines explaining them, which is no help to anyone
+    who is not looking at the file. llama-swap has no /api/config at all.
+    """
+    text = config_text()
+    macros, cur = {}, None
+    in_macros = False
+    for line in text.split("\n"):
+        if re.match(r"^macros:\s*$", line):
+            in_macros = True
+            continue
+        if in_macros and line.strip() and not line[:1].isspace():
+            break
+        if not in_macros:
+            continue
+        m = re.match(r'^  "?([\w.-]+)"?:\s*>\s*$', line)
+        if m:
+            cur = m.group(1)
+            macros[cur] = []
+        elif cur and line.startswith("    "):
+            macros[cur].append(line.strip())
+    groups = {}
+    m = re.search(r"# >>> llm:groups\n(.*?)# <<< llm:groups", text, re.S)
+    if m:
+        name = None
+        for line in m.group(1).split("\n"):
+            g = re.match(r"^  ([\w-]+):\s*$", line)
+            if g:
+                name = g.group(1)
+                groups[name] = {"swap": None, "exclusive": None, "persistent": None,
+                                "members": []}
+                continue
+            if not name:
+                continue
+            kv = re.match(r"^    (swap|exclusive|persistent):\s*(true|false)\s*$", line)
+            if kv:
+                groups[name][kv.group(1)] = kv.group(2) == "true"
+            mem = re.match(r'^      - "([^"]+)"', line)
+            if mem:
+                groups[name]["members"].append(mem.group(1))
+    return {"path": CONFIG, "macros": {k: " ".join(v) for k, v in macros.items()},
+            "groups": groups, "healthCheckTimeout":
+            _num((re.search(r"^healthCheckTimeout:\s*(\d+)", text, re.M) or [None, None])[1], None)}
+
+
+# ---------------------------------------------------------------------------
 #  The token for write access
 # ---------------------------------------------------------------------------
 def api_token(create: bool = True) -> str | None:

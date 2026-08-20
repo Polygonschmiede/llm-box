@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 
-suites=(gpu-matrix config-matrix vram-matrix api-matrix)
+suites=(gpu-matrix config-matrix vram-matrix api-matrix ui-matrix)
 failed=()
 
 for s in "${suites[@]}"; do

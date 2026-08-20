@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -33,8 +34,12 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 os.environ.setdefault("LLM_HOME", ROOT)
 
 import anyio                                                            # noqa: E402
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse            # noqa: E402
+from fastapi import (                                                     # noqa: E402
+    Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response,
+)
+from fastapi.responses import (                                          # noqa: E402
+    FileResponse, JSONResponse, StreamingResponse,
+)
 
 import llmreg                                                            # noqa: E402
 
@@ -158,16 +163,71 @@ def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
 # ---------------------------------------------------------------------------
 #  Auth
 # ---------------------------------------------------------------------------
-def require_token(x_llm_token: str | None = Header(default=None)):
-    want = llmreg.api_token(create=False)
-    if not want:
-        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
-    if x_llm_token != want:
-        raise HTTPException(401, "wrong or missing X-LLM-Token")
+#  Writes need the token from config/api-token, as a header or - so the web page
+#  does not have to keep it in every form - as a session cookie obtained once
+#  from POST /api/session. Sessions live in memory only: they are gone after a
+#  restart, which is the right trade for something that guards one machine's
+#  configuration and saves writing a session store.
+SESSION_COOKIE = "llm_session"
+SESSION_TTL = 12 * 3600
+_sessions: dict[str, float] = {}
+_sessions_lock = threading.Lock()
+
+
+def _session_new() -> tuple[str, int]:
+    sid = secrets.token_urlsafe(32)
+    with _sessions_lock:
+        now = time.time()
+        for k, exp in list(_sessions.items()):        # opportunistic cleanup
+            if exp < now:
+                del _sessions[k]
+        _sessions[sid] = now + SESSION_TTL
+    return sid, SESSION_TTL
+
+
+def _session_valid(sid: str | None) -> bool:
+    if not sid:
+        return False
+    with _sessions_lock:
+        exp = _sessions.get(sid)
+        if exp is None:
+            return False
+        if exp < time.time():
+            del _sessions[sid]
+            return False
     return True
 
 
+def require_token(x_llm_token: str | None = Header(default=None),
+                  llm_session: str | None = Cookie(default=None)):
+    want = llmreg.api_token(create=False)
+    if not want:
+        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
+    if x_llm_token == want or _session_valid(llm_session):
+        return True
+    raise HTTPException(401, "wrong or missing X-LLM-Token (or expired session)")
+
+
 WRITE = [Depends(require_token)]
+
+#  Reads are open by default, and that is deliberate rather than an oversight:
+#  the pi extension fetches /api/models, /api/gpus, /api/health and /api/jobs
+#  without a token, and docs/PI.md tells people the token is only for changes.
+#  Requiring auth for reads would break every existing client, so it is opt-in.
+#  Worth turning on if 8081 is reachable beyond your own machine: reads expose
+#  every model path, checksum and Hugging Face repo, plus live VRAM per card.
+READ_NEEDS_AUTH = os.environ.get("LLM_API_REQUIRE_AUTH", "").strip().lower() \
+    in ("1", "true", "yes")
+
+
+def require_read(x_llm_token: str | None = Header(default=None),
+                 llm_session: str | None = Cookie(default=None)):
+    if not READ_NEEDS_AUTH:
+        return True
+    return require_token(x_llm_token, llm_session)
+
+
+READ = [Depends(require_read)]
 
 
 # ---------------------------------------------------------------------------
@@ -388,24 +448,24 @@ def versions() -> dict:
             "llamaCpp": os.path.basename(lcpp).replace("build-", "") if lcpp else None}
 
 
-@app.get("/api/models")
+@app.get("/api/models", dependencies=READ)
 def api_models(role: str | None = Query(default=None),
                slim: bool = Query(default=False)):
     models = [m for m in CAT.all() if not role or m["role"] == role]
     return [_slim(m) for m in models] if slim else models
 
 
-@app.get("/api/models/{model_id}")
+@app.get("/api/models/{model_id}", dependencies=READ)
 def api_model(model_id: str):
     return CAT.one(model_id)
 
 
-@app.get("/api/gpus")
+@app.get("/api/gpus", dependencies=READ)
 def api_gpus():
     return llmreg.gpus()
 
 
-@app.get("/api/state")
+@app.get("/api/state", dependencies=READ)
 def api_state():
     st = llmreg.live()
     return {"swapUp": st["up"], "running": st["running"],
@@ -417,7 +477,7 @@ def api_pi_models():
     return llmreg.pi_models_json(CAT.all())
 
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=READ)
 async def api_events():
     """SSE: announces every change to the configuration or the load state."""
     async def gen():
@@ -433,6 +493,133 @@ async def api_events():
                     {"type": "state", "states": snap["states"], "configMtime": snap["mtime"]})
             await asyncio.sleep(2)
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/session")
+def api_session(response: Response, body: dict = Body(default={})):
+    """Exchange the token for a session cookie, so the web page holds no secret.
+
+    The cookie is HttpOnly and SameSite=Strict. It is NOT marked Secure: this
+    project serves plain HTTP, and setting the flag would make the cookie
+    unusable rather than the connection safe. Over an untrusted network the
+    answer is an SSH tunnel or a TLS proxy, not a flag - see SECURITY.md.
+    """
+    want = llmreg.api_token(create=False)
+    if not want:
+        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
+    if str(body.get("token") or "") != want:
+        raise HTTPException(401, "wrong token")
+    sid, ttl = _session_new()
+    response.set_cookie(SESSION_COOKIE, sid, max_age=ttl, httponly=True,
+                        samesite="strict", path="/")
+    return {"ok": True, "expiresInSeconds": ttl}
+
+
+@app.delete("/api/session")
+def api_session_end(response: Response, llm_session: str | None = Cookie(default=None)):
+    if llm_session:
+        with _sessions_lock:
+            _sessions.pop(llm_session, None)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/session")
+def api_session_state(llm_session: str | None = Cookie(default=None),
+                      x_llm_token: str | None = Header(default=None)):
+    """Whether this caller may write. The page asks before showing any button."""
+    want = llmreg.api_token(create=False)
+    return {"canWrite": bool(want) and (x_llm_token == want or _session_valid(llm_session)),
+            "tokenConfigured": bool(want), "readNeedsAuth": READ_NEEDS_AUTH}
+
+
+@app.get("/api/versions", dependencies=READ)
+def api_versions():
+    """Engine versions, what is installed alongside and how to roll back.
+
+    Only `llm versions` and `llm status` knew any of this, so nothing outside
+    the machine could tell whether an update was pending or what there was to
+    fall back to. 'latest' comes from .update-cache and never from a live
+    GitHub call - the same rule the CLI follows, so neither blocks on the
+    network.
+    """
+    return llmreg.engine_versions()
+
+
+@app.get("/api/config", dependencies=READ)
+def api_config():
+    """The parts of llama-swap.yaml that are not per-model: macros and groups.
+
+    llama-swap's own UI has no /api/config at all, so the eviction semantics -
+    swap, exclusive, persistent - were visible only by opening the file.
+    """
+    try:
+        return llmreg.config_overview()
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@app.get("/api/config/diff", dependencies=READ)
+def api_config_diff():
+    """What `llm gpu sync` would change. Empty diff = configuration matches."""
+    try:
+        out = llmreg.gpu_sync(dry_run=True)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    return {"diff": out.get("diff") or "", "cards": out.get("cards"),
+            "tensorSplit": out.get("tensorSplit"),
+            "drift": llmreg.tensor_split_drift()}
+
+
+# ---------------------------------------------------------------------------
+#  Roles. Until now these could only be created from the CLI, which meant a UI
+#  or a remote agent could see them and not change them.
+# ---------------------------------------------------------------------------
+@app.get("/api/roles", dependencies=READ)
+def api_roles():
+    try:
+        return llmreg.read_selectors()
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@app.put("/api/roles/{name}", dependencies=WRITE)
+def api_role_put(name: str, body: dict = Body(...),
+                 dry_run: bool = Query(default=False, alias="dryRun")):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        raise HTTPException(400, "a role name may hold letters, digits, dot, dash "
+                                 "and underscore, and must start with one of the first two")
+    targets = body.get("targets")
+    if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+        raise HTTPException(400, "targets must be a list of model names")
+    spill = body.get("spillover")
+    if spill is not None and not (isinstance(spill, int) and 1 <= spill <= 64):
+        raise HTTPException(400, "spillover must be a whole number 1..64")
+    try:
+        out = llmreg.set_selector(name, str(body.get("strategy") or ""), targets,
+                                  spillover=spill, description=body.get("description"),
+                                  dry_run=dry_run)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    CAT.invalidate()
+    if not dry_run:
+        out["reloaded"] = llmreg.reload_swap()
+    return out
+
+
+@app.delete("/api/roles/{name}", dependencies=WRITE)
+def api_role_delete(name: str):
+    try:
+        out = llmreg.del_selector(name)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from None
+    CAT.invalidate()
+    out["reloaded"] = llmreg.reload_swap()
+    return out
 
 
 @app.patch("/api/models/{model_id}", dependencies=WRITE)
@@ -561,13 +748,13 @@ def api_add(body: dict = Body(...)):
             "hint": "progress: GET /api/jobs/%s" % job_id}
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=READ)
 def api_jobs():
     with JOBS_LOCK:
         return [{k: v for k, v in j.items() if k != "log"} for j in JOBS.values()]
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=READ)
 def api_job(job_id: str):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -576,18 +763,43 @@ def api_job(job_id: str):
     return job
 
 
+WEB_PAGE = os.path.join(ROOT, "web", "index.html")
+
+
+@app.get("/ui")
+@app.get("/ui/")
+def api_ui():
+    """The control page. One file, no build step, served from the same origin as
+    the API so there is nothing to configure for CORS.
+
+    Registered before the MCP mount on "/" deliberately; a route added after it
+    would never be reached.
+    """
+    if not os.path.exists(WEB_PAGE):
+        raise HTTPException(404, "web/index.html is missing from this checkout")
+    #  no-store: the page is small and always reflects a live configuration.
+    return FileResponse(WEB_PAGE, media_type="text/html; charset=utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.get("/")
 def root():
     return JSONResponse({
         "service": "llm-box registry",
+        "version": LLM_BOX_VERSION,
+        "ui": "/ui",
         "read": ["/api/health", "/api/models", "/api/models/{id}", "/api/gpus",
-                 "/api/state", "/api/pi-models.json", "/api/events"],
+                 "/api/state", "/api/versions", "/api/config", "/api/config/diff",
+                 "/api/roles", "/api/jobs", "/api/pi-models.json", "/api/events"],
         "write": ["PATCH /api/models/{id}", "POST /api/models",
                   "POST /api/models/{id}/load", "POST /api/unload",
-                  "DELETE /api/models/{id}"],
+                  "DELETE /api/models/{id}", "PUT /api/roles/{name}",
+                  "DELETE /api/roles/{name}"],
         "mcp": "/mcp",
         "docs": "/docs",
-        "hint": "writing needs the X-LLM-Token header",
+        "hint": "writing needs the X-LLM-Token header, or a session cookie from "
+                "POST /api/session",
+        "readNeedsAuth": READ_NEEDS_AUTH,
     })
 
 
