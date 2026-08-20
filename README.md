@@ -168,10 +168,11 @@ bin/llm                 the CLI (everything goes through here)
 bin/llm-api.py          registry: HTTP catalog + MCP server
 lib/llmreg.py           the library both use: GGUF headers, VRAM estimates,
                         card detection, llama-swap config read/write
+lib/update.sh           updating and rolling back the engines (sourced by bin/llm)
 config/                 configuration template and requirements
 systemd/                user service templates
 pi/extensions/          pi agent integration
-tests/                  card-detection matrix with fake rocm-smi fixtures
+tests/                  four suites, no GPU needed — see CONTRIBUTING.md
 docs/                   the documentation above
 ```
 
