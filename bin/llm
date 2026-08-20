@@ -268,10 +268,9 @@ cmd_dash(){
   reg gpus --table 2>/dev/null
   # Does the config still match the hardware? After a card change a -ts with
   # the wrong arity would otherwise quietly stay in place.
-  local want have
-  want=$(reg hw 2>/dev/null | sed -n 's/.*"tensorSplit": *"\([^"]*\)".*/\1/p')
-  have=$(sed -n 's/^\s*-ts \([0-9,]*\)\s*$/\1/p' "$CONFIG" 2>/dev/null | head -1)
-  [[ -n "$want$have" && "$want" != "$have" ]] && \
+  local have want status
+  IFS=$'\t' read -r have want status < <(reg ts-drift 2>/dev/null)
+  [[ "$status" == drift ]] && \
     warn "  cards do not match the config (-ts '${have:-none}', expected '${want:-none}') → llm gpu sync"
   # Version hint: read from the cache ONLY (never wait on GitHub). A stale cache
   # is refreshed in the background, so the next call has fresh numbers.
@@ -381,10 +380,9 @@ cmd_doctor(){
       [[ "${seen:-0}" -eq "$n" ]] && _ok "llama.cpp sees the same $n card(s)" \
         || _warn "llama.cpp sees $seen instead of $n card(s)" "llm gpu sync"
     fi
-    local want have
-    want=$(reg hw 2>/dev/null | sed -n 's/.*"tensorSplit": *"\([^"]*\)".*/\1/p')
-    have=$(sed -n 's/^\s*-ts \([0-9,]*\)\s*$/\1/p' "$CONFIG" 2>/dev/null | head -1)
-    [[ "$want" == "$have" ]] && _ok "-ts matches (${want:-none})" \
+    local have want status
+    IFS=$'\t' read -r have want status < <(reg ts-drift 2>/dev/null)
+    [[ "$status" == ok ]] && _ok "-ts matches (${want:-none})" \
       || _warn "-ts is '${have:-none}', expected '${want:-none}'" "llm gpu sync"
   else
     _bad "no compute card detected" "run rocm-smi by hand; check the render/video groups"
@@ -807,22 +805,23 @@ require_config(){
   return 1
 }
 
+#  Deleting goes through the library, which escapes the name before it becomes
+#  part of a regex, checks that the directory really sits under models/ before
+#  removing it, takes the configuration lock once, and prunes any role that
+#  pointed at the model. This used to be a sed address with the name
+#  interpolated raw and an rm -rf with no containment check.
 cmd_rm(){
   local name="${1:-}"; [[ -z "$name" ]] && { err "usage: llm rm <name>"; return 1; }
-  # 'groups' is the marker block of the GPU groups, not a model.
-  [[ "$name" == "groups" ]] && { err "'groups' is not a model (it is the GPU group block). See docs/FLAGS.md"; return 1; }
-  grep -q "# >>> llm:$name" "$CONFIG" || { err "model '$name' not found. (llm ls)"; return 1; }
-  # Delete the marker block
-  cfg_lock
-  sed -i "/# >>> llm:$name/,/# <<< llm:$name/d" "$CONFIG"
-  ok "removed from the configuration: $name"
-  sync_groups
-  cfg_unlock
+  # 'groups' and 'selectors' are marker blocks, not models.
+  case "$name" in
+    groups|selectors) err "'$name' is a configuration block, not a model. See docs/FLAGS.md"; return 1;;
+  esac
+  local files=false
   if [[ -d "$MODELS/$name" ]]; then
     read -r -p "Delete the model files as well ($MODELS/$name)? [y/N] " a
-    [[ "$a" == [yY] ]] && { rm -rf "${MODELS:?}/$name"; ok "files deleted."; } || info "files kept."
+    [[ "$a" == [yY] ]] && files=true
   fi
-  reload_swap
+  reg remove-model "$name" "$files" || return 1
 }
 
 # --- Roles (llama-swap selectors): virtual model names --------------------

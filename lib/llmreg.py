@@ -325,6 +325,20 @@ def _arch_get(meta: dict, suffix: str, default=None):
     return meta.get("%s.%s" % (arch, suffix), default)
 
 
+#  Weights plus KV cache is not the whole story: llama-server also allocates
+#  compute buffers, the CUDA/HIP graph and (with -np) one batch per slot. 8 % on
+#  top has matched the measurements on this hardware - 32.0 GB estimated against
+#  32.17 GB observed for a 27B at 131k context with four slots.
+VRAM_HEADROOM = 1.08
+
+
+def vram_needed(weights: int | None, kv: int | None) -> int | None:
+    """What to reserve for a model. None when the weights are unknown."""
+    if not weights:
+        return None
+    return int((weights + (kv or 0)) * VRAM_HEADROOM)
+
+
 def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
                    parallel: int = 1, meta: dict | None = None) -> int | None:
     """Size of the KV cache in bytes, from the real GGUF header.
@@ -866,7 +880,7 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
             "kvCacheBytes": kv_bytes,
             # Headroom for compute context and fragmentation: measured ~8 percent.
             # Without a KV figure (Whisper) only the weights plus headroom remain.
-            "estimatedBytes": int((weights + (kv_bytes or 0)) * 1.08) if weights else None,
+            "estimatedBytes": vram_needed(weights, kv_bytes),
         },
         "source": src,
         "architecture": {
@@ -968,7 +982,7 @@ def recheck_files(m: dict) -> dict:
     vram = m.get("vram") or {}
     vram["weightsBytes"] = weights or None
     kv = vram.get("kvCacheBytes")
-    vram["estimatedBytes"] = int((weights + (kv or 0)) * 1.08) if weights else None
+    vram["estimatedBytes"] = vram_needed(weights, kv)
     m["vram"] = vram
     return m
 
@@ -1082,14 +1096,20 @@ def put_block(text: str, mark: str, body: str, head: str = "") -> str:
         raise ValueError("the configuration has no 'models:' section - "
                          "is this a llama-swap config? (llm init)")
     #  Walk back over the comment header that belongs to 'models:' so it stays
-    #  attached to it instead of ending up above the new block.
+    #  attached to it instead of ending up above the new block. Stop at a marker
+    #  line: those start with '#' too, and walking past one would insert the new
+    #  block INSIDE the previous one, splitting it from its closing marker.
     lines = text[:m.start()].split("\n")
-    while lines and (lines[-1].startswith("#") or not lines[-1].strip()):
+    while lines and (not lines[-1].strip()
+                     or (lines[-1].startswith("#")
+                         and not lines[-1].startswith("# <<< llm:")
+                         and not lines[-1].startswith("# >>> llm:"))):
         lines.pop()
     cut = len("\n".join(lines))
     if cut:
         cut += 1
-    return text[:cut] + head + block + "\n\n" + text[cut:]
+    sep = "\n" if cut and not text[:cut].endswith("\n\n") else ""
+    return text[:cut] + sep + head + block + "\n\n" + text[cut:]
 
 
 def _write_config(text: str) -> None:
@@ -1280,6 +1300,26 @@ _TS_LINE_RE = re.compile(r"^\s*-ts\s+[\d.,]+\s*$")
 _MACRO_KEY_RE = re.compile(r'^(\s+)"?([\w.-]+)"?:\s*>\s*$')
 
 
+def tensor_split_drift() -> dict:
+    """What the config says about -ts versus what the hardware wants.
+
+    One implementation on purpose. bin/llm used to carry this twice as the same
+    sed one-liner, with a third regex here that additionally accepts decimal
+    points - so a hand-written '-ts 1.5,1' was visible to Python and invisible
+    to bash, and `llm doctor` reported a match that was not one.
+    """
+    try:
+        lines = config_text().split("\n")
+    except ConfigMissing:
+        return {"configured": None, "expected": tensor_split(), "drifted": False,
+                "reason": "no configuration yet"}
+    have = next((m.group(1) for m in
+                 (re.match(r"^\s*-ts\s+([\d.,]+)\s*$", ln) for ln in lines) if m), None)
+    want = tensor_split()
+    return {"configured": have, "expected": want,
+            "drifted": bool((have or want) and have != want), "reason": None}
+
+
 def sync_tensor_split(text: str | None = None, value: str = "auto") -> str:
     """Adjust -ts in the chat macros to the detected card count.
 
@@ -1417,7 +1457,7 @@ def check_fit(model: dict, ctx: int | None = None, gpu=None) -> dict:
     kv = kv_cache_bytes(model["files"].get("model", {}).get("path", ""), ctx,
                         model["runtime"]["kvCacheQuant"],
                         model["runtime"].get("parallel") or 1) or 0
-    need = int((weights + kv) * 1.08)
+    need = vram_needed(weights, kv) or 0
     #  If the model is already running, it occupies the space we are computing.
     loaded = model.get("state") in ("ready", "loaded")
     all_cards = gpus()
@@ -1573,6 +1613,8 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
 
 
 def remove_model(name: str, delete_files: bool = False) -> dict:
+    """Remove a model, its group membership and any role that pointed at it."""
+    dropped_roles = []
     with config_lock():
         text = config_text()
         if not find_block(name, text):
@@ -1580,6 +1622,21 @@ def remove_model(name: str, delete_files: bool = False) -> dict:
         model = get_model(name)
         text = re.sub(r"\n*# >>> llm:%s\n.*?# <<< llm:%s\n" % (re.escape(name), re.escape(name)),
                       "\n", text, flags=re.S)
+        #  A role whose target no longer exists is an invalid configuration -
+        #  llama-swap validates the targets at startup, so leaving one behind
+        #  would take the whole endpoint down on the next restart.
+        sel = read_selectors(text)
+        touched = False
+        for role, spec in list(sel.items()):
+            if name not in spec["targets"]:
+                continue
+            spec["targets"] = [t for t in spec["targets"] if t != name]
+            touched = True
+            if not spec["targets"]:
+                del sel[role]
+                dropped_roles.append(role)
+        if touched:
+            text = write_selectors(sel, text)
         text = sync_groups(text)
         _write_config(text)
     removed = []
@@ -1590,7 +1647,8 @@ def remove_model(name: str, delete_files: bool = False) -> dict:
         if d and os.path.isdir(d) and inside:
             shutil.rmtree(d)
             removed.append(d)
-    return {"model": name, "filesRemoved": removed, "reloaded": reload_swap()}
+    return {"model": name, "filesRemoved": removed, "rolesRemoved": dropped_roles,
+            "reloaded": reload_swap()}
 
 
 def reload_swap() -> bool:
@@ -1752,6 +1810,24 @@ def _cli(argv: list[str]) -> int:
         print(json.dumps(catalog(), indent=2, ensure_ascii=False))
     elif cmd == "pi-json":
         print(json.dumps(pi_models_json(), indent=2, ensure_ascii=False))
+    elif cmd == "remove-model":                     # remove-model <name> [true]
+        name = argv[1]
+        want_files = len(argv) > 2 and argv[2].lower() in ("1", "true", "yes")
+        try:
+            out = remove_model(name, delete_files=want_files)
+        except KeyError:
+            sys.exit("model '%s' not found. (llm ls)" % name)
+        print("removed from the configuration: %s" % name)
+        for d in out["filesRemoved"]:
+            print("  files deleted: %s" % d)
+        if out["rolesRemoved"]:
+            print("  roles removed with it: %s" % ", ".join(out["rolesRemoved"]))
+        if not out["reloaded"]:
+            print("  llama-swap was not reachable - restart it with: llm restart")
+    elif cmd == "ts-drift":
+        d = tensor_split_drift()
+        print("%s\t%s\t%s" % (d["configured"] or "", d["expected"] or "",
+                               "drift" if d["drifted"] else "ok"))
     elif cmd == "sync-groups":
         _write_config(sync_groups())
     elif cmd == "selectors":                        # selectors

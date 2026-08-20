@@ -144,6 +144,35 @@ check_err "no models: section raises" ValueError \
   "$(run "$H" "llmreg.put_block('nothing: here\n', 'groups', '')" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
+#  put_block walks back over the comment header that belongs to 'models:'. Marker
+#  lines start with '#' too, so walking past one inserted the new block INSIDE
+#  the previous one, splitting it from its closing marker and corrupting the YAML.
+section "put_block leaves neighbouring blocks alone"
+H="$(cfg)"
+check "groups block survives a role insert" "1 1" \
+  "$(run "$H" "
+t = llmreg.write_selectors({'r': {'strategy': 'pin', 'targets': ['big']}},
+                           llmreg.sync_groups())
+print(t.count('>>> llm:groups'), t.count('<<< llm:groups'))")"
+check "the two blocks do not interleave" "True" \
+  "$(run "$H" "
+t = llmreg.write_selectors({'r': {'strategy': 'pin', 'targets': ['big']}},
+                           llmreg.sync_groups())
+print(t.index('<<< llm:groups') < t.index('>>> llm:selectors'))")"
+check "and both still land before models:" "True" \
+  "$(run "$H" "
+import re
+t = llmreg.write_selectors({'r': {'strategy': 'pin', 'targets': ['big']}},
+                           llmreg.sync_groups())
+start = re.search(r'^models:', t, re.M).start()
+print(t.index('<<< llm:groups') < start and t.index('<<< llm:selectors') < start)")"
+check "inserting twice does not nest" "1" \
+  "$(run "$H" "
+t = llmreg.sync_groups()
+t = llmreg.write_selectors({'r': {'strategy': 'pin', 'targets': ['big']}}, t)
+t = llmreg.sync_groups(t)
+print(t.count('>>> llm:selectors'))")"
+
 section "roles: render/read round-trip"
 H="$(cfg)"
 ROLES="{'warm-one': {'strategy': 'warm', 'targets': ['big', 'spread']},
@@ -261,5 +290,94 @@ import re
 t = llmreg.sync_tensor_split()
 m = re.search(r'^\s*(-ts [\d.,]+)\s*$', t, re.M)
 print(m.group(1) if m else 'none')")"
+
+# ---------------------------------------------------------------------------
+#  bin/llm carried this twice as the same sed one-liner, and the regex here
+#  additionally accepts decimal points - so '-ts 1.5,1' was visible to Python
+#  and invisible to bash, and `llm doctor` reported a match that was not one.
+section "tensor_split_drift: one reader for config and hardware"
+H="$(cfg)"
+check "two cards, -ts 1,1 in the config" "ok" \
+  "$(run "$H" "print('drift' if llmreg.tensor_split_drift()['drifted'] else 'ok')")"
+check "same config on one card drifts" "drift" \
+  "$(LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-1card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+     pyx "print('drift' if llmreg.tensor_split_drift()['drifted'] else 'ok')")"
+check "three cards drift too" "drift" \
+  "$(LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-3card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+     pyx "print('drift' if llmreg.tensor_split_drift()['drifted'] else 'ok')")"
+#  The case bash could not see at all.
+H2="$(cfg)"
+sed -i 's/^    -ts 1,1$/    -ts 1.5,1/' "$H2/config/llama-swap.yaml"
+check "a decimal -ts is read, not ignored" "1.5,1" \
+  "$(run "$H2" "print(llmreg.tensor_split_drift()['configured'])")"
+check "and it counts as drift" "drift" \
+  "$(run "$H2" "print('drift' if llmreg.tensor_split_drift()['drifted'] else 'ok')")"
+check "no configuration is not drift" "ok" \
+  "$(LLM_HOME="$(mktemp -d "$TMP/none.XXXXXX")" LLM_ROCM_SMI="$SMI2" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+     pyx "print('drift' if llmreg.tensor_split_drift()['drifted'] else 'ok')")"
+
+# ---------------------------------------------------------------------------
+#  bin/llm used to do this itself: a sed address with the name interpolated raw,
+#  and an rm -rf whose only guard was that $MODELS is non-empty.
+section "remove_model"
+rm_case(){ # $1=python body -> stdout, with a sandbox holding a,b and two roles
+  local home; home="$(sandbox)"
+  add_block "$home" a "\${server} -m $home/models/a/a.gguf -c 8192 --device ROCm0 -sm none -mg 0"
+  add_block "$home" b "\${server} -m $home/models/b/b.gguf -c 8192"
+  mkdir -p "$home/models/a" "$home/models/victim"
+  : > "$home/models/a/a.gguf"
+  : > "$home/models/victim/keep.gguf"
+  LLM_HOME="$home" LLM_ROCM_SMI="$SMI2" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+  LLM_SWAP_API="http://127.0.0.1:9" HOME_UNDER_TEST="$home" pyx "
+import os
+home = os.environ['HOME_UNDER_TEST']
+llmreg.set_selector('both', 'warm', ['a', 'b'])
+llmreg.set_selector('onlya', 'pin', ['a'])
+$1"
+}
+check "the block goes"                "b" \
+  "$(rm_case "
+llmreg.remove_model('a')
+print(' '.join(e['name'] for e in llmreg.parse_config()))")"
+check "and the group with it"         "False" \
+  "$(rm_case "
+import re
+llmreg.remove_model('a')
+t = llmreg.config_text()
+blk = t[t.index('>>> llm:groups'):t.index('<<< llm:groups')]
+print('a' in re.findall(r'^\s+- \"([^\"]+)\"', blk, re.M))")"
+#  A role pointing at a model that no longer exists is a configuration
+#  llama-swap refuses at startup, so it must not survive the removal.
+#  Reads the file, not the return value: reporting a role as removed while
+#  leaving it in the configuration is exactly the failure worth catching.
+check "a role that loses its only target goes" "both" \
+  "$(rm_case "
+llmreg.remove_model('a')
+print(' '.join(sorted(llmreg.read_selectors())))")"
+check "and it says so"                "onlya" \
+  "$(rm_case "print(' '.join(llmreg.remove_model('a')['rolesRemoved']))")"
+check "a role with others left shrinks" "b" \
+  "$(rm_case "
+llmreg.remove_model('a')
+print(' '.join(llmreg.read_selectors()['both']['targets']))")"
+check "files stay unless asked"       "True" \
+  "$(rm_case "
+llmreg.remove_model('a')
+print(os.path.isdir(os.path.join(home, 'models', 'a')))")"
+check "files go when asked"           "False" \
+  "$(rm_case "
+llmreg.remove_model('a', delete_files=True)
+print(os.path.isdir(os.path.join(home, 'models', 'a')))")"
+check_err "an unknown name refuses"   KeyError \
+  "$(rm_case "llmreg.remove_model('ghost')" 2>/dev/null)"
+check_err "and so does a traversal attempt" KeyError \
+  "$(rm_case "llmreg.remove_model('../victim', delete_files=True)" 2>/dev/null)"
+check "nothing outside models/ is touched" "True" \
+  "$(rm_case "
+try:
+    llmreg.remove_model('../victim', delete_files=True)
+except KeyError:
+    pass
+print(os.path.isfile(os.path.join(home, 'models', 'victim', 'keep.gguf')))")"
 
 summary
