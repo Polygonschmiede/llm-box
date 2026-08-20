@@ -7,6 +7,36 @@ All notable changes to llm-box. Format follows
 Version numbers describe **llm-box itself**, not the engines it drives —
 `llm versions` reports those, and `llm update` moves them independently.
 
+## [Unreleased]
+
+### Added
+
+- The registry reports **which** `reasoning_effort` values a model's chat
+  template accepts, read out of the GGUF header, plus the default and whether
+  thinking is preserved across turns: `runtime.reasoningEffort` and
+  `compat.reasoningEfforts` in what pi receives. llama.cpp only reports
+  `supports_reasoning_effort: true`, so a client offering the usual OpenAI
+  low/medium/high picker gets an HTTP 500 from Jinja on two of the three —
+  Qwen3.8 accepts `xhigh`, `medium` and `low` and raises on `high`.
+- `docs/FLAGS.md` gains a "Thinking depth" section: the accepted values come
+  from the model rather than from llama.cpp, `--reasoning-effort` is a floor and
+  not a ceiling, old `reasoning_content` accumulates unless
+  `--no-reasoning-preserve` says otherwise, and switching effort mid-session
+  invalidates the whole prompt cache because the instruction is rendered ahead
+  of the system prompt.
+
+### Fixed
+
+- `docs/FLAGS.md` listed `high` as a valid `reasoning_effort`. On the model this
+  project ships examples for, it is an HTTP 500.
+
+### Changed
+
+- `qwen3.8-27b-q6_k` and `qwen3.8-27b-q8_0` carry
+  `--reasoning-effort low --no-reasoning-preserve`. The template defaults to
+  `xhigh`, and the harnesses that drive local models mostly send no effort field
+  at all, so the default was the slowest setting with no way to notice.
+
 ## [1.2.0] — 2026-08-20
 
 Maintenance: the first tests for the parts that decide whether a model loads,

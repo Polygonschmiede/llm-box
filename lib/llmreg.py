@@ -339,6 +339,31 @@ def vram_needed(weights: int | None, kv: int | None) -> int | None:
     return int((weights + (kv or 0)) * VRAM_HEADROOM)
 
 
+def reasoning_efforts(meta: dict | None) -> dict | None:
+    """Which reasoning_effort values the chat template accepts, and its default.
+
+    llama.cpp reports `supports_reasoning_effort: true` and nothing about the
+    allowed set, so a client offering the usual OpenAI low/medium/high picker
+    gets an HTTP 500 from Jinja on two of the three. Qwen3.8 for instance takes
+    only xhigh, medium and low - 'high' raises. The template is in the GGUF
+    header, so the set can be read instead of guessed.
+
+    Returns None when the template does not gate the value, which is most of
+    them - then anything goes and there is nothing to report.
+    """
+    tmpl = (meta or {}).get("tokenizer.chat_template") or ""
+    if "reasoning_effort" not in tmpl:
+        return None
+    m = re.search(r"reasoning_effort\s+not\s+in\s*\(([^)]*)\)", tmpl)
+    if not m:
+        return None
+    values = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+    if not values:
+        return None
+    d = re.search(r"reasoning_effort\s*\|\s*default\(\s*['\"]([^'\"]+)", tmpl)
+    return {"values": values, "default": d.group(1) if d else None}
+
+
 def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
                    parallel: int = 1, meta: dict | None = None) -> int | None:
     """Size of the KV cache in bytes, from the real GGUF header.
@@ -840,6 +865,12 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
     gguf = gguf_meta(model_file) \
         if (want_gguf and model_file and os.path.exists(model_file)) else {}
     parallel, kv_unified = slots_of(cmd, role)
+    #  What the template accepts, and the floor this entry sets on the command
+    #  line. A client that sends nothing gets the floor; one that sends a value
+    #  overrides it (server-common.cpp merges CLI kwargs first, request second).
+    efforts = reasoning_efforts(gguf)
+    effort_default = flag(cmd, "--reasoning-effort")
+    preserve = not has_flag_any(cmd, "--no-reasoning-preserve", "-no-rp")
     kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel or 1) \
         if (model_file and ctx) else None
 
@@ -859,6 +890,13 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
             "kvCacheQuant": kv_quant,
             "parallel": parallel,
             "kvUnified": kv_unified,
+            "reasoningEffort": {
+                #  None = the template does not gate the value, so anything goes.
+                "accepts": (efforts or {}).get("values"),
+                "templateDefault": (efforts or {}).get("default"),
+                "serverDefault": effort_default,
+                "preserveThinking": preserve,
+            } if role == "chat" else None,
             "mmproj": mmproj,
             "cmd": cmd,
         },
@@ -932,6 +970,14 @@ def pi_entry(model: dict) -> dict | None:
     #  it provider-wide. This sits before the '# pi-json:' block so an explicit
     #  override still wins.
     entry.setdefault("compat", {})["supportsReasoningEffort"] = entry["reasoning"]
+    #  And WHICH values, when the template gates them. Without this a client
+    #  offering the usual low/medium/high gets a Jinja exception on 'high'.
+    re_info = (model["runtime"].get("reasoningEffort") or {})
+    if entry["reasoning"] and re_info.get("accepts"):
+        entry["compat"]["reasoningEfforts"] = re_info["accepts"]
+        if re_info.get("serverDefault") or re_info.get("templateDefault"):
+            entry["compat"]["reasoningEffortDefault"] = (
+                re_info.get("serverDefault") or re_info.get("templateDefault"))
     for k, v in (model.get("_pi_json") or {}).items():
         if k == "compat":
             entry.setdefault("compat", {}).update(v)

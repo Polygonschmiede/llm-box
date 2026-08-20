@@ -196,6 +196,24 @@ Two capability flags are reported rather than guessed:
 Embedders, rerankers and Whisper are not reported to pi: they hang off the same
 endpoint but are not chat models.
 
+## Steering how long the model thinks
+
+The registry reports, per model, whether the template takes a `reasoning_effort`
+and **which values** — `compat.reasoningEfforts` plus
+`compat.reasoningEffortDefault`. That matters because llama.cpp only says "yes,
+supported": Qwen3.8 accepts `xhigh`, `medium` and `low` and answers `high` with an
+HTTP 500 from Jinja, so a client offering the usual low/medium/high picker fails
+on a third of it. With the list in hand a client can offer only what works.
+
+The server sets the floor (`--reasoning-effort` on the model entry, see
+[FLAGS.md](FLAGS.md)); a request that carries the field overrides it. So the
+sensible split is: the server keeps the default sane for everything that sends
+nothing, and pi raises it when a task deserves it.
+
+One caveat worth respecting: the effort instruction is rendered at the very front
+of the prompt, so changing it between turns invalidates the whole prompt cache.
+Choose per session, not per task.
+
 ## Giving subagents a different model
 
 The registry serves **roles** (`llm role` on the server) alongside the models, so

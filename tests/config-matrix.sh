@@ -380,4 +380,50 @@ except KeyError:
     pass
 print(os.path.isfile(os.path.join(home, 'models', 'victim', 'keep.gguf')))")"
 
+# ---------------------------------------------------------------------------
+#  llama.cpp reports supports_reasoning_effort as a bare true and says nothing
+#  about the allowed set, so a client offering the usual OpenAI low/medium/high
+#  gets a Jinja exception on two of them. Qwen3.8 takes xhigh, medium and low -
+#  'high' raises. The template is in the GGUF header, so read it rather than guess.
+section "reasoning_effort: which values the template actually accepts"
+check "the gated set is read"        "xhigh medium low" \
+  "$(run "$H" "
+t = chr(39)
+tmpl = ('{%- set r = reasoning_effort|default(' + t + 'xhigh' + t + ') %}'
+        '{%- if reasoning_effort not in (' + t + 'xhigh' + t + ', '
+        + t + 'medium' + t + ', ' + t + 'low' + t + ') %}raise{%- endif %}')
+print(' '.join(llmreg.reasoning_efforts({'tokenizer.chat_template': tmpl})['values']))")"
+check "and the template default"     "xhigh" \
+  "$(run "$H" "
+t = chr(39)
+tmpl = ('{%- set r = reasoning_effort|default(' + t + 'xhigh' + t + ') %}'
+        '{%- if reasoning_effort not in (' + t + 'low' + t + ') %}raise{%- endif %}')
+print(llmreg.reasoning_efforts({'tokenizer.chat_template': tmpl})['default'])")"
+check "an ungated template reports nothing" "None" \
+  "$(run "$H" "print(llmreg.reasoning_efforts({'tokenizer.chat_template': '{{ messages }}'}))")"
+check "mentioned but not gated"      "None" \
+  "$(run "$H" "print(llmreg.reasoning_efforts({'tokenizer.chat_template': '{{ reasoning_effort }}'}))")"
+check "no header at all"             "None" \
+  "$(run "$H" "print(llmreg.reasoning_efforts(None))")"
+
+#  The floor: a client that sends nothing gets this, one that sends a value
+#  overrides it. server-common.cpp merges the CLI kwargs first, the request
+#  second, the OAI field last - so it is a floor, not a ceiling.
+section "the server-side floor is read off the command line"
+H2="$(cfg)"
+add_block "$H2" floored \
+  '${server} -m /home/x/models/floored/f.gguf -c 8192 --reasoning-effort low --no-reasoning-preserve'
+check "the floor is reported"        "low" \
+  "$(run "$H2" "print(llmreg.get_model('floored', with_live=False)['runtime']['reasoningEffort']['serverDefault'])")"
+check "preserve off is detected"     "False" \
+  "$(run "$H2" "print(llmreg.get_model('floored', with_live=False)['runtime']['reasoningEffort']['preserveThinking'])")"
+check "preserve defaults to on"      "True" \
+  "$(run "$H2" "print(llmreg.get_model('big', with_live=False)['runtime']['reasoningEffort']['preserveThinking'])")"
+check "no floor set"                 "None" \
+  "$(run "$H2" "print(llmreg.get_model('big', with_live=False)['runtime']['reasoningEffort']['serverDefault'])")"
+check "whisper has no effort block"  "None" \
+  "$(run "$H2" "
+m = [x for x in llmreg.catalog(with_live=False) if x['role'] == 'stt']
+print(m[0]['runtime'].get('reasoningEffort') if m else 'no stt model')")"
+
 summary
