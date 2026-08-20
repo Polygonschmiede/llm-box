@@ -232,6 +232,10 @@ always wins:
 | `# pi: thinkingFormat=qwen-chat-template` | set the thinking format |
 | `# pi-json: {"compat":{…}}` | mix in arbitrary fields from the pi documentation |
 
+Boolean values accept `true`/`1`/`yes` — and `ja`, which older configurations
+written before this project was translated may still contain. A bare `# pi: skip`
+with no value counts as true.
+
 A trailing comment (` # …`) is allowed. The same works over the API through
 `piOverrides` in `PATCH /api/models/{id}`.
 

@@ -516,7 +516,8 @@ def _check_add(body: dict) -> tuple[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
         raise HTTPException(400, "repo must be 'publisher/name' (e.g. 'unsloth/Qwen3-8B-GGUF')")
     if not re.fullmatch(r"[A-Za-z0-9_.]+", quant):
-        raise HTTPException(400, "quant enthaelt unerlaubte Zeichen (z.B. 'Q4_K_M')")
+        raise HTTPException(400, "quant contains characters that are not allowed "
+                                 "(it looks like 'Q4_K_M')")
     extra = str(body.get("extraFlags") or "")
     if re.search(r"[;&|<>`$\n\r\"']", extra):
         raise HTTPException(400, "extraFlags contains metacharacters - plain flags only")
@@ -557,7 +558,7 @@ def api_add(body: dict = Body(...)):
         argv += ["--", *str(body["extraFlags"]).split()]
     job_id = job_start("add", argv)
     return {"jobId": job_id, "argv": argv,
-            "hint": "Fortschritt: GET /api/jobs/%s" % job_id}
+            "hint": "progress: GET /api/jobs/%s" % job_id}
 
 
 @app.get("/api/jobs")

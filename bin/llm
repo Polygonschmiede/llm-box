@@ -1032,7 +1032,7 @@ case "${1:-}" in
   setup)   cmd_setup;;
   doctor)  cmd_doctor;;
   add)     require_config || exit 1; shift; cmd_add "$@";;
-  rm)      shift; cmd_rm "$@";;
+  rm)      require_config || exit 1; shift; cmd_rm "$@";;
   ls|list) require_config || exit 1; cmd_ls;;
   search)  shift; cmd_search "$@";;
   edit)    require_config || exit 1; "${EDITOR:-nano}" "$CONFIG"; warn "do not forget:  llm llama restart";;
@@ -1064,7 +1064,7 @@ case "${1:-}" in
   -V|--version|version) printf 'llm-box %s\n' "$(llm_version)";;
   # Overview / monitoring
   status|st) cmd_dash;;
-  role|roles) shift; cmd_role "$@";;
+  role|roles) require_config || exit 1; shift; cmd_role "$@";;
   gpu)     case "${2:-}" in
              list)  reg gpus --table;;
              sync)  if [[ "${3:-}" == "--dry-run" ]]; then

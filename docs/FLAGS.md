@@ -317,8 +317,8 @@ groups:
     exclusive: false   # and do not evict anything from other groups
     persistent: true   # and no other group may evict THEM
     members:
-      - "qwen3.8-27b-q6_k"        # Karte 0
-      - "qwen3-embedding-4b-q8_0" # Karte 1
+      - "qwen3.8-27b-q6_k"        # card 0
+      - "qwen3-embedding-4b-q8_0" # card 1
 ```
 
 Only that lets **two cards each hold a model at the same time** — without a group,

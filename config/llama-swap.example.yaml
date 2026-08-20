@@ -9,9 +9,12 @@
 #   - You do NOT add models by hand; use:  llm add <repo> <quant>
 #     (which appends a block at the end of this file).
 #
-#  THIS FILE IS THE TEMPLATE. 'llm init' substitutes @LLM_HOME@/@WHISPER_HOME@
-#  and writes config/llama-swap.yaml from it — that one belongs to the machine
-#  and is therefore not in the repository.
+#  THIS FILE IS THE TEMPLATE. 'llm init' fills in the two path placeholders and
+#  writes config/llama-swap.yaml from it — that one belongs to the machine and is
+#  therefore not in the repository. Do not name the placeholders in a comment:
+#  the substitution is a plain sed over the whole file and would rewrite the
+#  comment too, which is how generated configs used to end up with a path like
+#  '/home/you/llm//home/you/whisper.cpp' in their header.
 #
 #  Endpoint afterwards:  http://<server-ip>:8080/v1   ('llm url' prints it)
 # ============================================================================
@@ -100,77 +103,16 @@ models:
 
 # --- From here on 'llm add' / 'llm rm' manage the entries automatically. ----
 #
-#  PROVEN ENTRIES, all commented out (= inactive).
-#  These are settings that were measured to work well on 2x Radeon AI PRO R9700
-#  (32 GB each), including the MTP flags. Take a block as a reference, download
-#  the model with 'llm add <hf-repo> <quant>' and compare. Un-commenting alone
-#  does NOT work: without the matching GGUF file llama-swap will not start.
+#  What one entry looks like (commented out = inactive). Everything except 'cmd'
+#  is optional; 'llm add' writes this for you and it is easier to fix a flag with
+#  'llm edit' or a PATCH than to write a block by hand:
 #
-#  An entry looks like this:
+#  # >>> llm:gemma-3-4b
 #    "gemma-3-4b":
 #      cmd: "${server} -m @LLM_HOME@/models/gemma-3-4b/gemma-3-4b-it-Q4_K_M.gguf -c 8192"
-#      ttl: 900      # unload after 900s without use (frees VRAM); 0 = never
-
-
-
-# --- qwen3.6-35b-a3b-mtp-q4_k_m ---
-#  "qwen3.6-35b-a3b-mtp-q4_k_m":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.6-35b-a3b-mtp-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -c 200000 --spec-draft-n-max 2"
-#    ttl: 900
-
-
-
-
-# --- qwen3-coder-next-ud-q4_k_m ---
-#  "qwen3-coder-next-ud-q4_k_m":
-#    cmd: "${server-ngram} -m @LLM_HOME@/models/qwen3-coder-next-ud-q4_k_m/Qwen3-Coder-Next-UD-Q4_K_M.gguf -c 65536 --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0 --no-context-shift"
-#    ttl: 900
-
-
-
-# --- qwen3.8-27b-q8_0 ---
-#  "qwen3.8-27b-q8_0":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q8_0/Qwen3.8-27B-Q8_0.gguf -c 262144 --spec-draft-n-max 2 -np 4 -kvu -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0"
-#    ttl: 900
-
-# --- qwen3.8-27b-q6_k ---
-#  "qwen3.8-27b-q6_k":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q6_k/Qwen3.8-27B-Q6_K.gguf -c 131072 --spec-draft-n-max 2 -np 4 -kvu -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --device ROCm0 -sm none -mg 0 --spec-draft-device ROCm0"
-#    ttl: 900
-
-# --- qwen3-reranker-0.6b-q8_0 ---
-#  "qwen3-reranker-0.6b-q8_0":
-#    cmd: "${server-rerank} -m @LLM_HOME@/models/qwen3-reranker-0.6b-q8_0/qwen3-reranker-0.6b-q8_0.gguf -c 4096 --device ROCm1 -sm none -mg 0"
-#    ttl: 0
-
-# --- whisper-large-v3-turbo ---
-#  "whisper-large-v3-turbo":
-#    cmd: "@WHISPER_HOME@/build/bin/whisper-server -m @LLM_HOME@/models/whisper-large-v3-turbo/ggml-large-v3-turbo-q8_0.bin --host 127.0.0.1 --port ${PORT} --request-path /v1/audio --inference-path /transcriptions -l auto -t 4"
-#    env:
-#      - "HIP_VISIBLE_DEVICES=1"
-#    checkEndpoint: "/v1/audio/health"
-#    ttl: 900
-
-# --- qwen3.5-4b-q4_k_m ---
-#  "qwen3.5-4b-q4_k_m":
-#    cmd: "${server} -m @LLM_HOME@/models/qwen3.5-4b-q4_k_m/Qwen3.5-4B-Q4_K_M.gguf -c 8192 --device ROCm1 -sm none -mg 0 -rea off"
-#    ttl: 900
-#  # pi: skip          # service model (titles/tags) - not useful in an agent
-
-# --- whisper-large-v3-turbo-german ---
-#  "whisper-large-v3-turbo-german":
-#    cmd: "@WHISPER_HOME@/build/bin/whisper-server -m @LLM_HOME@/models/whisper-large-v3-turbo-german/ggml-model.bin --host 127.0.0.1 --port ${PORT} --request-path /v1/audio --inference-path /transcriptions -l de -t 4"
-#    env:
-#      - "HIP_VISIBLE_DEVICES=1"
-#    checkEndpoint: "/v1/audio/health"
-#    ttl: 900
-
-# --- qwen3-embedding-4b-q8_0 ---
-#  "qwen3-embedding-4b-q8_0":
-#    cmd: "${server-embed} -m @LLM_HOME@/models/qwen3-embedding-4b-q8_0/Qwen3-Embedding-4B-Q8_0.gguf -c 4096 --device ROCm1 -sm none -mg 0"
-#    ttl: 0
-
-# --- gemma-4-26b-a4b-it-ud-q4_k_xl ---
-#  "gemma-4-26b-a4b-it-ud-q4_k_xl":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/gemma-4-26b-a4b-it-ud-q4_k_xl/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf -c 65536 --mmproj @LLM_HOME@/models/mmproj-gemma-4-26b/mmproj-F16.gguf --model-draft @LLM_HOME@/models/gemma-4-26b-a4b-it-ud-q4_k_xl/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
-#    ttl: 900
+#      ttl: 900         # unload after 900 idle seconds (0 = never)
+#  # <<< llm:gemma-3-4b
+#
+#  The marker comments are not decoration: only what sits between them is
+#  visible to 'llm ls', the registry and pi. An entry added without them still
+#  works in llama-swap and is invisible to everything else.

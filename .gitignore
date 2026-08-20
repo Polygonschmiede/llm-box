@@ -4,6 +4,15 @@
 # ============================================================================
 
 # Model files (GGUFs, often tens of GB) — restore with 'llm add'
+#  Including the .llm-model.json provenance sidecars. They are the only thing in
+#  here that cannot simply be downloaded again - repo, quant, revision SHA and
+#  checksums, which 'llm meta backfill' can rebuild only partly and not at all
+#  once the Hugging Face cache has been cleaned. They stay out anyway, for the
+#  same reason config/llama-swap.yaml does: they are THIS machine's model list,
+#  not part of the tool. Back them up with the rest of your configuration -
+#  'llm meta' prints what they contain. (If you do want them in your own fork,
+#  git will not descend into an ignored directory, so a negation needs
+#  'models/*' + '!models/*/' + 'models/*/*' rather than 'models/'.)
 models/
 
 # Python environments — recreate with 'llm setup'

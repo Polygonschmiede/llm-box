@@ -299,7 +299,7 @@ def gguf_meta(path: str) -> dict:
                         return vals if n <= 64 else n
                     if et not in _GT:
                         raise ValueError("array type %s" % et)
-                    if n > 4096:                      # riesige Zahlen-Arrays ueberspringen
+                    if n > 4096:                      # skip huge numeric arrays
                         fh.seek(_GS[et] * n, os.SEEK_CUR)
                         return n
                     return list(struct.unpack("<%d%s" % (n, _GT[et]), fh.read(_GS[et] * n)))
@@ -354,7 +354,7 @@ def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
       * hybrid (Qwen3.x, 'full_attention_interval'): only every Nth layer has a
         KV cache, the rest are SSM layers with constant state
       * sliding window (Gemma 4): SWA layers only store the window and
-        haben eigene Key-/Value-Laengen
+        have their own key/value lengths
     """
     #  meta is injectable so the three layout branches below can be checked
     #  against synthetic headers - the arithmetic decides whether a load OOMs,
@@ -906,7 +906,9 @@ def pi_entry(model: dict) -> dict | None:
     over = model.get("_pi_over", {})
     # '# pi: skip' (no value) and '# pi: skip=true' (how the API writes it)
     skip = over.get("skip")
-    if skip is True or str(skip).strip().lower() in ("1", "true", "ja", "yes"):
+    #  "ja" is accepted for backwards compatibility with configurations written
+    #  before this file was translated; documented in docs/PI.md.
+    if skip is True or str(skip).strip().lower() in ("1", "true", "yes", "ja"):
         return None
     ctx = model["runtime"]["contextWindow"] or 8192
     entry = {"id": model["id"]}
@@ -1148,7 +1150,7 @@ def sync_groups(text: str | None = None) -> str:
                  "    persistent: true\n    members:\n" % PINNED_GROUP)
         width = max(len(n) for n, _ in members) + 2
         for name, card in members:
-            block += '      - %-*s # Karte %d\n' % (width, '"%s"' % name, card)
+            block += '      - %-*s # card %d\n' % (width, '"%s"' % name, card)
     head = ("# " + "=" * 76 + "\n"
             "#  CARD GROUPS  —  maintained by 'llm add --gpu N' / 'llm gpu sync'\n"
             "# " + "=" * 76 + "\n"
@@ -1338,7 +1340,8 @@ def sync_tensor_split(text: str | None = None, value: str = "auto") -> str:
     while i < n:
         line = lines[i]
         if re.match(r"^macros:\s*$", line):
-            in_macros, _ = True, out.append(line)
+            in_macros = True
+            out.append(line)
             i += 1
             continue
         if in_macros and line.strip() and not line[:1].isspace():
@@ -1421,7 +1424,7 @@ def gpu_sync(dry_run: bool = False) -> dict:
         import difflib
         out["diff"] = "\n".join(difflib.unified_diff(
             old.splitlines(), new.splitlines(),
-            fromfile="llama-swap.yaml", tofile="llama-swap.yaml (neu)", lineterm=""))
+            fromfile="llama-swap.yaml", tofile="llama-swap.yaml (new)", lineterm=""))
         return out
     if changed:
         with config_lock():
@@ -1581,7 +1584,7 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
             body_new = pat.sub("" if val is None else line, body_new)
         elif val is not None:
             body_new = body_new.rstrip("\n") + "\n" + line
-        notes.append("pi-Override %s" % key)
+        notes.append("pi override %s" % key)
 
     # Does it still fit on the card? Evaluate the PATCHED command, not `before`:
     # -ctk halves the KV cache and -np changes the slot count, so checking the
