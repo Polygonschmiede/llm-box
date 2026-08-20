@@ -79,6 +79,7 @@ async function cardIndices(): Promise<number[]> {
 
 /** "all cards" or "card N" - without assuming how many there are. */
 function gpuLabel(gpu: any): string {
+  if (gpu?.mode === "role") return "role";          // virtual, sits on no card
   return gpu?.mode === "both" ? "all cards" : `card ${gpu?.device}`;
 }
 
@@ -110,6 +111,13 @@ function toPiModel(m: any) {
 function short(m: any): string {
   const gpu = gpuLabel(m.runtime?.gpu);
   const state = m.state === "ready" ? "loaded" : m.state;
+  const sel = m.runtime?.selector;
+  if (sel) {
+    //  A role is a name in front of several models - there is no card, no
+    //  file and nothing to move, so it reads differently on purpose.
+    return `${m.id}  [role ${sel.strategy} -> ${sel.targets.join(" | ")}, ctx ${
+      m.runtime?.contextWindow ?? "-"}]`;
+  }
   return `${m.id}  [${m.role}, ${gpu}, ctx ${m.runtime?.contextWindow ?? "-"}, ${state}]`;
 }
 
@@ -370,6 +378,11 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (args.trim() === "add") return addFlow(ctx);
+
+      //  Roles (selectors) are shown by the registry alongside the models, but
+      //  they have no card, no file and no cmd line - none of the actions below
+      //  apply to them. They are configured on the server with 'llm role'.
+      models = models.filter((m) => m.kind !== "role");
 
       const pick = await ctx.ui.select("Pick a model:", [
         ...models.map(short),

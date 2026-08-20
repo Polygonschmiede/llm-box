@@ -188,6 +188,34 @@ Two capability flags are reported rather than guessed:
 Embedders, rerankers and Whisper are not reported to pi: they hang off the same
 endpoint but are not chat models.
 
+## Giving subagents a different model
+
+The registry serves **roles** (`llm role` on the server) alongside the models, so
+they show up in pi's model list like any other entry. A role is one name in front
+of several models, and the server decides which one answers:
+
+```bash
+# on the server
+llm role set coder spillover qwen3.8-27b-q6_k <small-model> --spillover=2
+llm role set fast  pin       <small-model>
+llm restart
+```
+
+Then point the main agent at `coder` and its subagents at `fast`. With `spillover`
+you do not even have to split them by hand: the first two concurrent requests go to
+the big model on card 0, and everything beyond that starts the small model on card 1.
+The client sends `coder` either way.
+
+Two things to know before you rely on it:
+
+- A role reports the **smallest** context window and the **intersection** of the
+  capabilities of its targets — otherwise pi would send 131k tokens at a model that
+  holds 8k. `llm role` prints the effective values; check them after changing
+  targets, because adding one small model shrinks the whole role.
+- Roles are read-only from pi's side. The tools that move a model between cards or
+  change its context (`llm_set_config`, `/llm`) deliberately skip them: a role has
+  no card, no file and no command line. Change one with `llm role` on the server.
+
 ## When the derivation is wrong
 
 One line **inside the model's marker block** in `config/llama-swap.yaml` (`llm edit`)

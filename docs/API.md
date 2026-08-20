@@ -41,15 +41,17 @@ curl -s 'http://<server-ip>:8081/api/models?slim=true' | jq -r \
 ```jsonc
 {
   "id": "qwen3.8-27b-q6_k",
+  "kind": "model",                      // model | role  (see "Roles" below)
   "role": "chat",                       // chat | embed | rerank | stt
   "state": "ready",                     // ready | unloaded | unknown
   "ttl": 900,                           // idle seconds before unloading (0 = never)
   "runtime": {
     "macro": "server-mtp",
     "contextWindow": 131072,
-    "gpu": { "mode": "single", "device": 0, "group": "gpu0", "via": "flag" },
+    "gpu": { "mode": "single", "device": 0, "group": "pinned", "via": "flag" },
     "specDecoding": "mtp",              // mtp | ngram | none
-    "kvCacheQuant": "q8_0", "parallel": 1,
+    "kvCacheQuant": "q8_0",
+    "parallel": 4, "kvUnified": true,   // slots; no -np flag means 4 + shared KV
     "mmproj": "…/mmproj-Qwen3.8-27B-f16.gguf",
     "cmd": "…"                          // the complete llama-server line
   },
@@ -74,11 +76,50 @@ there is no second list that could go stale. `source` comes from
 The `slim=true` form additionally carries `gpuMode` and `gpuDevice` as separate
 fields, so an agent does not have to parse the human-readable `gpu` string.
 
+**Slots:** `parallel` is what llama-server will really do, not the literal flag —
+llama.cpp treats a missing `-np` as four slots with a unified KV cache
+(`server.cpp`), so the catalog reports `4`, not `1`. `kvUnified` says whether the
+`contextWindow` is one shared pool (a single request may use all of it) or a hard
+per-slot share. Both are `null` for `role: "stt"`, because whisper-server has
+neither. Writable through `PATCH` as `parallel`.
+
 **The VRAM figure is calculated, not guessed:** from the GGUF header (layers, KV
 heads, key/value length) plus the KV quantisation, including the awkward cases —
 hybrid models with `full_attention_interval` (Qwen3.x: only every 4th layer has a KV
 cache) and sliding-window layers (Gemma 4). Cross-check: for Qwen3.8-27B-Q6_K at
 131k context the estimate says 29.3 GB and the measurement is 30.7 GB.
+
+### Roles
+
+Entries with `"kind": "role"` are **not** models: they are virtual names that
+llama-swap resolves per request (`llm role` on the server, `selectors:` in the
+YAML). They carry no `files`, no `source`, no `vram` and `runtime.cmd` is `null`:
+
+```jsonc
+{
+  "id": "coder",
+  "kind": "role",
+  "role": "chat",                       // the role of its targets
+  "state": "ready",                     // ready as soon as ONE target is loaded
+  "activeTargets": ["qwen3.8-27b-q6_k"],
+  "runtime": {
+    "selector": { "strategy": "spillover",   // warm | pin | spillover
+                  "targets": ["qwen3.8-27b-q6_k", "qwen3.5-4b-q4_k_m"],
+                  "spillover": 2 },
+    "contextWindow": 8192,              // the MINIMUM over the targets
+    "gpu": { "mode": "role", "device": null, "group": "pinned", "via": "selector" },
+    "cmd": null
+  },
+  "capabilities": { … },                // the INTERSECTION over the targets
+  "pi": { … }
+}
+```
+
+`contextWindow` and `capabilities` are deliberately the weakest common denominator:
+a client that trusted the larger of two targets would fail on every second request.
+Filtering by `?role=chat` returns roles too, which is what makes them appear in pi.
+They are **read-only** over this API — `PATCH`, `load` and `DELETE` apply to models;
+change a role with `llm role` on the server.
 
 ### About card numbers
 
@@ -96,7 +137,7 @@ The key lives in `config/api-token`, generated on first start, readable only by 
 
 | Endpoint | Effect |
 |---|---|
-| `PATCH /api/models/{id}` | `gpu`, `contextWindow`, `ttl`, `sampling`, `piOverrides`, `force` |
+| `PATCH /api/models/{id}` | `gpu`, `contextWindow`, `parallel`, `ttl`, `sampling`, `piOverrides`, `force` |
 | `PATCH /api/models/{id}?dryRun=true` | check and show before/after — change nothing |
 | `POST /api/models/{id}/load` | pull a model into VRAM |
 | `POST /api/unload` | unload everything (llama-swap only knows all-or-nothing) |
@@ -131,6 +172,23 @@ words:
 ```
 
 `{"force": true}` overrides that.
+
+> The fit check compares against the VRAM that is free **right now**, so patching a
+> model while it is loaded fails against its own footprint. `POST /api/unload`
+> first, or pass `?dryRun=true` to see the diff without the check biting.
+
+**Changing the slot count** — how many requests a model serves at once:
+
+```bash
+curl -X PATCH http://<server-ip>:8081/api/models/qwen3.8-27b-q6_k \
+     -H "X-LLM-Token: $T" -H 'Content-Type: application/json' \
+     -d '{"parallel": 4}'
+```
+
+That writes `-np 4 -kvu` and removes whatever spelling was there before. Slots cost
+no KV cache — `-c` is the total either way — but a little compute buffer, ~1.4 GB on
+a 27B. What they buy is fairness rather than throughput; the measurements are in
+[FLAGS.md](FLAGS.md#slots-several-clients-or-agents-at-once).
 
 ## Provenance: which quant from which publisher
 

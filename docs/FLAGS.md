@@ -18,7 +18,8 @@ To change an option for *all* models, change the macro — not every model.
 | `-c 8192` | context size (the token "memory"). Larger = more VRAM. `llm add -c 32768 …` |
 | `-fa on` | flash attention — faster and leaner, leave it on. |
 | `-ctk q8_0 -ctv q8_0` | quantise the KV cache: **halves** context memory, quality loss not measurable in practice. Worth it from ~64k context. |
-| `--parallel 1` | only **one** slot. Otherwise llama.cpp divides the `-c` tokens among slots — at `-c 131072` with 4 slots a single request only gets 32k. |
+| `-np 4 -kvu` | four **slots**: four requests are served at the same time instead of queueing. `-c` is the *total* KV either way, so slots cost no KV memory — only ~1.4 GB of extra compute buffer on a 27B. `-kvu` makes the `-c` tokens one shared pool, so a lone request may still use all of them; without it each slot gets a hard `-c / slots` share. Leaving the flag out entirely is the same as `-np 4 -kvu` (llama.cpp's auto default). See "Slots" below. |
+| `-cram 16384` | how much **host RAM** (MiB) may hold prompt caches, so a returning agent does not re-read its whole prompt. Costs no VRAM. Default is 8192. See "Slots" below. |
 | `--mmproj <file>` | vision projector for image models (see "Understanding images"). |
 | `--jinja` | correct chat templates and tool calling (essential for agents and editors). |
 | `--host/--port` | set by llama-swap (`${PORT}`) — do not touch. |
@@ -39,6 +40,83 @@ without a tensor split, llama.cpp distributes **by free VRAM at load time**
 (`llama.cpp/src/llama-model.cpp`, "default split, by free memory"). If one card
 already holds something, the model lands almost entirely on the other one, and the
 placement is no longer reproducible.
+
+## Slots (several clients or agents at once)
+
+One llama-server serves as many requests at a time as it has **slots**. With
+`--parallel 1` there is exactly one, so a second client — or a subagent — waits in
+a queue until the first is done. llama-swap itself allows ten concurrent requests
+per model, so the queue is never its fault.
+
+`-c` is the *total* KV cache in either case: with `-kvu` all sequences share those
+tokens as one pool, without it each slot gets a hard `-c / slots` share
+(`llama-context.cpp`, `n_ctx_seq`). Slots therefore cost **no** KV memory. Omitting
+`-np` entirely is the same as `-np 4 -kvu`.
+
+### What it actually buys — measured on 2× R9700, Qwen3.8-27B-Q6_K, `-c 131072`
+
+Two clients, five steps each, ~11k tokens of session context per client:
+
+| | `--parallel 1` | `-np 4 -kvu` |
+|---|---|---|
+| total wall clock | 66.6 s | 66.7 s |
+| a warm step, mean | 8.1 s | **4.6 s** |
+| a warm step, median | 5.8 s | 4.9 s |
+| a warm step, **worst case** | **24.7 s** | **5.0 s** |
+| VRAM on card 0 | 30.76 GB | 32.17 GB |
+
+Read that carefully: the **total throughput does not change**. One card has a fixed
+budget and slots do not enlarge it. What changes is *fairness*. With one slot a step
+that needed 0.6 s of work randomly took 24.7 s because it sat behind another
+client's prompt. With four slots every step lands between 3.4 and 5.1 s. That is the
+whole point — the machine stops feeling blocked.
+
+### Where slots do *not* help
+
+Prompt processing (prefill) is a single, saturated resource on this hardware:
+
+| four 15k-token prompts at once | prefill throughput |
+|---|---|
+| `--parallel 1` (queued) | 549 tok/s |
+| `-np 4 -kvu` (interleaved) | 391 tok/s |
+
+Four prefills interleaving in `-ub`-sized chunks is **slower** than doing them one
+after another. Raising `-b 4096 -ub 1024` recovered only 2.6 % of that and cost
+0.43 GB, so this stack leaves `-b`/`-ub` at llama.cpp's defaults. A single card
+prefills ~560 tok/s and no flag changes that; the only real cure is a second card
+with its own model (see "One, two or more GPUs").
+
+### The flag that matters more than slots: `-cram`
+
+Agents send almost the same prompt every step. The prompt cache means only the new
+tokens are read — 1.2 s instead of 34 s in the runs above, an 80 % cache hit rate.
+`-cram` caps that cache in **host RAM**, and the default is only 8192 MiB. At
+roughly 36 KB per token for a 27B with a q8_0 KV cache, 8 GB holds about 228k tokens
+of cached prefix — four agents with 60k contexts already exceed it, and then every
+step pays the full prefill again. Same four-client test, cache artificially reduced:
+
+| four clients, three steps | `-cram 512` | `-cram 8192` (default) |
+|---|---|---|
+| tokens re-read | 56 917 | 45 627 (the minimum possible) |
+| wall clock | 165.0 s | 138.0 s |
+| a warm step, mean | 25.6 s | 12.2 s |
+
+The macros here set `-cram 16384`. It is a ceiling, not a reservation, and it costs
+no VRAM — check `free -g` before raising it much further, since every running model
+may claim its own.
+
+### How many slots
+
+Four is a good default and what llama.cpp picks on its own. Note the four-client
+numbers above: the worst-case warm step was 18.1 s against 5.0 s with two clients.
+One card comfortably serves **two or three** concurrent agents; beyond that the
+prefill ceiling dominates and a second card is the answer, not more slots.
+
+```bash
+llm add --slots 4 …                                   # when adding
+llm ls                                                # SLOTS column, * = -kvu
+curl -s localhost:8080/upstream/<model>/props | jq .total_slots   # what is really running
+```
 
 ## Token prediction (answering faster)
 
@@ -181,7 +259,7 @@ and unloaded like any model:
     cmd: "@WHISPER_HOME@/build/bin/whisper-server -m …/ggml-large-v3-turbo-q8_0.bin
           --host 127.0.0.1 --port ${PORT} --request-path /v1/audio
           --inference-path /transcriptions -l auto"
-    env: ["HIP_VISIBLE_DEVICES=1"]     # one card, so the other keeps the big model
+    env: ["HIP_VISIBLE_DEVICES=1"]     # one card - but see the warning below
     checkEndpoint: "/v1/audio/health"  # moves with --request-path!
 ```
 
@@ -192,6 +270,12 @@ and unloaded like any model:
 - Note that the card number in `env:` is an **absolute** HIP index, while
   `--device ROCmN` counts *within* the visible cards. `llm` translates between the
   two; if you edit by hand, `llm gpu list` shows the mapping.
+- **Pinning through `env:` alone does not put the model in a card group.** The group
+  generator reads `--device ROCmN`, so an `env:`-pinned model lands in llama-swap's
+  default group, which swaps and is exclusive — starting it unloads the pinned
+  models on *both* cards. `llm ls` marks this case with a `!` behind the card
+  number. The whisper entries above are pinned by `env:` because whisper-server has
+  no `--device` flag.
 - Speed: 11 seconds of audio in 0.3 seconds, roughly 36× realtime.
 
 ## Adding a model by hand
@@ -224,20 +308,37 @@ llm add --gpu 1 unsloth/Qwen3-14B-GGUF Q4_K_M
 ```
 
 That appends `--device ROCmN -sm none -mg 0` to the `cmd` line (`-sm none` disables
-the macro's `-ts`) **and** puts the model into a GPU group in the YAML:
+the macro's `-ts`) **and** puts the model into the routing group in the YAML:
 
 ```yaml
 groups:
-  gpu0:
-    swap: false        # models in the same group do not evict each other
+  pinned:
+    swap: false        # members do not evict each other
     exclusive: false   # and do not evict anything from other groups
-    members: ["…"]
+    persistent: true   # and no other group may evict THEM
+    members:
+      - "qwen3.8-27b-q6_k"        # Karte 0
+      - "qwen3-embedding-4b-q8_0" # Karte 1
 ```
 
-Only that lets **two cards each hold a model at the same time** — without groups,
+Only that lets **two cards each hold a model at the same time** — without a group,
 llama-swap would unload the other one on every switch. The block is generated by
 `llm add`/`llm rm`/`llm gpu sync` (marker `# >>> llm:groups`); do **not** maintain
 it by hand.
+
+Three details about that block are easy to get wrong:
+
+- **It is one group, not one per card.** The settings would be identical for every
+  card anyway, and a `spillover` role (see "Roles" below) requires all of its
+  targets to sit in a *single* group — which is exactly the card-0-then-card-1
+  case. llama-swap refuses to start otherwise:
+  `selectors.<name> spillover targets must share one routing group`.
+- **`persistent: true` is what protects the pinned models.** Without it a model
+  that spans all cards evicts them. Measured: loading whisper took `/running` from
+  `[embedding, qwen3.8-27b]` down to `[whisper]` alone.
+- **Both ways of pinning count.** whisper-server has no `--device` flag and pins
+  its card through `env: HIP_VISIBLE_DEVICES=N`; the group generator reads that
+  too. `llm ls` puts a `!` behind the card number of anything pinned but ungrouped.
 
 **Changing placement later** — without `llm edit`, also from another machine or by
 an agent (details in [API.md](API.md)):
@@ -261,10 +362,57 @@ Things worth knowing:
   `ggml_abort` while measuring the draft model. `llm add --mtp --gpu N …` sets it.
 - `swap: false` also means several models on the **same** card all stay loaded,
   which can fill the card. The safety net is `ttl` (default 900 idle seconds).
-- A **large** model (no `--gpu`) needs every card and unloads the pinned ones while
-  it runs. That is intended; they come back on the next request.
+- A **large** model (no `--gpu`) needs every card, but since the group is
+  `persistent` it no longer unloads the pinned ones. Both then compete for the
+  same VRAM, so check `llm gpu` if a large model refuses to load.
 - ComfyUI gets one card, chosen by `llm gpu sync` and overridable with
   `LLM_COMFY_GPU`. For real quiet, pin the LLM to a different card than ComfyUI.
+
+## Roles (one name, several models — this is how subagents get their own)
+
+A `selectors:` block gives llama-swap a **virtual model name** that it resolves to
+a real model per request. Clients and their subagents then never need to know a
+file name, and the placement stays a server-side decision:
+
+```bash
+llm role                                   # what exists and what it resolves to
+llm role set chat warm  <big> <medium>     # whichever is already loaded
+llm role set fast  pin   <small>           # always this one
+llm role set coder spillover <big> <small> --spillover=2
+llm role rm  coder
+```
+
+| strategy | behaviour |
+|---|---|
+| `warm` | the first target that is already running; cold-starts the first one if none are. Saves a 30 GB load for a one-line question. |
+| `pin` | always the first target. The remaining entries are documentation. |
+| `spillover` | the first target up to `--spillover=N` concurrent requests, then the **next** target starts. With one model per card that is automatic card-0-then-card-1. |
+
+`spillover` is the one that answers "how do my subagents get the second card":
+
+```
+4 concurrent requests to role "coder", spillover=2, on 2× R9700
+  request 0 -> Qwen3.8-27B-Q6_K   (card 0)   12.3 s
+  request 1 -> Qwen3.5-4B-Q4_K_M  (card 1)    4.9 s
+  request 2 -> Qwen3.5-4B-Q4_K_M  (card 1)    5.2 s
+  request 3 -> Qwen3.8-27B-Q6_K   (card 0)   12.1 s
+```
+
+Both models were loaded at the same time, one per card, and the client only ever
+asked for `coder`.
+
+**A role never promises more than its weakest target.** Its context window is the
+**minimum** over the targets and its capabilities are the **intersection** — pair a
+131k vision model with an 8k text-only one and the role reports 8k and no vision,
+because a client that trusted the larger number would fail on every second request.
+`llm role` prints the effective value, so check it after changing targets.
+
+Roles appear in `GET /v1/models`, so Open WebUI lists them without any setup, and
+in the registry catalog with `"kind": "role"`, so pi offers them as models. They are
+written into the marker block `# >>> llm:selectors` — do not edit it by hand.
+Constraints worth knowing: a role name must not collide with a model name, a role
+cannot target another role, and `spillover` targets must share one routing group
+(see above).
 
 ## Build flags
 

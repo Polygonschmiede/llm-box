@@ -135,9 +135,13 @@ ${c_y}── MODELS (you choose; nothing downloads on its own) ─────�
                    --rerank    reranker: sorts RAG hits by relevance → /v1/rerank
                    --gpu N     pin to card N; two pinned models run AT THE SAME TIME
                    --gpu all   spread over every card (the default)
+                   --slots N   serve N requests at once (default 4; docs/FLAGS.md)
                    --ttl SEC   idle time before unloading (0 = never; default 900)
                    -- ...      any further llama-server flags (e.g. --top-p 0.9)
   llm ls                  show configured models
+  llm role                roles: one name, several models behind it (for subagents)
+        llm role set coder spillover <big-model> <small-model> --spillover=2
+        llm role set fast pin <small-model>       |  llm role rm <name>
   llm meta                where each model came from (Hugging Face repo + quant)
   llm meta backfill       fill in provenance for models added earlier
   llm rm <name>           remove a model (asks whether to delete the files too)
@@ -1114,7 +1118,7 @@ mk_name(){ # $1=repo $2=quant
 }
 
 cmd_add(){
-  local macro="server" tag="" ctx="8192" extra="" gpu="" ttl="900"
+  local macro="server" tag="" ctx="8192" extra="" gpu="" ttl="900" slots=""
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
       --mtp)      macro="server-mtp";   tag=" [MTP]";   shift;;
@@ -1124,6 +1128,10 @@ cmd_add(){
       --embed)    macro="server-embed";  tag=" [embed]";  ttl=0; shift;;
       --rerank)   macro="server-rerank"; tag=" [rerank]"; ttl=0; shift;;
       --ttl)      ttl="$2"; shift 2;;
+      # Slots = how many requests the model serves AT THE SAME TIME. Costs no
+      # KV cache (-c is the total either way), but a little compute buffer.
+      # Omitted = llama.cpp's own default of 4 slots with a shared KV pool.
+      --slots)    slots="$2"; shift 2;;
       --gpu)      gpu="$2"; shift 2;;
       --gpu0)     gpu=0; shift;;
       --gpu1)     gpu=1; shift;;
@@ -1132,6 +1140,16 @@ cmd_add(){
       *) err "unknown option: $1"; return 1;;
     esac
   done
+  if [[ -n "$slots" ]]; then
+    if ! [[ "$slots" =~ ^[0-9]+$ ]] || [[ "$slots" -lt 1 ]]; then
+      err "--slots needs a number >= 1 (llama.cpp default without the flag: 4)"
+      return 1
+    fi
+    # -kvu: the -c tokens become ONE shared pool, so a single long request may
+    # still use all of them. Without it each slot gets a hard -c/slots share.
+    extra="$extra -np $slots -kvu"
+    tag="$tag [${slots} slots]"
+  fi
   if [[ -n "$gpu" && "$gpu" != all && "$gpu" != both ]]; then
     local ncards; ncards=$(reg hw 2>/dev/null | grep -c '"smiIndex"')
     if ! [[ "$gpu" =~ ^[0-9]+$ ]] || { [[ "$ncards" -gt 0 ]] && [[ "$gpu" -ge "$ncards" ]]; }; then
@@ -1148,7 +1166,7 @@ cmd_add(){
     gpu=""                                  # across all cards = the macro default
   fi
   local repo="${1:-}" quant="${2:-Q4_K_M}"
-  [[ -z "$repo" ]] && { err "usage: llm add [--mtp|--ngram|--embed|--rerank] [--gpu N|all] [-c CTX] [-t TEMP] [--ttl SEC] <hf-repo> [quant] [-- <extra flags>]"; return 1; }
+  [[ -z "$repo" ]] && { err "usage: llm add [--mtp|--ngram|--embed|--rerank] [--gpu N|all] [--slots N] [-c CTX] [-t TEMP] [--ttl SEC] <hf-repo> [quant] [-- <extra flags>]"; return 1; }
   # everything after '--' becomes additional llama-server flags
   if [[ "$quant" == "--" ]]; then           # 'llm add repo -- flags'  (no quant given)
     quant="Q4_K_M"; shift 2; extra="$extra $*"
@@ -1288,12 +1306,97 @@ cmd_rm(){
   reload_swap
 }
 
+# --- Roles (llama-swap selectors): virtual model names --------------------
+#  A client asks for a ROLE, llama-swap picks a real model for it. That is how a
+#  subagent gets a different model from the main agent without the client
+#  knowing any file names.
+cmd_role(){
+  case "${1:-}" in
+    ""|list|ls)
+      reg catalog | python3 -c '
+import json, sys
+roles = [m for m in json.load(sys.stdin) if m.get("kind") == "role"]
+if not roles:
+    print("  no roles yet.  llm role set coder spillover <model> <model> --spillover=2")
+    raise SystemExit
+print("  %-12s %-12s %8s %-7s %s" % ("ROLE", "STRATEGY", "CTX", "LOADED", "TARGETS (in order)"))
+for m in roles:
+    s = m["runtime"]["selector"]
+    strat = s["strategy"]
+    if strat == "spillover":
+        strat += "/%s" % s["spillover"]
+    ctx = m["runtime"]["contextWindow"]
+    live = len(m.get("activeTargets") or [])
+    print("  %-12s %-12s %8s %-7s %s" % (
+        m["id"], strat, "-" if ctx is None else ctx,
+        "%d/%d" % (live, len(s["targets"])), ", ".join(s["targets"])))
+print()
+print("  warm         = whichever target is already loaded (no cold start)")
+print("  pin          = always the first target")
+print("  spillover/N  = first target up to N requests at once, then the next starts")
+print("  CTX is the SMALLEST of the targets - a role cannot promise more than its")
+print("  weakest member, so pairing a 131k model with an 8k one gives you 8k.")
+'
+      ;;
+    set)
+      shift
+      [[ $# -lt 3 ]] && { err "usage: llm role set <name> <warm|pin|spillover> <model>... [--spillover=N] [--description=...]"; return 1; }
+      reg selector-set "$@" >/dev/null || return 1
+      ok "role '$1' written"
+      warn "for llama-swap to see it:  llm restart"
+      ;;
+    rm|del|delete)
+      shift
+      [[ -z "${1:-}" ]] && { err "usage: llm role rm <name>"; return 1; }
+      reg selector-rm "$1" >/dev/null || return 1
+      ok "role '$1' removed"
+      warn "for llama-swap to see it:  llm restart"
+      ;;
+    *) err "llm role [list | set <name> <strategy> <model>... | rm <name>]"; return 1;;
+  esac
+}
+
 cmd_ls(){
   info "Configured models (${CONFIG#$HOME/}):"
   if ! grep -q "# >>> llm:" "$CONFIG" 2>/dev/null; then
     warn "  (none yet — add one with 'llm add <repo>')"; return 0
   fi
-  grep "# >>> llm:" "$CONFIG" | grep -v "llm:groups" | sed 's/# >>> llm:/  - /'
+  # The catalog knows role, context, slots and card; fall back to the plain
+  # marker list when the registry cannot be reached.
+  reg catalog 2>/dev/null | python3 -c '
+import json, sys
+try:
+    ms = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+roles = [m for m in ms if m.get("kind") == "role"]
+ms = [m for m in ms if m.get("kind") != "role"]     # roles live in "llm role"
+if not ms:
+    sys.exit(1)
+print("  %-32s %-6s %9s %6s %-6s %s" % ("MODEL", "ROLE", "CTX", "SLOTS", "CARD", "TTL"))
+for m in ms:
+    r = m.get("runtime") or {}
+    g = r.get("gpu") or {}
+    dev = g.get("device")                       # card 0 is falsy - test for None
+    card = str(dev) if dev is not None else ("all" if g.get("mode") == "both" else "-")
+    if dev is not None and not g.get("group"):
+        card += "!"                             # pinned, but in no group: gets evicted
+    np_ = r.get("parallel")
+    slots = "-" if np_ is None else ("%d%s" % (np_, "" if r.get("kvUnified") is False else "*"))
+    ctx = r.get("contextWindow")
+    ttl = m.get("ttl")
+    print("  %-32s %-6s %9s %6s %-6s %s" % (
+        m["id"], m.get("role") or "?", "-" if ctx is None else ctx,
+        slots, card, "never" if ttl == 0 else ("%ss" % ttl)))
+print()
+print("  SLOTS = requests served at the same time; * = one shared KV pool (-kvu)")
+print("  CARD ! = pinned to that card but in no group, so anything else evicts it")
+if roles:
+    print("  plus %d role(s) on top of these: %s   (llm role)"
+          % (len(roles), ", ".join(r["id"] for r in roles)))
+' || {
+    grep "# >>> llm:" "$CONFIG" | grep -v "llm:groups" | sed 's/# >>> llm:/  - /'
+  }
   echo
   if svc_active; then
     info "llama-swap is running. Currently available according to the API:"
@@ -1440,14 +1543,22 @@ case "${1:-}" in
 
   # Overview / monitoring
   status|st) cmd_dash;;
+  role|roles) shift; cmd_role "$@";;
   gpu)     case "${2:-}" in
              list)  reg gpus --table;;
              sync)  if [[ "${3:-}" == "--dry-run" ]]; then
                       reg gpu-sync --dry-run | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["diff"] or "  Configuration already matches the hardware (%d card(s), -ts %s)." % (d["cards"], d["tensorSplit"] or "none"))'
                     else
-                      cfg_lock; reg gpu-sync; cfg_unlock
-                      ok "configuration and config/hardware.env brought in line with the hardware."
-                      warn "for the services to see it:  llm restart"
+                      # No cfg_lock here: llmreg.gpu_sync() takes the same lock
+                      # itself, and flock on a second file descriptor would
+                      # deadlock against our own child process.
+                      if reg gpu-sync >/dev/null; then
+                        ok "configuration and config/hardware.env brought in line with the hardware."
+                        warn "for the services to see it:  llm restart"
+                      else
+                        err "gpu sync failed - nothing was written"
+                        exit 1
+                      fi
                     fi;;
              ""|show) rocm-smi;;
              *)     err "llm gpu [list|sync [--dry-run]]";;

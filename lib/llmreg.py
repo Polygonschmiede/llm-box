@@ -64,6 +64,12 @@ SERVICE = "llama-swap"
 META_NAME = ".llm-model.json"
 BLOCK_RE = r"# >>> llm:(\S+)\n(.*?)# <<< llm:\1"
 
+#  All card-pinned models go into ONE routing group, not one group per card.
+#  The settings would be identical anyway (swap/exclusive false, persistent
+#  true), and llama-swap requires that the targets of a 'spillover' selector
+#  share a single group - which is exactly the card-0-then-card-1 case.
+PINNED_GROUP = "pinned"
+
 
 # ---------------------------------------------------------------------------
 #  Small helpers
@@ -93,6 +99,20 @@ def flag(cmd: str, name: str):
 
 def has_flag(cmd: str, name: str) -> bool:
     return re.search(r"(?:^|\s)" + re.escape(name) + r"(?=\s|$)", cmd) is not None
+
+
+def flag_any(cmd: str, *names):
+    """Value of the first flag present. For llama.cpp's short/long pairs
+    ('-np' / '--parallel', '-c' / '--ctx-size'), where either may be written."""
+    for n in names:
+        v = flag(cmd, n)
+        if v is not None:
+            return v
+    return None
+
+
+def has_flag_any(cmd: str, *names) -> bool:
+    return any(has_flag(cmd, n) for n in names)
 
 
 def set_flag(cmd: str, name: str, value) -> str:
@@ -268,6 +288,12 @@ def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
                    parallel: int = 1) -> int | None:
     """Size of the KV cache in bytes, from the real GGUF header.
 
+    NOTE on `parallel`: the attention KV cache does NOT scale with the slot
+    count. `-c` is the total; llama.cpp either shares it across sequences
+    (`-kvu`, n_ctx_seq = n_ctx) or divides it (n_ctx_seq = n_ctx / n_seq_max) —
+    either way it allocates n_ctx cells. See llama-context.cpp:291-301.
+    Only the recurrent/SSM state is held once per sequence and scales.
+
     Covers the three layouts that occur in practice:
       * classic: every layer holds KV over the full context
       * hybrid (Qwen3.x, 'full_attention_interval'): only every Nth layer has a
@@ -315,15 +341,17 @@ def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
             elems += h * (k_len + v_len) * ctx
     total = elems * b
 
-    # State of the SSM layers (constant, not context-dependent)
+    # State of the SSM layers (constant, not context-dependent) — but one state
+    # PER SEQUENCE, so this is the only part that scales with the slot count.
+    ssm = 0
     ssm_inner = _arch_get(meta, "ssm.inner_size")
     if interval and ssm_inner:
         ssm_layers = int(layers) - int(layers) // int(interval)
         conv = (_arch_get(meta, "ssm.conv_kernel") or 0) * ssm_inner
         state = (_arch_get(meta, "ssm.state_size") or 0) * ssm_inner
-        total += ssm_layers * (conv + state) * 4                  # f32
+        ssm = ssm_layers * (conv + state) * 4                     # f32
 
-    return int(total * max(1, parallel))
+    return int(total + ssm * max(1, parallel))
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +674,7 @@ def gpu_of(entry: dict) -> dict:
     dev = flag(entry["cmd"], "--device")
     if dev and dev.startswith("ROCm"):
         n = _num(dev[4:])
-        return {"mode": "single", "device": n, "group": "gpu%s" % n, "via": "flag"}
+        return {"mode": "single", "device": n, "group": PINNED_GROUP, "via": "flag"}
     for e in entry.get("env") or []:
         m = re.match(r"HIP_VISIBLE_DEVICES=([\d,]+)", e)
         if m:
@@ -658,7 +686,8 @@ def gpu_of(entry: dict) -> dict:
             n = to_logical(idxs[0])
             if n is None:                 # points at something that is not a compute card
                 return {"mode": "both", "device": None, "group": None, "via": "env"}
-            return {"mode": "single", "device": n, "group": None, "via": "env"}
+            #  sync_groups() picks up env-pinned models too, so report the group.
+            return {"mode": "single", "device": n, "group": PINNED_GROUP, "via": "env"}
     return {"mode": "both", "device": None, "group": None, "via": "macro"}
 
 
@@ -742,7 +771,17 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
         issues.append("provenance unknown (on the server: llm meta backfill)")
 
     gguf = gguf_meta(model_file) if (want_gguf and model_file and os.path.exists(model_file)) else {}
-    parallel = _num(flag(cmd, "--parallel"), 1)
+    # llama.cpp: '-np'/'--parallel' unset means auto = 4 slots + unified KV
+    # (server.cpp:151-154). Report what the server will actually do, not the
+    # literal flag, otherwise the catalog claims one slot where there are four.
+    _np = _num(flag_any(cmd, "-np", "--parallel"), None)
+    parallel = 4 if (_np is None or _np < 0) else _np
+    kv_unified = has_flag_any(cmd, "-kvu", "--kv-unified") or _np is None or _np < 0
+    if has_flag_any(cmd, "-no-kvu", "--no-kv-unified"):
+        kv_unified = False
+    if role == "stt":
+        # whisper-server, not llama-server: neither flag exists there.
+        parallel = kv_unified = None
     kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel) \
         if (model_file and ctx) else None
 
@@ -761,6 +800,7 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
             "draftModel": draft,
             "kvCacheQuant": kv_quant,
             "parallel": parallel,
+            "kvUnified": kv_unified,
             "mmproj": mmproj,
             "cmd": cmd,
         },
@@ -889,6 +929,61 @@ def recheck_files(m: dict) -> dict:
     return m
 
 
+def selector_catalog(models: list[dict]) -> list[dict]:
+    """Catalog entries for the roles, derived from their target models.
+
+    A role must not promise more than its weakest target, so capabilities are
+    INTERSECTED and the context window is the MINIMUM. Otherwise a client would
+    happily send 131k tokens to a role whose second target holds 8k.
+    """
+    by_id = {m["id"]: m for m in models}
+    out = []
+    for name, sel in sorted(read_selectors().items()):
+        targets = [by_id[t] for t in sel["targets"] if t in by_id]
+        if not targets:
+            continue
+        caps: dict[str, bool] = {}
+        for key in targets[0]["capabilities"]:
+            caps[key] = all(t["capabilities"].get(key) for t in targets)
+        ctxs = [t["runtime"]["contextWindow"] for t in targets
+                if t["runtime"]["contextWindow"]]
+        roles = {t["role"] for t in targets}
+        #  A role over mixed kinds of model is not something a client can use.
+        role = targets[0]["role"] if len(roles) == 1 else "mixed"
+        ready = [t["id"] for t in targets if t["state"] in ("ready", "loading")]
+        entry = {
+            "id": name,
+            "kind": "role",
+            "role": role,
+            "ttl": None,
+            "runtime": {
+                "selector": {
+                    "strategy": sel["strategy"],
+                    "targets": [t["id"] for t in targets],
+                    "spillover": (sel.get("settings") or {}).get("spillover"),
+                },
+                "contextWindow": min(ctxs) if ctxs else None,
+                "gpu": {"mode": "role", "device": None,
+                        "group": PINNED_GROUP, "via": "selector"},
+                "cmd": None,
+            },
+            "capabilities": caps,
+            "sampling": {},
+            "vram": None,
+            "endpoints": targets[0]["endpoints"],
+            "description": sel.get("description") or "",
+            "issues": [],
+            "state": "ready" if ready else "unloaded",
+            "activeTargets": ready,
+        }
+        if sel.get("name"):
+            entry["name"] = sel["name"]
+        entry["pi"] = pi_entry(dict(entry, _pi_over={}, _pi_json=None)) \
+            if role == "chat" else None
+        out.append(entry)
+    return out
+
+
 def catalog(with_live: bool = True, want_gguf: bool = True) -> list[dict]:
     entries = parse_config()
     state = live() if with_live else {"up": False, "states": {}, "running": []}
@@ -906,8 +1001,10 @@ def catalog(with_live: bool = True, want_gguf: bool = True) -> list[dict]:
         m["pi"] = pi_entry(m)
         m.pop("_pi_over", None)
         m.pop("_pi_json", None)
+        m["kind"] = "model"
         out.append(m)
-    return out
+    #  Roles come last and are derived from the models above.
+    return out + selector_catalog(out)
 
 
 def get_model(name: str, **kw) -> dict | None:
@@ -929,22 +1026,183 @@ def _write_config(text: str) -> None:
 
 
 def sync_groups(text: str | None = None) -> str:
-    """Regenerate the GPU groups from the --device flags (swap/exclusive false)."""
+    """Regenerate the routing group from whatever pins a model to a card.
+
+    Uses gpu_of(), so BOTH ways of pinning count: '--device ROCmN' and
+    'env: HIP_VISIBLE_DEVICES=N'. Reading only the flag used to leave the
+    env-pinned whisper entries out, which put them in llama-swap's default
+    group - swapping and exclusive - so every transcription unloaded the
+    pinned models on both cards.
+
+    The group is written with:
+      swap: false       members do not evict each other
+      exclusive: false  and do not evict other groups
+      persistent: true  and no other group may evict THEM, so a model that
+                        spans all cards no longer throws the service models out
+    """
     text = config_text() if text is None else text
-    members: dict[str, list[str]] = {}
-    for name, cmd in re.findall(r'^  "([^"]+)":\n\s+cmd: "([^"]*)"', text, re.M):
-        m = re.search(r"--device ROCm(\d+)", cmd)
-        if m:
-            members.setdefault(m.group(1), []).append(name)
+    members: list[tuple[str, int]] = []
+    for entry in parse_config(text):
+        g = gpu_of(entry)
+        if g["mode"] == "single" and g["device"] is not None:
+            members.append((entry["name"], int(g["device"])))
+    members.sort(key=lambda x: (x[1], x[0]))
     block = ""
     if members:
-        block = "groups:\n"
-        for g in sorted(members):
-            block += "  gpu%s:\n    swap: false\n    exclusive: false\n    members:\n" % g
-            for n in members[g]:
-                block += '      - "%s"\n' % n
+        block = ("groups:\n  %s:\n    swap: false\n    exclusive: false\n"
+                 "    persistent: true\n    members:\n" % PINNED_GROUP)
+        width = max(len(n) for n, _ in members) + 2
+        for name, card in members:
+            block += '      - %-*s # Karte %d\n' % (width, '"%s"' % name, card)
     new = "# >>> llm:groups\n" + block + "# <<< llm:groups"
     return re.sub(r"# >>> llm:groups\n.*?# <<< llm:groups", lambda _m: new, text, flags=re.S)
+
+
+# ---------------------------------------------------------------------------
+#  Roles (llama-swap "selectors"): virtual model names -> real models
+# ---------------------------------------------------------------------------
+#  A client asks for a ROLE and llama-swap picks a target for it. That way
+#  clients and their subagents never need to know a file name.
+#
+#  Deliberately parsed by hand instead of with PyYAML: venv-api does not have
+#  it, and the block is machine-generated, so its shape is fixed.
+SELECTOR_STRATEGIES = ("warm", "pin", "spillover")
+_SEL_MARK = "selectors"
+
+
+def read_selectors(text: str | None = None) -> dict:
+    """The roles from the marker block, as {name: {strategy, targets, ...}}."""
+    text = config_text() if text is None else text
+    m = re.search(r"# >>> llm:%s\n(.*?)# <<< llm:%s" % (_SEL_MARK, _SEL_MARK),
+                  text, re.S)
+    if not m:
+        return {}
+    out: dict[str, dict] = {}
+    cur = None
+    listing = None                                  # which key the '- ' items go to
+    for raw in m.group(1).splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#") or line.strip() == "selectors:":
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = line.strip()
+        if indent == 2 and body.endswith(":"):      # a role name
+            cur = body[:-1].strip().strip('"')
+            out[cur] = {"strategy": "warm", "targets": []}
+            listing = None
+            continue
+        if cur is None:
+            continue
+        if body.startswith("- "):
+            if listing == "targets":
+                out[cur]["targets"].append(body[2:].strip().strip('"'))
+            continue
+        key, _, val = body.partition(":")
+        key, val = key.strip(), val.strip().strip('"')
+        if not val:                                 # 'targets:' / 'settings:'
+            listing = key
+            continue
+        listing = None
+        if key == "spillover":                      # lives under settings:
+            out[cur].setdefault("settings", {})["spillover"] = _num(val, 1)
+        elif key in ("strategy", "name", "description"):
+            out[cur][key] = val
+    return out
+
+
+def render_selectors(sel: dict) -> str:
+    """The YAML for the marker block. Empty dict -> no 'selectors:' key at all."""
+    if not sel:
+        return ""
+    out = "selectors:\n"
+    for name in sorted(sel):
+        s = sel[name]
+        out += '  "%s":\n    strategy: %s\n    targets:\n' % (name, s["strategy"])
+        for t in s["targets"]:
+            out += '      - "%s"\n' % t
+        if s["strategy"] == "spillover":
+            n = (s.get("settings") or {}).get("spillover") or 1
+            out += "    settings:\n      spillover: %d\n" % int(n)
+        for k in ("name", "description"):
+            if s.get(k):
+                out += '    %s: "%s"\n' % (k, str(s[k]).replace('"', "'"))
+    return out
+
+
+def write_selectors(sel: dict, text: str | None = None) -> str:
+    """Replace the marker block. Creates it above the MODELLE header if absent."""
+    text = config_text() if text is None else text
+    block = "# >>> llm:%s\n%s# <<< llm:%s" % (_SEL_MARK, render_selectors(sel), _SEL_MARK)
+    pat = r"# >>> llm:%s\n.*?# <<< llm:%s" % (_SEL_MARK, _SEL_MARK)
+    if re.search(pat, text, re.S):
+        return re.sub(pat, lambda _m: block, text, flags=re.S)
+    head = ("# " + "=" * 76 + "\n"
+            "#  ROLES (selectors)  —  virtual model names, maintained by 'llm role'\n"
+            "# " + "=" * 76 + "\n"
+            "#  A client asks for a ROLE and llama-swap picks a real model for it, so\n"
+            "#  clients and their subagents never need to know a file name.\n"
+            "#   strategy: warm      -> the first target that is already running\n"
+            "#   strategy: pin       -> always the first target\n"
+            "#   strategy: spillover -> target 1 up to 'spillover' concurrent requests,\n"
+            "#                          then target 2 starts (= the second card)\n"
+            "#  A role reports the SMALLEST context and the INTERSECTION of the\n"
+            "#  capabilities of its targets.  DO NOT edit by hand:\n")
+    #  Must go BEFORE 'models:'. Appending at the end of the file would put the
+    #  block after it, and then the next 'llm add' - which appends its two-space
+    #  model block at the bottom - would hang that model under 'selectors:'.
+    m = re.search(r"^models:", text, re.M)
+    if not m:
+        raise ValueError("the configuration has no 'models:' section")
+    start = m.start()
+    #  Walk back over the comment header that belongs to 'models:' so it stays
+    #  attached to it instead of ending up above our block.
+    lines = text[:start].split("\n")
+    while lines and (lines[-1].startswith("#") or not lines[-1].strip()):
+        lines.pop()
+    cut = len("\n".join(lines))
+    if cut:
+        cut += 1
+    return text[:cut] + head + block + "\n\n" + text[cut:]
+
+
+def set_selector(name: str, strategy: str, targets: list[str],
+                 spillover: int | None = None, description: str | None = None,
+                 dry_run: bool = False) -> dict:
+    """Create or change a role. Validates against the real model list."""
+    if strategy not in SELECTOR_STRATEGIES:
+        raise ValueError("strategy must be one of %s" % ", ".join(SELECTOR_STRATEGIES))
+    if not targets:
+        raise ValueError("a role needs at least one target model")
+    text = config_text()
+    known = {e["name"] for e in parse_config(text)}
+    unknown = [t for t in targets if t not in known]
+    if unknown:
+        raise ValueError("not a configured model: %s (see llm ls)" % ", ".join(unknown))
+    if name in known:
+        raise ValueError("'%s' is already a model name - a role needs its own name" % name)
+    sel = read_selectors(text)
+    entry = {"strategy": strategy, "targets": list(targets)}
+    if strategy == "spillover":
+        entry["settings"] = {"spillover": int(spillover or 1)}
+    if description:
+        entry["description"] = description
+    before = dict(sel)
+    sel[name] = entry
+    out = {"role": name, "before": before.get(name), "after": entry, "dryRun": dry_run}
+    if not dry_run:
+        with config_lock():
+            _write_config(write_selectors(sel, config_text()))
+    return out
+
+
+def del_selector(name: str) -> dict:
+    sel = read_selectors()
+    if name not in sel:
+        raise KeyError("no role called '%s'" % name)
+    removed = sel.pop(name)
+    with config_lock():
+        _write_config(write_selectors(sel, config_text()))
+    return {"role": name, "removed": removed}
 
 
 #  The chat macros that spread a model over ALL cards. server-embed and
@@ -1129,8 +1387,9 @@ def check_fit(model: dict, ctx: int | None = None, gpu=None) -> dict:
 def patch_model(name: str, changes: dict, dry_run: bool = False) -> dict:
     """Change a model's runtime configuration. Returns before/after.
 
-    changes: gpu (0|1|'both'), contextWindow, ttl, sampling {..}, extraFlags (str),
-             piOverrides {key: value|None}, force (bool)
+    changes: gpu (0|1|'both'), contextWindow, parallel (slots), ttl,
+             sampling {..}, extraFlags (str), piOverrides {key: value|None},
+             force (bool)
     """
     if dry_run:                                   # compute only, touch nothing
         return _patch_model(name, changes, True)
@@ -1155,6 +1414,22 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
 
     if "contextWindow" in changes and changes["contextWindow"] is not None:
         cmd = set_flag(cmd, "-c", int(changes["contextWindow"]))
+
+    if "parallel" in changes and changes["parallel"] is not None:
+        np_ = int(changes["parallel"])
+        if np_ < 1:
+            raise ValueError("parallel must be >= 1")
+        if before["role"] == "stt":
+            raise ValueError("whisper-server has no slots")
+        # Normalise both spellings away first, then write one canonical form.
+        for f in ("--parallel", "-np"):
+            cmd = del_flag(cmd, f)
+        for f in ("-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"):
+            cmd = del_flag(cmd, f)
+        cmd = set_flag(cmd, "-np", np_)
+        # Shared KV pool: one long request may still use the whole -c.
+        cmd = set_flag(cmd, "-kvu", None)
+        notes.append("%d slots, shared KV pool" % np_)
 
     if "gpu" in changes and changes["gpu"] is not None:
         gpu = changes["gpu"]
@@ -1397,6 +1672,22 @@ def _cli(argv: list[str]) -> int:
         print(json.dumps(pi_models_json(), indent=2, ensure_ascii=False))
     elif cmd == "sync-groups":
         _write_config(sync_groups())
+    elif cmd == "selectors":                        # selectors
+        print(json.dumps(read_selectors(), indent=2))
+    elif cmd == "selector-set":                     # selector-set <name> <strategy> <target>...
+        rest = [a for a in argv[1:] if not a.startswith("--")]
+        spill = _num(next((a.split("=", 1)[1] for a in argv
+                           if a.startswith("--spillover=")), None), None)
+        desc = next((a.split("=", 1)[1] for a in argv
+                     if a.startswith("--description=")), None)
+        if len(rest) < 3:
+            sys.exit("usage: selector-set <name> <strategy> <target>... "
+                     "[--spillover=N] [--description=...]")
+        print(json.dumps(set_selector(rest[0], rest[1], rest[2:], spillover=spill,
+                                      description=desc,
+                                      dry_run="--dry-run" in argv), indent=2))
+    elif cmd == "selector-rm":                      # selector-rm <name>
+        print(json.dumps(del_selector(argv[1]), indent=2))
     elif cmd == "gpus":
         if "--table" in argv:
             #  One source for the display: bin/llm had the same rocm-smi parse a

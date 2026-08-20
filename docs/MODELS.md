@@ -47,8 +47,13 @@ Two things to keep in mind:
 On large dense models the quant decides whether one card is enough. Measured on a
 32 GB card with Qwen3.8-27B: `Q6_K` = 23.5 GB and fits on one card with a 131k
 context (30.7 of 34 GB used), while `Q8_0` = 29.1 GB needs two cards but then
-allows 262k. At that much context add `-ctk q8_0 -ctv q8_0 --parallel 1`, otherwise
-the KV cache eats everything — see [FLAGS.md](FLAGS.md).
+allows 262k. At that much context add `-ctk q8_0 -ctv q8_0`, otherwise the KV cache
+eats everything — see [FLAGS.md](FLAGS.md).
+
+Note that the **slot count does not enter this calculation**: `-c` is the total KV
+cache whether the model has one slot or four, so `-np 4 -kvu` costs about 1.4 GB of
+compute buffer and nothing else. Do not trade context away for slots — see
+[FLAGS.md](FLAGS.md#slots-several-clients-or-agents-at-once).
 
 **Vision models** additionally need their `mmproj-*.gguf`, which `llm add` does
 *not* fetch automatically — see FLAGS.md, "Understanding images".
@@ -160,14 +165,38 @@ after 15 idle minutes would pay for a reload.
 
 On a two-card machine it is worth keeping one card for small always-on models and
 letting the other hold the big chat model. Pinning an embedder, a reranker and a
-small task model to card 1 was measured at **21.7 GB of 34 GB** — much more than
-the 7.7 GB their files add up to, because at `-b/-ub 8192` the batch buffers and KV
-caches come on top. That leaves room for Whisper (~1.6 GB) but not for another
-large model. If you need space, turn the context of those service models down from
-8192 with `llm edit`; it feeds straight into the buffer sizes.
+small task model to card 1 measured **21.7 GB of 34 GB** — much more than the
+7.7 GB their files add up to, because at `-b/-ub 8192` the batch buffers and KV
+caches come on top.
 
-A model **without** `--gpu` needs every card and briefly evicts the pinned ones.
-They come back by themselves on the next request.
+Halving those buffers is the cheapest space you will ever find on this machine.
+With `-b/-ub 4096` in the `server-embed`/`server-rerank` macros and `-c 4096` on
+the two models, the same trio measured **15.3 GB** — **6.3 GB freed**, enough for
+a second chat model on that card:
+
+| card 1 with embedder + reranker + 4B task model | VRAM |
+|---|---|
+| `-b/-ub 8192`, `-c 8192` | 21.6 GB (12.6 GB free) |
+| `-b/-ub 4096`, `-c 4096` | **15.3 GB (18.9 GB free)** |
+
+`-b/-ub` must stay **at or above** `-c` for these two: embedding and reranker
+models compute non-causally, and a smaller batch than the context refuses to start.
+
+What you give up: a **single** input longer than 4096 tokens is now *rejected* with
+an HTTP 400 (`exceed_context_size_error`) — llama.cpp does not silently truncate
+it. Batches are fine, they get split internally; a request of 32 chunks went
+through without complaint. So what matters is the size of one chunk, not how many.
+Open WebUI's default `chunk_size` is 1000 *characters* (~250 tokens), so its RAG
+pipeline is nowhere near the limit — check yours under Admin → Settings →
+Documents before halving, and leave the buffers alone if you feed whole documents
+in one piece.
+
+A model **without** `--gpu` needs every card. It used to briefly evict the pinned
+ones; since the card groups are written with `persistent: true` it no longer can.
+Whisper was the worst case here: it pins its card through `env:` rather than
+`--device`, so it used to land in llama-swap's default swapping group and a single
+transcription unloaded *both* cards. Measured before the fix, `/running` went from
+`[embedding, qwen3.8-27b]` to `[whisper]` alone.
 
 One small model earns its place especially: Open WebUI generates chat titles and
 tags with whichever model is currently active. Without a dedicated task model, a

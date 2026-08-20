@@ -78,6 +78,19 @@ class Catalog:
             if r:
                 m["state"] = r.get("state", "ready")
                 m["runtime"]["proxy"] = r.get("proxy")
+        #  Roles are cached without live data, so their activeTargets would stay
+        #  empty. Derive them from the targets we just refreshed - a role is
+        #  "ready" exactly when one of its targets is, whatever llama-swap
+        #  reports for the selector name itself.
+        live_state = {m["id"]: m["state"] for m in base}
+        for m in base:
+            sel = m["runtime"].get("selector")
+            if not sel:
+                continue
+            active = [t for t in sel["targets"]
+                      if live_state.get(t) in ("ready", "loading")]
+            m["activeTargets"] = active
+            m["state"] = "ready" if active else "unloaded"
         return base
 
     def one(self, model_id: str) -> dict:
@@ -200,7 +213,23 @@ def _slim(m: dict) -> dict:
     """Compact view for agents - everything that matters, without the byte desert."""
     gpu = m["runtime"]["gpu"]
     src = m.get("source") or {}
+    sel = m["runtime"].get("selector")
+    if sel:
+        #  A role has no file, no card and no VRAM of its own. Reporting zeros
+        #  for those would read as "a 0 GB model", so it gets its own shape.
+        return {
+            "id": m["id"], "kind": "role", "role": m["role"], "state": m["state"],
+            "contextWindow": m["runtime"]["contextWindow"],
+            "strategy": sel["strategy"], "targets": sel["targets"],
+            "spillover": sel.get("spillover"),
+            "activeTargets": m.get("activeTargets") or [],
+            "vision": m["capabilities"]["vision"], "tools": m["capabilities"]["tools"],
+            "reasoning": m["capabilities"]["reasoning"],
+            "endpoint": m["endpoints"]["base"] + m["endpoints"]["path"],
+            **({"description": m["description"]} if m.get("description") else {}),
+        }
     return {
+        "kind": "model",
         "id": m["id"], "role": m["role"], "state": m["state"],
         "contextWindow": m["runtime"]["contextWindow"],
         #  The string is for humans; gpuMode/gpuDevice exist so agents do not
@@ -209,9 +238,9 @@ def _slim(m: dict) -> dict:
         "gpuMode": gpu["mode"], "gpuDevice": gpu["device"],
         "vision": m["capabilities"]["vision"], "tools": m["capabilities"]["tools"],
         "reasoning": m["capabilities"]["reasoning"],
-        "specDecoding": m["runtime"]["specDecoding"],
-        "sizeGB": round((m["vram"]["weightsBytes"] or 0) / 2**30, 1),
-        "vramNeededGB": round((m["vram"]["estimatedBytes"] or 0) / 2**30, 1),
+        "specDecoding": m["runtime"].get("specDecoding"),
+        "sizeGB": round(((m.get("vram") or {}).get("weightsBytes") or 0) / 2**30, 1),
+        "vramNeededGB": round(((m.get("vram") or {}).get("estimatedBytes") or 0) / 2**30, 1),
         "source": {"repo": src.get("repo"), "quant": src.get("quant"),
                    "revision": (src.get("revision") or "")[:12] or None,
                    "verified": src.get("verified")},
@@ -242,18 +271,21 @@ async def gpu_status() -> list[dict]:
 
 @mcp.tool(description="Change a model's configuration: gpu (a card number from 0, "
                       "or 'both' for all of them - gpu_status lists the cards), "
-                      "context_window, ttl, temperature/top_p/top_k/min_p. "
+                      "context_window, slots (how many requests it serves at the "
+                      "same time - raise this when several agents share one model), "
+                      "ttl, temperature/top_p/top_k/min_p. "
                       "Checks that it fits in VRAM first. Needs X-LLM-Token.")
 async def set_model_config(model_id: str, gpu: str | None = None,
-                           context_window: int | None = None, ttl: int | None = None,
+                           context_window: int | None = None, slots: int | None = None,
+                           ttl: int | None = None,
                            temperature: float | None = None, top_p: float | None = None,
                            top_k: int | None = None, min_p: float | None = None,
                            force: bool = False, dry_run: bool = False) -> dict:
     _mcp_check_token()
     sampling = {k: v for k, v in (("temperature", temperature), ("top_p", top_p),
                                   ("top_k", top_k), ("min_p", min_p)) if v is not None}
-    changes = {"gpu": gpu, "contextWindow": context_window, "ttl": ttl,
-               "sampling": sampling, "force": force}
+    changes = {"gpu": gpu, "contextWindow": context_window, "parallel": slots,
+               "ttl": ttl, "sampling": sampling, "force": force}
     try:
         out = await _thread(llmreg.patch_model, model_id, changes, dry_run)
     except MemoryError as exc:
@@ -457,6 +489,9 @@ def _check_add(body: dict) -> tuple[str, str]:
         v = body.get(key)
         if v is not None and not (isinstance(v, int) and 0 <= v <= 10_000_000):
             raise HTTPException(400, "%s must be a whole number" % key)
+    slots = body.get("slots")
+    if slots is not None and not (isinstance(slots, int) and 1 <= slots <= 64):
+        raise HTTPException(400, "slots must be a whole number 1..64")
     return repo, quant
 
 
@@ -475,6 +510,8 @@ def api_add(body: dict = Body(...)):
         argv.append("--rerank")
     if body.get("gpu") not in (None, "both"):
         argv += ["--gpu", str(body["gpu"])]
+    if body.get("slots") is not None:
+        argv += ["--slots", str(body["slots"])]
     if body.get("ttl") is not None:
         argv += ["--ttl", str(body["ttl"])]
     if body.get("contextWindow"):

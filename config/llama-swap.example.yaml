@@ -24,7 +24,7 @@ macros:
   server: >
     @LLM_HOME@/llama.cpp/build/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
-    -ngl 99 -fa on --no-webui --jinja
+    -ngl 99 -fa on --no-webui --jinja -cram 16384
     -ts 1,1
 
   # --- MTP / multi-token prediction -----------------------------------------
@@ -34,7 +34,7 @@ macros:
   server-mtp: >
     @LLM_HOME@/llama.cpp/build/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
-    -ngl 99 -fa on --no-webui --jinja
+    -ngl 99 -fa on --no-webui --jinja -cram 16384
     --spec-type draft-mtp
     -ts 1,1
 
@@ -44,7 +44,7 @@ macros:
   server-ngram: >
     @LLM_HOME@/llama.cpp/build/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
-    -ngl 99 -fa on --no-webui --jinja
+    -ngl 99 -fa on --no-webui --jinja -cram 16384
     --spec-type ngram-simple --spec-draft-n-max 16
     -ts 1,1
 
@@ -54,7 +54,7 @@ macros:
   server-embed: >
     @LLM_HOME@/llama.cpp/build/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
-    -ngl 99 -fa on --no-webui --embedding -b 8192 -ub 8192
+    -ngl 99 -fa on --no-webui --embedding -b 4096 -ub 4096
 
   # --- reranking (sorts RAG hits by real relevance) -------------------------
   #  Serves /v1/rerank. Needs a reranker model - see docs/FLAGS.md, the GGUF
@@ -62,17 +62,34 @@ macros:
   server-rerank: >
     @LLM_HOME@/llama.cpp/build/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
-    -ngl 99 -fa on --no-webui --embedding --pooling rank --reranking -b 8192 -ub 8192
+    -ngl 99 -fa on --no-webui --embedding --pooling rank --reranking -b 4096 -ub 4096
+# ============================================================================
+#  ROLES (selectors)  —  virtual model names, maintained by 'llm role'
+# ============================================================================
+#  A client asks for a ROLE and llama-swap picks a real model for it, so
+#  clients and their subagents never need to know a file name.
+#   strategy: warm      -> the first target that is already running
+#   strategy: pin       -> always the first target
+#   strategy: spillover -> target 1 up to 'spillover' concurrent requests,
+#                          then target 2 starts (= the second card)
+#  A role reports the SMALLEST context and the INTERSECTION of the
+#  capabilities of its targets.  DO NOT edit by hand:
+# >>> llm:selectors
+# <<< llm:selectors
 
 # ============================================================================
 #  GPU GROUPS  —  maintained automatically by 'llm add --gpu N' / 'llm gpu sync'
 # ============================================================================
-#  Models with  --device ROCmN  end up in group gpuN.
-#   swap: false      -> models in the same group do not evict each other
+#  Every model pinned to a card lands in ONE group called 'pinned' - no matter
+#  whether it was pinned with --device ROCmN or with env: HIP_VISIBLE_DEVICES=N
+#  (that is how whisper does it, it has no --device flag).
+#   swap: false      -> members do not evict each other
 #   exclusive: false -> and do not evict anything from other groups
-#  Only this lets two cards each hold a model at the same time. Ungrouped
-#  (large) models use every card and unload the pinned ones while they run -
-#  that is intended.  DO NOT edit by hand:
+#   persistent: true -> and NO other group may evict them either
+#  Only this lets two cards each hold a model at the same time, and it keeps a
+#  model that spans all cards from throwing the service models out. One group
+#  and not one per card, because a 'spillover' role needs all of its targets in
+#  a single group.  DO NOT edit by hand:
 # >>> llm:groups
 # <<< llm:groups
 
@@ -113,17 +130,17 @@ models:
 
 # --- qwen3.8-27b-q8_0 ---
 #  "qwen3.8-27b-q8_0":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q8_0/Qwen3.8-27B-Q8_0.gguf -c 262144 --spec-draft-n-max 2 --parallel 1 -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0"
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q8_0/Qwen3.8-27B-Q8_0.gguf -c 262144 --spec-draft-n-max 2 -np 4 -kvu -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0"
 #    ttl: 900
 
 # --- qwen3.8-27b-q6_k ---
 #  "qwen3.8-27b-q6_k":
-#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q6_k/Qwen3.8-27B-Q6_K.gguf -c 131072 --spec-draft-n-max 2 --parallel 1 -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --device ROCm0 -sm none -mg 0 --spec-draft-device ROCm0"
+#    cmd: "${server-mtp} -m @LLM_HOME@/models/qwen3.8-27b-q6_k/Qwen3.8-27B-Q6_K.gguf -c 131072 --spec-draft-n-max 2 -np 4 -kvu -ctk q8_0 -ctv q8_0 --mmproj @LLM_HOME@/models/mmproj-qwen3.8-27b/mmproj-Qwen3.8-27B-f16.gguf --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --device ROCm0 -sm none -mg 0 --spec-draft-device ROCm0"
 #    ttl: 900
 
 # --- qwen3-reranker-0.6b-q8_0 ---
 #  "qwen3-reranker-0.6b-q8_0":
-#    cmd: "${server-rerank} -m @LLM_HOME@/models/qwen3-reranker-0.6b-q8_0/qwen3-reranker-0.6b-q8_0.gguf -c 8192 --device ROCm1 -sm none -mg 0"
+#    cmd: "${server-rerank} -m @LLM_HOME@/models/qwen3-reranker-0.6b-q8_0/qwen3-reranker-0.6b-q8_0.gguf -c 4096 --device ROCm1 -sm none -mg 0"
 #    ttl: 0
 
 # --- whisper-large-v3-turbo ---
@@ -150,7 +167,7 @@ models:
 
 # --- qwen3-embedding-4b-q8_0 ---
 #  "qwen3-embedding-4b-q8_0":
-#    cmd: "${server-embed} -m @LLM_HOME@/models/qwen3-embedding-4b-q8_0/Qwen3-Embedding-4B-Q8_0.gguf -c 8192 --device ROCm1 -sm none -mg 0"
+#    cmd: "${server-embed} -m @LLM_HOME@/models/qwen3-embedding-4b-q8_0/Qwen3-Embedding-4B-Q8_0.gguf -c 4096 --device ROCm1 -sm none -mg 0"
 #    ttl: 0
 
 # --- gemma-4-26b-a4b-it-ud-q4_k_xl ---

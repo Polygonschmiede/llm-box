@@ -39,6 +39,10 @@ Versions: llama.cpp b10453 · llama-swap v250 · whisper.cpp v1.9.2  up to date
   where they came from — and that accept changes.
 - **1, 2 or more cards.** Card count, gfx target and HIP compiler are detected, not
   hardcoded. Pin a small model to one card and run two models at once.
+- **Several clients and their subagents at the same time.** Models serve four
+  requests in parallel instead of queueing, and a **role** — one name in front of
+  several models — can send the overflow to the second card without the client
+  knowing. See [docs/FLAGS.md](docs/FLAGS.md).
 
 ## Requirements
 
@@ -89,6 +93,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 llm status                     # services, loaded model, GPU temperature and VRAM
 llm ls  /  llm rm <name>       # list / remove models
 llm add … --gpu 1              # pin a model to one card
+llm add … --slots 4            # serve four requests at once instead of queueing
+llm role                       # roles: one name, several models behind it
 llm gpu list  /  llm gpu sync  # cards; re-match the config after a hardware change
 llm speed                      # what token prediction is and when it helps
 
@@ -135,6 +141,11 @@ use any non-empty API key (`sk-local` in the examples — llama.cpp does not che
 and use a model name from `llm ls`. For agents there is the registry and its MCP
 server, so they see the real state instead of a stale hardcoded model list — see
 [docs/API.md](docs/API.md) and [docs/PI.md](docs/PI.md).
+
+Better than a model name: a **role** from `llm role`. A client asks for `coder` or
+`chat` and the server decides which model answers — including sending a third and
+fourth concurrent request to the second card. Point your main agent at one role and
+its subagents at another, and you never touch the client again when models change.
 
 ## Documentation
 
