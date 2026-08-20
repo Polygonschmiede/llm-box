@@ -14,7 +14,7 @@
 #  therefore not in the repository. Do not name the placeholders in a comment:
 #  the substitution is a plain sed over the whole file and would rewrite the
 #  comment too, which is how generated configs used to end up with a path like
-#  '/home/you/llm//home/you/whisper.cpp' in their header.
+#  <llm-home><whisper-home> glued together in their header.
 #
 #  Endpoint afterwards:  http://<server-ip>:8080/v1   ('llm url' prints it)
 # ============================================================================

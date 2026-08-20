@@ -248,7 +248,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "llm_gpus",
-    label: "LLM-Grafikkarten",
+    label: "LLM cards",
     description:
       "Free and used VRAM per card on the LLM server, temperature, and which models " +
       "are pinned to which card. The card count depends on the machine, so call " +
@@ -488,7 +488,7 @@ export default async function (pi: ExtensionAPI) {
     if (!repo) return;
     const quant = (await ctx.ui.input("Quant:", "Q4_K_M")) || "Q4_K_M";
     const cards = await cardIndices();
-    const gpu = await ctx.ui.select("Grafikkarte:", [
+    const gpu = await ctx.ui.select("Card:", [
       "all cards",
       ...cards.map((c) => `card ${c} only`),
     ]);

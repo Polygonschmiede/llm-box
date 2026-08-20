@@ -35,6 +35,18 @@ jobs:
           shellcheck --version
           shellcheck -x -S warning bin/llm setup-system.sh bin/install-comfyui.sh tests/*.sh
 
+      # The tree was translated once and the residue kept turning up in
+      # user-facing strings - an HTTP 400 body, a diff label, two pi menu items.
+      # A short explicit word list is cheap and catches the regression; a
+      # general language detector would only produce false positives.
+      - name: english only
+        run: |
+          if git grep -nIE '[äöüÄÖÜß]|\b(Karte|Grafikkarte|Modelle|Fortschritt|enthaelt|unerlaubte|Dienst|riesige|ueberspringen|Zeichen|neu\))' \
+               -- ':!CHANGELOG.md' ':!.github/workflows/ci.yml'; then
+            echo "::error::German text in a tracked file - this project is English throughout"
+            exit 1
+          fi
+
       - name: no leaked machine paths or addresses
         run: |
           # The repo must stay portable: no /home/<someone>, no LAN address.
