@@ -7,7 +7,7 @@ All notable changes to llm-box. Format follows
 Version numbers describe **llm-box itself**, not the engines it drives —
 `llm versions` reports those, and `llm update` moves them independently.
 
-## [Unreleased]
+## [1.3.0] — 2026-08-20
 
 ### Added
 
@@ -205,6 +205,7 @@ and speech-to-text; models that load and unload themselves; the `llm` CLI;
 versioned engine builds with rollback; a registry with an HTTP catalog and MCP
 for agents; ROCm-first, no Docker.
 
+[1.3.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.0.0
