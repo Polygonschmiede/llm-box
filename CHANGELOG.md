@@ -36,12 +36,8 @@ CI, and five bugs those tests found.
   existed only on `POST /api/models`.
 - A checkout without a configuration answered `GET /api/models` with a 500 and
   a traceback. It now returns 503 naming `llm init`.
-- `llm gpu sync` could never work: bash took the configuration lock and then
-  called Python, which takes the same lock — a self-deadlock — and the success
-  message was printed regardless of the exit status.
 - `llm llama|llm|api <action>` could never match `api`, and would have been
-  wrong if it had: `api` is the registry.
-- `llm ls` printed card 0 as `-`, because 0 is falsy in Python.
+  wrong if it had: `api` is the registry. Found by shellcheck.
 
 ### Added
 
@@ -109,6 +105,10 @@ CI, and five bugs those tests found.
   Card groups are now written `persistent: true`.
 - The catalog reported one slot for models with no `-np` flag, where llama.cpp
   actually runs four with a unified KV cache.
+- `llm gpu sync` could never work: bash took the configuration lock and then
+  called Python, which takes the same lock — a self-deadlock — and the success
+  message was printed regardless of the exit status.
+- `llm ls` printed card 0 as `-`, because 0 is falsy in Python.
 
 ### Changed
 
