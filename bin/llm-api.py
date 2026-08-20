@@ -32,11 +32,11 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 #  so setting it afterwards would have no effect.
 os.environ.setdefault("LLM_HOME", ROOT)
 
-import anyio
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+import anyio                                                            # noqa: E402
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse            # noqa: E402
 
-import llmreg
+import llmreg                                                            # noqa: E402
 
 #  Loopback by default: started by hand, the service is not accidentally on the
 #  network. The unit sets LLM_API_HOST explicitly, so the decision lives in one
@@ -546,7 +546,7 @@ def api_add(body: dict = Body(...)):
         argv += ["-c", str(body["contextWindow"])]
     argv += [repo, quant]
     if body.get("extraFlags"):
-        argv += ["--"] + str(body["extraFlags"]).split()
+        argv += ["--", *str(body["extraFlags"]).split()]
     job_id = job_start("add", argv)
     return {"jobId": job_id, "argv": argv,
             "hint": "Fortschritt: GET /api/jobs/%s" % job_id}

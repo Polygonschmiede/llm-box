@@ -179,7 +179,8 @@ def config_lock(timeout: float = 30.0):
                 break
             except OSError:
                 if time.time() > deadline:
-                    raise TimeoutError("configuration is locked right now (another llm command is running)")
+                    raise TimeoutError("configuration is locked right now "
+                                       "(another llm command is running)") from None
                 time.sleep(0.2)
         yield
     finally:
@@ -313,7 +314,7 @@ def gguf_meta(path: str) -> dict:
                 if key.startswith("tokenizer.") and key != "tokenizer.chat_template":
                     continue
                 out[key] = val
-    except Exception:
+    except Exception:      # noqa: BLE001 - a malformed header is "no metadata"
         out = {}
     _GGUF_CACHE[path] = out
     return out
@@ -459,7 +460,7 @@ def hf_verify(repo: str, sha: str) -> str | None:
         d = _http_json("https://huggingface.co/api/models/%s/revision/%s" % (repo, sha),
                        timeout=15)
         return (d or {}).get("id") or repo
-    except Exception:
+    except Exception:      # noqa: BLE001 - no Hugging Face, no revision
         return None
 
 
@@ -470,7 +471,7 @@ def hf_search(query: str, limit: int = 20, gguf_only: bool = True) -> list[str]:
             % (urllib.parse.quote(query), limit, "&filter=gguf" if gguf_only else ""),
             timeout=15)
         return [d.get("id", "") for d in (data or []) if d.get("id")]
-    except Exception:
+    except Exception:      # noqa: BLE001 - a failed search is an empty search
         return []
 
 
@@ -509,12 +510,12 @@ def live() -> dict:
         out["up"] = True
         for m in (data or {}).get("data", []):
             out["states"][m.get("id")] = (m.get("status") or {}).get("value", "unknown")
-    except Exception:
+    except Exception:      # noqa: BLE001 - llama-swap down is a state, not an error
         return out
     try:
         run = _http_json(SWAP_API + "/running") or {}
         out["running"] = run.get("running", [])
-    except Exception:
+    except Exception:      # noqa: BLE001 - as above: report what we know
         pass
     return out
 
@@ -822,7 +823,8 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
     else:
         issues.append("provenance unknown (on the server: llm meta backfill)")
 
-    gguf = gguf_meta(model_file) if (want_gguf and model_file and os.path.exists(model_file)) else {}
+    gguf = gguf_meta(model_file) \
+        if (want_gguf and model_file and os.path.exists(model_file)) else {}
     parallel, kv_unified = slots_of(cmd, role)
     kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel or 1) \
         if (model_file and ctx) else None
@@ -1584,7 +1586,8 @@ def remove_model(name: str, delete_files: bool = False) -> dict:
     if delete_files:
         path = (model or {}).get("files", {}).get("model", {}).get("path")
         d = os.path.dirname(path) if path else os.path.join(MODELS, name)
-        if d and os.path.isdir(d) and os.path.realpath(d).startswith(os.path.realpath(MODELS) + os.sep):
+        inside = os.path.realpath(d).startswith(os.path.realpath(MODELS) + os.sep)
+        if d and os.path.isdir(d) and inside:
             shutil.rmtree(d)
             removed.append(d)
     return {"model": name, "filesRemoved": removed, "reloaded": reload_swap()}
@@ -1627,7 +1630,7 @@ def unload_all() -> dict:
     try:
         urllib.request.urlopen(SWAP_API + "/unload", timeout=30).read()
         return {"unloaded": True}
-    except Exception as exc:
+    except Exception as exc:      # noqa: BLE001 - the caller wants the reason, not a raise
         return {"unloaded": False, "error": str(exc)}
 
 

@@ -79,7 +79,7 @@ whisper_roundtrip(){ # $1=fixture  $2=logical card -> what lands in the env
       - "HIP_VISIBLE_DEVICES=0"'
   #  Writes for real and reads the value back OUT OF THE FILE. Asserting on the
   #  returned note instead would pass even when the wrong number is written.
-  LLM_HOME="$home" LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  LLM_HOME="$home" LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
   LLM_SWAP_API="http://127.0.0.1:9" \
     pyx "
 import re

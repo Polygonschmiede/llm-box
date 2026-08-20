@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # ============================================================================
 #  Shared harness for the test suites in this directory
 # ============================================================================
@@ -61,7 +62,7 @@ $1
 }
 
 probe(){ # $1=fixture  $2=expression -> one line
-  LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
     pyx "print($2)"
 }
 

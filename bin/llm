@@ -22,7 +22,6 @@ API="http://127.0.0.1:8080"
 lan_ip(){ hostname -I 2>/dev/null | awk '{print $1; exit}'; }
 PUBLIC_HOST="${LLM_PUBLIC_HOST:-$(lan_ip)}"
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
-PUBLIC_API="${LLM_PUBLIC_API:-http://$PUBLIC_HOST:8080/v1}"
 
 # --- Configuration lock -----------------------------------------------------
 #  Since the registry API (port 8081) can trigger changes, two writers can arrive
@@ -490,7 +489,7 @@ lcpp_migrate(){
 # wait for /health, force a tiny answer. LD_LIBRARY_PATH matters because older
 # builds carry an absolute RUNPATH to .../build/bin.
 smoke_test(){ # $1=build directory
-  local bd="$1" model port=5987 log="$LLM_HOME/.smoke.log" pid code i out
+  local bd="$1" model port=5987 log="$LLM_HOME/.smoke.log" pid code out
   [[ -x "$bd/bin/llama-server" ]] || { err "no llama-server in $bd/bin"; return 1; }
   # Take a model from the configuration (an entry's '-m') and pick the smallest.
   # Not simply the smallest GGUF in the directory: that would be the MTP drafter,
@@ -506,7 +505,7 @@ smoke_test(){ # $1=build directory
     --host 127.0.0.1 --port "$port" --no-webui > "$log" 2>&1 &
   pid=$!
   code=""
-  for i in $(seq 1 180); do
+  for _ in $(seq 1 180); do
     sleep 2
     if ! kill -0 "$pid" 2>/dev/null; then
       err "the test server died. Last lines ($log):"; tail -6 "$log" >&2; return 1
@@ -664,8 +663,7 @@ owui_active(){
   "$VENV_UI/bin/python" -c 'import importlib.metadata as m; print(m.version("open-webui"))' 2>/dev/null
 }
 owui_smoke(){   # waits until the UI answers
-  local i
-  for i in $(seq 1 40); do
+  for _ in $(seq 1 40); do
     curl -sf -m 3 http://127.0.0.1:3000/health >/dev/null 2>&1 && return 0
     sleep 3
   done
@@ -1527,7 +1525,9 @@ case "${1:-}" in
   rollback) shift; cmd_rollback "$@";;
 
   # Individual services
-  llama|llm|api)   shift; svc_ctl llama-swap "${1:-status}" "LLM API";;
+  #  No 'api' here: that is the registry (cmd_api, above) and this branch could
+  #  never be reached for it anyway.
+  llama|llm)       shift; svc_ctl llama-swap "${1:-status}" "LLM API";;
   comfy|comfyui)   shift; svc_ctl comfyui    "${1:-status}" "ComfyUI";;
   ui|webui|chat)   shift; svc_ctl open-webui "${1:-status}" "chat UI";;
 

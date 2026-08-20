@@ -27,7 +27,7 @@ if [ "$DEPS_ONLY" = no ]; then
   [ -d "$CU/.git" ] || git clone --depth 1 https://github.com/comfyanonymous/ComfyUI "$CU"
 fi
 [ -d "$CU/.git" ] || { echo "ComfyUI is not in $CU"; exit 1; }
-cd "$CU"
+cd "$CU" || { echo "cannot enter $CU"; exit 1; }
 
 echo "=== 2) venv (Python 3.12) ==="
 [ -d "$CU/venv" ] || uv venv --python 3.12 "$CU/venv"

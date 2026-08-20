@@ -40,7 +40,7 @@ LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" \
 printf 'testtoken\n' > "$H/config/api-token"
 
 api(){ # $1=python body with `c` = TestClient, prints what you print
-  LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
   LLM_SWAP_API="http://127.0.0.1:9" \
     pyapi "
 import importlib.util, os

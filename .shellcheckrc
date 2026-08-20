@@ -1,0 +1,16 @@
+# ============================================================================
+#  shellcheck configuration
+# ============================================================================
+#  bin/llm is a 1500-line CLI with heredocs, colour variables and small inline
+#  python. shellcheck earns its place on the real hazards - unquoted expansions,
+#  useless cat, wrong test operators - and not on style.
+
+# Follow `.` / `source` into the sourced file (tests/lib.sh, bin/llm-update).
+external-sources=true
+
+# SC2155: `local x="$(cmd)"` masks the exit status. Used throughout on commands
+#         whose failure is already handled by the empty result.
+disable=SC2155
+
+# SC1091: sourced paths that only exist at runtime (the venvs).
+disable=SC1091

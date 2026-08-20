@@ -33,7 +33,7 @@ cfg(){ # -> LLM_HOME with one card-0 model, one env-pinned whisper, one all-card
 }
 
 run(){ # $1=LLM_HOME  $2=python -> stdout
-  LLM_HOME="$1" LLM_ROCM_SMI="$SMI2" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  LLM_HOME="$1" LLM_ROCM_SMI="$SMI2" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
   LLM_SWAP_API="http://127.0.0.1:9" pyx "$2"
 }
 
@@ -90,7 +90,7 @@ check "env pin gets a group"     "pinned" \
   "$(run "$H" "print(llmreg.gpu_of([e for e in llmreg.parse_config() if e['name']=='whisper'][0])['group'])")"
 #  On an iGPU-first machine the env holds 1 absolute = card 0 logical.
 check "env pin translated"       "0" \
-  "$(LLM_HOME="$H" LLM_ROCM_SMI="$SMI_IGPU" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  "$(LLM_HOME="$H" LLM_ROCM_SMI="$SMI_IGPU" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
      pyx "print(llmreg.gpu_of([e for e in llmreg.parse_config() if e['name']=='whisper'][0])['device'])")"
 
 section "role_of"
@@ -255,7 +255,7 @@ import re
 t = llmreg.sync_tensor_split()
 print((re.search(r'^\s*(-ts [\d.,]+)\s*$', t, re.M) or ['','none'])[1])")"
 check "one card -> gone" "none" \
-  "$(LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-1card.sh" LLM_DGPUS= LLM_MIN_VRAM_GB= \
+  "$(LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-1card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
      pyx "
 import re
 t = llmreg.sync_tensor_split()

@@ -10,7 +10,7 @@
 #  Run with:  bash tests/run-all.sh
 # ============================================================================
 set -uo pipefail
-cd "$(dirname "$(readlink -f "$0")")/.."
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 
 suites=(gpu-matrix config-matrix vram-matrix api-matrix)
 failed=()
