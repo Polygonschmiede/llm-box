@@ -781,8 +781,17 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
     if model_dir and os.path.basename(os.path.dirname(model_dir)) == "models":
         pass                                        # model file sits directly in the folder
     elif model_dir:
-        while model_dir and os.path.dirname(model_dir) != MODELS and model_dir != MODELS:
-            model_dir = os.path.dirname(model_dir)
+        #  Walk up to the directory sitting directly under MODELS. The root
+        #  check is not cosmetic: for a -m path OUTSIDE models/ - another disk,
+        #  a hand-edited config - this used to spin forever, because
+        #  os.path.dirname("/") == "/". A single such entry hung every caller of
+        #  catalog(), i.e. GET /api/models never answered.
+        while model_dir != MODELS and os.path.dirname(model_dir) != MODELS:
+            parent = os.path.dirname(model_dir)
+            if parent == model_dir:                 # filesystem root, not under MODELS
+                model_dir = None
+                break
+            model_dir = parent
     src = read_meta(model_dir) if model_dir else None
     if src and src.get("repo"):
         src = dict(src, url="https://huggingface.co/" + src["repo"])
