@@ -231,12 +231,34 @@ EOF
 }
 
 # --- Service control (one service, a generic action) ------------------------
+#  Why the reset-failed: the units are Restart=on-failure with RestartSec=3,
+#  against systemd's default of five starts per ten seconds. A configuration
+#  llama-swap rejects therefore trips the rate limiter within seconds, and from
+#  then on the unit stays dead - including after the configuration is fixed,
+#  because every further start is refused with "start request repeated too
+#  quickly". Without this, `llm restart` reports success while the endpoint
+#  stays down.
+svc_up(){ # $1=unit  $2=plain name  $3=start|restart
+  systemctl --user reset-failed "$1" 2>/dev/null
+  if systemctl --user "$3" "$1"; then
+    #  A unit can start and then fail on its own configuration a moment later.
+    sleep 1
+    if [[ "$(systemctl --user is-active "$1" 2>/dev/null)" == active ]]; then
+      ok "$2 ${3}ed"
+      return 0
+    fi
+  fi
+  err "$2 did not come up. Last lines:"
+  journalctl --user -u "$1" -n 8 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
 svc_ctl(){ # $1=unit  $2=action  $3=plain name
   local u="$1" a="${2:-status}" n="${3:-$1}"
   case "$a" in
-    on|start)  systemctl --user start   "$u" && ok "$n started";;
+    on|start)  svc_up "$u" "$n" start;;
     off|stop)  systemctl --user stop    "$u" && ok "$n stopped";;
-    restart)   systemctl --user restart "$u" && ok "$n restarted";;
+    restart)   svc_up "$u" "$n" restart;;
     status|"") systemctl --user status  "$u" --no-pager 2>/dev/null || warn "$n is not installed";;
     logs)      journalctl --user -u "$u" -n 60 -f;;
     *) err "which action? $n <on|off|restart|status|logs>";;
@@ -1058,8 +1080,18 @@ case "${1:-}" in
   logs)    journalctl --user -u "$SERVICE" -n 60 -f;;
 
   # Everything on / everything off
-  on)      info "starting the LLM API + registry + chat UI ..."; systemctl --user start llama-swap llm-api open-webui 2>/dev/null; ok "on. (ComfyUI separately: llm comfy on)";;
-  off)     info "Stopping ALL services (the GPUs become free) ..."; systemctl --user stop comfyui open-webui llm-api llama-swap 2>/dev/null; ok "Everything off.";;
+  #  Per unit through svc_up, so a service that refuses its configuration says
+  #  so instead of being hidden behind one cheerful "on."
+  on)      info "starting the LLM API + registry + chat UI ..."
+           rc=0
+           svc_up llama-swap "LLM API"  start || rc=1
+           svc_up llm-api    "Registry" start || rc=1
+           svc_up open-webui "Chat UI"  start || rc=1
+           [[ $rc -eq 0 ]] && ok "on. (ComfyUI separately: llm comfy on)"
+           exit $rc;;
+  off)     info "stopping ALL services (the GPUs become free) ..."
+           systemctl --user stop comfyui open-webui llm-api llama-swap 2>/dev/null
+           ok "everything off.";;
 
   -V|--version|version) printf 'llm-box %s\n' "$(llm_version)";;
   # Overview / monitoring

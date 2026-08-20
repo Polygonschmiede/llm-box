@@ -29,6 +29,19 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 
 - `docs/FLAGS.md` listed `high` as a valid `reasoning_effort`. On the model this
   project ships examples for, it is an HTTP 500.
+- **A service could stay dead after its configuration was fixed.** systemd counts
+  manual starts towards its rate limit, and the default is five per ten seconds —
+  so `llm off && llm on` plus a restart was enough to trip it, after which every
+  start was refused with "start request repeated too quickly" until someone ran
+  `systemctl --user reset-failed`. The units now disable the limiter, so a
+  rejected configuration crash-loops visibly and recovers by itself the moment
+  the file is fixed. Measured: broken config → `activating`, file repaired →
+  `active` within ten seconds with no command in between.
+- `llm restart` and `llm on` reported success while the service was down —
+  `systemctl restart` returns 0 for a unit that starts and then exits. Both now
+  clear the failed state, verify the unit is really running, and print the
+  service's own error when it is not. `llm on` reports per unit instead of one
+  "on." with stderr discarded.
 
 ### Changed
 

@@ -8,6 +8,15 @@ Description=llm-box registry — model catalog for agents (HTTP + MCP)
 After=network-online.target llama-swap.service
 Wants=network-online.target
 
+# The rate limiter counts MANUAL starts too, and its default is five per ten
+# seconds - so 'llm off && llm on' plus a restart trips it, and from then on
+# every start is refused with "start request repeated too quickly", leaving the
+# service dead until someone knows about 'systemctl --user reset-failed'.
+# Observed repeatedly. Without the limiter a rejected configuration crash-loops
+# visibly and, more usefully, recovers by itself once the configuration is fixed.
+# NOTE: this is a [Unit] directive. In [Service] systemd ignores it silently.
+StartLimitIntervalSec=0
+
 [Service]
 # Reads the llama-swap configuration, queries llama-swap and rocm-smi, and may
 # change both. Reading is unauthenticated, writing needs config/api-token.
@@ -17,7 +26,7 @@ ExecStart=@LLM_HOME@/venv-api/bin/python @LLM_HOME@/bin/llm-api.py
 Environment=LLM_API_PORT=8081
 Environment=LLM_API_HOST=@LLM_BIND@
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=default.target

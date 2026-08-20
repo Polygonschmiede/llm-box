@@ -8,6 +8,15 @@ Description=llama-swap — OpenAI-compatible LLM proxy (llama.cpp)
 After=network-online.target
 Wants=network-online.target
 
+# The rate limiter counts MANUAL starts too, and its default is five per ten
+# seconds - so 'llm off && llm on' plus a restart trips it, and from then on
+# every start is refused with "start request repeated too quickly", leaving the
+# service dead until someone knows about 'systemctl --user reset-failed'.
+# Observed repeatedly. Without the limiter a rejected configuration crash-loops
+# visibly and, more usefully, recovers by itself once the configuration is fixed.
+# NOTE: this is a [Unit] directive. In [Service] systemd ignores it silently.
+StartLimitIntervalSec=0
+
 [Service]
 # Which cards are visible is detected by 'llm gpu sync' and written there, so
 # this unit stays machine-independent. The '-' means: if the file is missing the
@@ -16,7 +25,7 @@ Wants=network-online.target
 EnvironmentFile=-@LLM_HOME@/config/hardware.env
 ExecStart=@LLM_HOME@/bin/llama-swap --config @LLM_HOME@/config/llama-swap.yaml --listen @LLM_BIND@:8080
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=default.target
