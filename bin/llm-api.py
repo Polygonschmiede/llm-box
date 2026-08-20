@@ -66,7 +66,12 @@ class Catalog:
         mt = self._config_mtime()
         with self._lock:
             if mt != self._mtime or not self._static:
-                self._static = llmreg.catalog(with_live=False)
+                try:
+                    self._static = llmreg.catalog(with_live=False)
+                except llmreg.ConfigMissing as exc:
+                    #  A fresh checkout, not a server fault - say which command
+                    #  fixes it instead of returning a traceback.
+                    raise HTTPException(503, str(exc)) from None
                 self._mtime = mt
             base = [json.loads(json.dumps(m)) for m in self._static]
         state = llmreg.live()
@@ -426,6 +431,7 @@ async def api_events():
 def api_patch(model_id: str, body: dict = Body(default={}),
               dry_run: bool = Query(default=False, alias="dryRun")):
     CAT.one(model_id)                                  # 404 if it does not exist
+    _check_patch(body)
     try:
         out = llmreg.patch_model(model_id, body, dry_run=dry_run)
     except MemoryError as exc:
@@ -467,6 +473,34 @@ def api_delete(model_id: str, files: bool = Query(default=False)):
     return out
 
 
+def _check_gpu(gpu) -> None:
+    """A card number that exists, or 'both'. Used by POST *and* PATCH.
+
+    PATCH used to skip this entirely, so a model could be pinned to a card the
+    machine does not have - llama-server then failed at load time with nothing
+    pointing back at the request that caused it.
+    """
+    if gpu is None or str(gpu) in ("both", "all"):
+        return
+    n = llmreg.gpu_count()
+    if not re.fullmatch(r"\d+", str(gpu)) or (n and int(gpu) >= n):
+        raise HTTPException(400, "gpu must be 'both' or a card number 0..%d "
+                                 "(detected: %d card(s), see GET /api/gpus)"
+                                 % (max(n - 1, 0), n))
+
+
+def _check_patch(body: dict) -> None:
+    """What PATCH accepts. Mirrors the checks POST /api/models already had."""
+    _check_gpu(body.get("gpu"))
+    for key in ("ttl", "contextWindow"):
+        v = body.get(key)
+        if v is not None and not (isinstance(v, int) and 0 <= v <= 10_000_000):
+            raise HTTPException(400, "%s must be a whole number" % key)
+    np_ = body.get("parallel")
+    if np_ is not None and not (isinstance(np_, int) and 1 <= np_ <= 64):
+        raise HTTPException(400, "parallel must be a whole number 1..64")
+
+
 def _check_add(body: dict) -> tuple[str, str]:
     """Validate input: these flags end up in the cmd line llama-swap executes."""
     repo = str(body.get("repo") or "")
@@ -478,13 +512,7 @@ def _check_add(body: dict) -> tuple[str, str]:
     extra = str(body.get("extraFlags") or "")
     if re.search(r"[;&|<>`$\n\r\"']", extra):
         raise HTTPException(400, "extraFlags contains metacharacters - plain flags only")
-    gpu = body.get("gpu")
-    if gpu is not None and str(gpu) not in ("both", "all"):
-        n = llmreg.gpu_count()
-        if not re.fullmatch(r"\d+", str(gpu)) or (n and int(gpu) >= n):
-            raise HTTPException(400, "gpu must be 'both' or a card number 0..%d "
-                                     "(detected: %d card(s), see GET /api/gpus)"
-                                     % (max(n - 1, 0), n))
+    _check_gpu(body.get("gpu"))
     for key in ("ttl", "contextWindow"):
         v = body.get(key)
         if v is not None and not (isinstance(v, int) and 0 <= v <= 10_000_000):

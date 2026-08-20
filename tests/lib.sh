@@ -117,14 +117,48 @@ check_err(){ # $1=case  $2=expected exception name  $3=actual output
   fi
 }
 
+#  Skipped, not failed: the registry suite needs venv-api, and a checkout that
+#  has not run 'llm setup' should report that rather than go red.
+skips=0
+skip(){ # $1=case  $2=why
+  skips=$((skips + 1))
+  printf '  \033[0;33mskip\033[0m  %-52s %s\n' "$1" "$2"
+}
+
+#  Python from the registry environment (fastapi, mcp). Falls back to the system
+#  interpreter, which is enough for anything that only imports llmreg.
+PYAPI="$REPO/venv-api/bin/python"
+[[ -x "$PYAPI" ]] || PYAPI="python3"
+
+have_api(){ "$PYAPI" -c 'import fastapi.testclient, mcp' >/dev/null 2>&1; }
+
+pyapi(){ # $1=python statements, run with the registry environment
+  local out rc
+  out=$("$PYAPI" -c "
+import sys
+sys.path.insert(0, '$REPO/lib')
+$1
+" 2>"$TMP/py.err")
+  rc=$?
+  if (( rc != 0 )); then
+    printf 'ERROR: %s' "$(grep -E '^\w*(Error|Exception)' "$TMP/py.err" | tail -1)"
+    printf '\n\033[0;31m        traceback:\033[0m\n' >&2
+    sed 's/^/        /' "$TMP/py.err" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
 section(){ printf '\n\033[0;36m%s\033[0m\n' "$1"; }
 
 summary(){
+  local tail=""
+  (( skips > 0 )) && tail="$(printf ', \033[0;33m%d skipped\033[0m' "$skips")"
   printf '\n'
   if (( fails == 0 )); then
-    printf '\033[0;32m%d checks passed.\033[0m\n' "$checks"
+    printf '\033[0;32m%d checks passed\033[0m%s.\n' "$checks" "$tail"
   else
-    printf '\033[0;31m%d of %d checks failed.\033[0m\n' "$fails" "$checks"
+    printf '\033[0;31m%d of %d checks failed\033[0m%s.\n' "$fails" "$checks" "$tail"
   fi
   return $(( fails > 0 ))
 }

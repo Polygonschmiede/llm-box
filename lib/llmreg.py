@@ -189,9 +189,24 @@ def config_lock(timeout: float = 30.0):
             fh.close()
 
 
+class ConfigMissing(FileNotFoundError):
+    """There is no llama-swap.yaml yet. Named so callers can answer usefully.
+
+    config_text() is the entrance to parse_config, find_block, read_selectors,
+    sync_groups, sync_tensor_split, gpu_sync, patch_model, remove_model and
+    therefore catalog(). On a fresh checkout - the state of every clone before
+    'llm init' - a bare FileNotFoundError travelled all the way out as an
+    HTTP 500 with a traceback, which tells the caller nothing.
+    """
+
+
 def config_text() -> str:
-    with open(CONFIG, encoding="utf-8") as fh:
-        return fh.read()
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        raise ConfigMissing(
+            "no configuration at %s - create it with 'llm init'" % CONFIG) from None
 
 
 def parse_config(text: str | None = None) -> list[dict]:
@@ -310,7 +325,7 @@ def _arch_get(meta: dict, suffix: str, default=None):
 
 
 def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
-                   parallel: int = 1) -> int | None:
+                   parallel: int = 1, meta: dict | None = None) -> int | None:
     """Size of the KV cache in bytes, from the real GGUF header.
 
     NOTE on `parallel`: the attention KV cache does NOT scale with the slot
@@ -326,7 +341,10 @@ def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
       * sliding window (Gemma 4): SWA layers only store the window and
         haben eigene Key-/Value-Laengen
     """
-    meta = gguf_meta(model_path)
+    #  meta is injectable so the three layout branches below can be checked
+    #  against synthetic headers - the arithmetic decides whether a load OOMs,
+    #  and a real GGUF fixture would mean committing gigabytes.
+    meta = gguf_meta(model_path) if meta is None else meta
     if not meta or not ctx:
         return None
     layers = _arch_get(meta, "block_count")
