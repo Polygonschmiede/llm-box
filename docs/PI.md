@@ -153,6 +153,14 @@ Questions that now simply work:
 
 **Deleting and downloading are not done by the agent** — those stay with you.
 
+## What the extension deliberately does not automate
+
+Six tools, against nine over plain MCP: `add_model`, `remove_model` and
+`job_status` are missing. Fetching 22 GB from Hugging Face and deleting a model
+live in the interactive `/llm` command instead, behind a confirmation. An agent
+that can delete a model inside its own turn is a worse trade than one that has
+to ask, and the registry keeps both doors so the choice is the client's.
+
 ## `/llm` — the things you decide yourself
 
 ```

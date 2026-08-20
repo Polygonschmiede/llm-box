@@ -122,6 +122,12 @@ llama-swap is the switchboard: clients talk to **one** endpoint, it starts the
 requested model and frees the VRAM again when the model goes unused. Open WebUI
 loads nothing itself — it is just another client of port 8080.
 
+llama-swap also ships its **own** web interface at `http://<server>:8080/ui`:
+live state, per-request tok/s, logs, GPU charts and a playground. It knows
+nothing about the configuration, though, and its hardware page does not apply
+`HIP_VISIBLE_DEVICES` — see [docs/UI.md](docs/UI.md) for which interface to
+trust for what.
+
 ## ⚠ Security
 
 The shipped defaults bind every service to `127.0.0.1`. That is deliberate:
@@ -155,6 +161,7 @@ its subagents at another, and you never touch the client again when models chang
 | [docs/MODELS.md](docs/MODELS.md) | choosing, adding and removing models; quants; per-model settings |
 | [docs/FLAGS.md](docs/FLAGS.md) | every llama.cpp option this stack sets, and why |
 | [docs/UPDATES.md](docs/UPDATES.md) | staying current, with rollback |
+| [docs/UI.md](docs/UI.md) | the four interfaces and which one knows what |
 | [docs/API.md](docs/API.md) | the registry: HTTP catalog and MCP |
 | [docs/PI.md](docs/PI.md) | connecting the pi agent |
 | [docs/COMFYUI.md](docs/COMFYUI.md) | image generation alongside the LLMs |

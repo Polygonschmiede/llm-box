@@ -56,6 +56,16 @@ CI, and five bugs those tests found.
   feeds the CLI, the registry and `package.json`.
 - This changelog, and `CONTRIBUTING.md` — which is the first place that says
   how to run the tests.
+- `docs/UI.md`: the four interfaces and which one is authoritative for what.
+  llama-swap ships its own ten-page web interface at `:8080/ui` and nothing here
+  ever mentioned it — including that its hardware page ignores
+  `HIP_VISIBLE_DEVICES` and lists an integrated GPU as a compute card, and that
+  it has no configuration view at all.
+- `SECURITY.md` now records that `GET /unload` on port 8080 unloads every model
+  without a token — a mutating GET, so a browser prefetch is enough.
+- `docs/API.md` and `docs/PI.md` state why the registry exposes nine MCP tools
+  and the pi extension registers six: downloading and deleting live in pi's
+  interactive `/llm` command behind a confirmation, not as agent-callable tools.
 
 ### Changed
 
@@ -64,6 +74,16 @@ CI, and five bugs those tests found.
 - Card-pinned models share **one** routing group (`pinned`) instead of one per
   card. The settings were identical anyway, and a `spillover` role requires all
   of its targets in a single group.
+- `bin/llm` is 1096 lines, down from 1591: the update and rollback machinery for
+  the five engines moved to `lib/update.sh`, which it does not share anything
+  with beyond the output helpers.
+- Removing a model now also drops it from every role that pointed at it, and
+  deletes a role left with no targets. llama-swap validates selector targets at
+  startup, so the old behaviour produced a configuration that failed on the next
+  restart.
+- The whole tree is English, including the shipped template's own header — which
+  used to name the two path placeholders in a comment, so `llm init` substituted
+  them there too and every generated configuration carried a mangled path.
 
 ## [1.1.0] — 2026-08-20
 

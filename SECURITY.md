@@ -22,6 +22,23 @@ the examples is a placeholder, not a secret. Anyone who can reach port 8080 can
 run any configured model and read any file the server process can read via a
 model path. Treat reachability as full access.
 
+Three specifics on port 8080 that are easy to miss:
+
+- **`GET /unload` unloads every model**, with no token and no confirmation. It is
+  a *mutating GET*, so it does not take a person: a browser prefetch, a link
+  checker, a chat client that unfurls URLs, anything that follows links will
+  empty your VRAM. Observed, not theoretical — one automated fetch of that path
+  dropped two models that were pinned resident with `ttl: 0`.
+- **The web interface at `/ui`** (llama-swap's own, see [docs/UI.md](docs/UI.md))
+  comes with a playground and a full log viewer. Whoever reaches the port gets
+  free inference and your upstream logs.
+- **Reads on the registry, port 8081, need no token** and return every model's
+  filesystem path, SHA-256 and Hugging Face repo, plus live VRAM per card.
+
+None of that matters on the shipped `127.0.0.1` default. All of it matters the
+moment you set `LLM_BIND=0.0.0.0`. If you need remote access, prefer the SSH
+tunnel in [docs/REMOTE.md](docs/REMOTE.md) over opening the ports.
+
 ## Opening it up on purpose
 
 Everything binds to loopback until you say otherwise:

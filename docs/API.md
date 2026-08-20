@@ -231,6 +231,20 @@ anything that changes state demands one and says exactly what is missing otherwi
 
 pi does not need MCP — it has an extension, see [PI.md](PI.md).
 
+### Nine tools over MCP, six in pi — on purpose
+
+The registry exposes `list_models`, `get_model`, `gpu_status`,
+`set_model_config`, `load_model`, `unload_models`, `add_model`, `remove_model`
+and `job_status`. The pi extension registers six: it leaves out `add_model`,
+`remove_model` and `job_status`.
+
+That is not drift. Downloading 22 GB and deleting a model are in pi's
+interactive `/llm` command instead, behind a confirmation, because an agent that
+can delete a model on its own turn is a worse trade than one that has to ask.
+What an agent connected over plain MCP can do is therefore *more* than what the
+same agent can do through the pi extension — worth knowing before you wonder
+which one is broken.
+
 ## Security
 
 Reads are unauthenticated by default; writes need the token. If you do not want the
