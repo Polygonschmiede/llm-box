@@ -115,6 +115,25 @@ def has_flag_any(cmd: str, *names) -> bool:
     return any(has_flag(cmd, n) for n in names)
 
 
+def slots_of(cmd: str, role: str = "chat") -> tuple[int | None, bool | None]:
+    """(slots, kv_unified) as llama-server will really run, not as written.
+
+    llama.cpp treats a missing '-np'/'--parallel' as auto = 4 slots with a
+    unified KV cache (tools/server/server.cpp), so reporting the literal flag
+    would claim one slot where there are four. whisper-server has neither
+    flag, hence the None for role "stt".
+    """
+    n = _num(flag_any(cmd, "-np", "--parallel"), None)
+    auto = n is None or n < 0
+    parallel = 4 if auto else n
+    unified = auto or has_flag_any(cmd, "-kvu", "--kv-unified")
+    if has_flag_any(cmd, "-no-kvu", "--no-kv-unified"):
+        unified = False
+    if role == "stt":
+        return None, None
+    return parallel, unified
+
+
 def set_flag(cmd: str, name: str, value) -> str:
     """Set a flag (replace or append). value=None -> a bare switch."""
     cmd = del_flag(cmd, name)
@@ -771,18 +790,8 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
         issues.append("provenance unknown (on the server: llm meta backfill)")
 
     gguf = gguf_meta(model_file) if (want_gguf and model_file and os.path.exists(model_file)) else {}
-    # llama.cpp: '-np'/'--parallel' unset means auto = 4 slots + unified KV
-    # (server.cpp:151-154). Report what the server will actually do, not the
-    # literal flag, otherwise the catalog claims one slot where there are four.
-    _np = _num(flag_any(cmd, "-np", "--parallel"), None)
-    parallel = 4 if (_np is None or _np < 0) else _np
-    kv_unified = has_flag_any(cmd, "-kvu", "--kv-unified") or _np is None or _np < 0
-    if has_flag_any(cmd, "-no-kvu", "--no-kv-unified"):
-        kv_unified = False
-    if role == "stt":
-        # whisper-server, not llama-server: neither flag exists there.
-        parallel = kv_unified = None
-    kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel) \
+    parallel, kv_unified = slots_of(cmd, role)
+    kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel or 1) \
         if (model_file and ctx) else None
 
     endpoint = {"chat": "/chat/completions", "embed": "/embeddings",
@@ -1017,6 +1026,37 @@ def get_model(name: str, **kw) -> dict | None:
 # ---------------------------------------------------------------------------
 #  Writing the configuration
 # ---------------------------------------------------------------------------
+def put_block(text: str, mark: str, body: str, head: str = "") -> str:
+    """Replace the '# >>> llm:<mark>' block, or CREATE it before 'models:'.
+
+    Creating rather than silently doing nothing matters: sync_groups() used to
+    return the text unchanged when its marker was missing, and all four callers
+    reported success - while every card-pinned model quietly stayed in
+    llama-swap's default group, which swaps and is exclusive.
+
+    New blocks go BEFORE 'models:'. Appending at the end of the file would put
+    them after it, and the next 'llm add' - which appends its two-space model
+    block at the bottom - would hang that model under the wrong key.
+    """
+    block = "# >>> llm:%s\n%s# <<< llm:%s" % (mark, body, mark)
+    pat = r"# >>> llm:%s\n.*?# <<< llm:%s" % (re.escape(mark), re.escape(mark))
+    if re.search(pat, text, re.S):
+        return re.sub(pat, lambda _m: block, text, flags=re.S)
+    m = re.search(r"^models:", text, re.M)
+    if not m:
+        raise ValueError("the configuration has no 'models:' section - "
+                         "is this a llama-swap config? (llm init)")
+    #  Walk back over the comment header that belongs to 'models:' so it stays
+    #  attached to it instead of ending up above the new block.
+    lines = text[:m.start()].split("\n")
+    while lines and (lines[-1].startswith("#") or not lines[-1].strip()):
+        lines.pop()
+    cut = len("\n".join(lines))
+    if cut:
+        cut += 1
+    return text[:cut] + head + block + "\n\n" + text[cut:]
+
+
 def _write_config(text: str) -> None:
     tmp = CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -1054,8 +1094,19 @@ def sync_groups(text: str | None = None) -> str:
         width = max(len(n) for n, _ in members) + 2
         for name, card in members:
             block += '      - %-*s # Karte %d\n' % (width, '"%s"' % name, card)
-    new = "# >>> llm:groups\n" + block + "# <<< llm:groups"
-    return re.sub(r"# >>> llm:groups\n.*?# <<< llm:groups", lambda _m: new, text, flags=re.S)
+    head = ("# " + "=" * 76 + "\n"
+            "#  CARD GROUPS  —  maintained by 'llm add --gpu N' / 'llm gpu sync'\n"
+            "# " + "=" * 76 + "\n"
+            "#  Every model pinned to a card goes into ONE group called '%s' -\n"
+            "#  whether it was pinned with --device ROCmN or with\n"
+            "#  env: HIP_VISIBLE_DEVICES=N (whisper has no --device flag).\n"
+            "#   swap: false      -> members do not evict each other\n"
+            "#   exclusive: false -> and do not evict anything from other groups\n"
+            "#   persistent: true -> and NO other group may evict them either\n"
+            "#  One group and not one per card, because a 'spillover' role needs\n"
+            "#  all of its targets in a single group.  DO NOT edit by hand:\n"
+            % PINNED_GROUP)
+    return put_block(text, "groups", block, head)
 
 
 # ---------------------------------------------------------------------------
@@ -1130,12 +1181,8 @@ def render_selectors(sel: dict) -> str:
 
 
 def write_selectors(sel: dict, text: str | None = None) -> str:
-    """Replace the marker block. Creates it above the MODELLE header if absent."""
+    """Replace the roles block, creating it above 'models:' if it is absent."""
     text = config_text() if text is None else text
-    block = "# >>> llm:%s\n%s# <<< llm:%s" % (_SEL_MARK, render_selectors(sel), _SEL_MARK)
-    pat = r"# >>> llm:%s\n.*?# <<< llm:%s" % (_SEL_MARK, _SEL_MARK)
-    if re.search(pat, text, re.S):
-        return re.sub(pat, lambda _m: block, text, flags=re.S)
     head = ("# " + "=" * 76 + "\n"
             "#  ROLES (selectors)  —  virtual model names, maintained by 'llm role'\n"
             "# " + "=" * 76 + "\n"
@@ -1147,22 +1194,7 @@ def write_selectors(sel: dict, text: str | None = None) -> str:
             "#                          then target 2 starts (= the second card)\n"
             "#  A role reports the SMALLEST context and the INTERSECTION of the\n"
             "#  capabilities of its targets.  DO NOT edit by hand:\n")
-    #  Must go BEFORE 'models:'. Appending at the end of the file would put the
-    #  block after it, and then the next 'llm add' - which appends its two-space
-    #  model block at the bottom - would hang that model under 'selectors:'.
-    m = re.search(r"^models:", text, re.M)
-    if not m:
-        raise ValueError("the configuration has no 'models:' section")
-    start = m.start()
-    #  Walk back over the comment header that belongs to 'models:' so it stays
-    #  attached to it instead of ending up above our block.
-    lines = text[:start].split("\n")
-    while lines and (lines[-1].startswith("#") or not lines[-1].strip()):
-        lines.pop()
-    cut = len("\n".join(lines))
-    if cut:
-        cut += 1
-    return text[:cut] + head + block + "\n\n" + text[cut:]
+    return put_block(text, _SEL_MARK, render_selectors(sel), head)
 
 
 def set_selector(name: str, strategy: str, targets: list[str],
@@ -1435,11 +1467,18 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
         gpu = changes["gpu"]
         gpu = "both" if str(gpu) == "both" else int(gpu)
         if before["role"] == "stt":
-            # Whisper gets its card through the environment, not through flags
+            # Whisper gets its card through the environment, not through flags -
+            # and HIP_VISIBLE_DEVICES counts ABSOLUTE cards the way rocm-smi
+            # does, while `gpu` here is the logical index. Writing the logical
+            # one addresses the wrong card on any machine whose iGPU does not
+            # sort last. gpu_of() reads this back through to_logical().
             if gpu == "both":
                 raise ValueError("whisper always runs on exactly one card")
-            body_new = re.sub(r'(HIP_VISIBLE_DEVICES=)\d+', r"\g<1>%d" % gpu, body_new)
-            notes.append("env HIP_VISIBLE_DEVICES=%d" % gpu)
+            smi = to_smi(gpu)
+            if smi is None:
+                raise ValueError("card %d is not a compute card (llm gpu list)" % gpu)
+            body_new = re.sub(r'(HIP_VISIBLE_DEVICES=)\d+', r"\g<1>%d" % smi, body_new)
+            notes.append("env HIP_VISIBLE_DEVICES=%d (logical card %d)" % (smi, gpu))
         else:
             cmd = set_gpu(cmd, gpu, is_mtp=before["runtime"]["specDecoding"] == "mtp")
 
@@ -1469,11 +1508,18 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
             body_new = body_new.rstrip("\n") + "\n" + line
         notes.append("pi-Override %s" % key)
 
-    # Does it still fit on the card?
+    # Does it still fit on the card? Evaluate the PATCHED command, not `before`:
+    # -ctk halves the KV cache and -np changes the slot count, so checking the
+    # old values could refuse a change that in fact frees room.
     target_gpu = changes.get("gpu", before["runtime"]["gpu"]["device"]
                              if before["runtime"]["gpu"]["mode"] == "single" else "both")
-    fit = check_fit(before, ctx=_num(changes.get("contextWindow"),
-                                     before["runtime"]["contextWindow"]),
+    np_new, _ = slots_of(cmd, before["role"])
+    candidate = dict(before, runtime=dict(before["runtime"],
+                                          kvCacheQuant=flag(cmd, "-ctk"),
+                                          parallel=np_new))
+    fit = check_fit(candidate, ctx=_num(changes.get("contextWindow"),
+                                        _num(flag(cmd, "-c"),
+                                             before["runtime"]["contextWindow"])),
                     gpu=target_gpu)
     if not fit["ok"] and not changes.get("force"):
         raise MemoryError(fit["reason"])
