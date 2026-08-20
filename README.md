@@ -95,6 +95,7 @@ llm ls  /  llm rm <name>       # list / remove models
 llm add … --gpu 1              # pin a model to one card
 llm add … --slots 4            # serve four requests at once instead of queueing
 llm role                       # roles: one name, several models behind it
+llm key                        # the API key for port 8080 (off by default)
 llm gpu list  /  llm gpu sync  # cards; re-match the config after a hardware change
 llm speed                      # what token prediction is and when it helps
 
@@ -143,8 +144,10 @@ only writes need a token.
 
 Open it up on purpose with `sudo env LLM_BIND=0.0.0.0 bash setup-system.sh`, which also
 adds firewall rules for your own subnet — or forward the ports over SSH and leave
-the services on loopback. Read **[SECURITY.md](SECURITY.md)** before you expose
-anything.
+the services on loopback. If you do open port 8080, `llm key new` puts an API key
+in front of it: without one, a plain `GET /unload` frees the VRAM, and being a GET
+it does not take a person — a browser prefetch will do it. `llm doctor` says so.
+Read **[SECURITY.md](SECURITY.md)** before you expose anything.
 
 ## Using it from other tools
 

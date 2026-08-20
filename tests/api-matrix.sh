@@ -228,4 +228,29 @@ print(c.patch('/api/models/big', json={'ttl': 60}).status_code)")"
 check "reads stay open by default" "False" \
   "$(api "print(c.get('/api/session').json()['readNeedsAuth'])")"
 
+#  pi-models.json is the one read that stays open so a client can bootstrap -
+#  but once an inference key is set the payload carries it, and handing that to
+#  anyone who reaches the port would undo the point of setting it.
+section "pi-models.json follows its content"
+check "open while no key is set"     "200" \
+  "$(api "print(c.get('/api/pi-models.json').status_code)")"
+check "it carries the placeholder"   "sk-local" \
+  "$(api "print(c.get('/api/pi-models.json').json()['providers']['llm-box']['apiKey'])")"
+check "gated once a key exists"      "401" \
+  "$(api "
+llmreg = __import__('llmreg')
+llmreg.api_key(create=True)
+print(c.get('/api/pi-models.json').status_code)")"
+check "and readable with the token"  "True" \
+  "$(api "
+llmreg = __import__('llmreg')
+k = llmreg.api_key(create=True)
+r = c.get('/api/pi-models.json', headers=TOK)
+print(r.status_code == 200 and r.json()['providers']['llm-box']['apiKey'] == k)")"
+check "health stays open regardless" "200" \
+  "$(api "
+llmreg = __import__('llmreg')
+llmreg.api_key(create=True)
+print(c.get('/api/health').status_code)")"
+
 summary

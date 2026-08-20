@@ -426,4 +426,63 @@ check "whisper has no effort block"  "None" \
 m = [x for x in llmreg.catalog(with_live=False) if x['role'] == 'stt']
 print(m[0]['runtime'].get('reasoningEffort') if m else 'no stt model')")"
 
+# ---------------------------------------------------------------------------
+#  llama-swap is default-allow: without an apiKeys block a plain GET /unload
+#  frees the VRAM, with no token and no confirmation. Measured on a scratch
+#  instance: with a key, every path except /health answers 401.
+section "the inference key"
+H3="$(cfg)"
+check "off by default"               "None" \
+  "$(run "$H3" "print(llmreg.api_key())")"
+check "and not created on demand"    "None" \
+  "$(run "$H3" "
+llmreg.api_key()
+import os
+print(os.path.exists(llmreg.API_KEY_FILE) or None)")"
+check "no key means no block content" "False" \
+  "$(run "$H3" "print('apiKeys:' in llmreg.sync_api_key())")"
+check "creating one is explicit"     "True" \
+  "$(run "$H3" "
+k = llmreg.api_key(create=True)
+print(k.startswith('sk-') and len(k) > 40)")"
+check "and it lands in the config"   "True" \
+  "$(run "$H3" "
+k = llmreg.api_key(create=True)
+print('apiKeys:' in llmreg.sync_api_key() and k in llmreg.sync_api_key())")"
+check "the key file is not world-readable" "600" \
+  "$(run "$H3" "
+import os, stat
+llmreg.api_key(create=True)
+print(oct(stat.S_IMODE(os.stat(llmreg.API_KEY_FILE).st_mode))[2:])")"
+check "the chat UI env file follows" "True" \
+  "$(run "$H3" "
+k = llmreg.api_key(create=True)
+llmreg.sync_api_key()
+print(k in open(llmreg.API_KEY_ENV).read())")"
+check "removing it empties the block" "False" \
+  "$(run "$H3" "
+llmreg.api_key(create=True); llmreg.sync_api_key()
+llmreg.drop_api_key()
+print('apiKeys:' in llmreg.sync_api_key())")"
+check "and the env file falls back"  "True" \
+  "$(run "$H3" "
+llmreg.api_key(create=True); llmreg.sync_api_key()
+llmreg.drop_api_key(); llmreg.sync_api_key()
+print('sk-local' in open(llmreg.API_KEY_ENV).read())")"
+check "rotating gives a different key" "True" \
+  "$(run "$H3" "
+a = llmreg.api_key(create=True)
+llmreg.drop_api_key()
+b = llmreg.api_key(create=True)
+print(a != b)")"
+#  The registry hands this key to pi, so a rotation propagates by itself.
+check "pi is handed the real key"    "True" \
+  "$(run "$H3" "
+k = llmreg.api_key(create=True)
+print(llmreg.pi_models_json()['providers']['llm-box']['apiKey'] == k)")"
+check "and the placeholder when open" "sk-local" \
+  "$(run "$H3" "
+llmreg.drop_api_key()
+print(llmreg.pi_models_json()['providers']['llm-box']['apiKey'])")"
+
 summary

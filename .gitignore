@@ -41,6 +41,8 @@ __pycache__/
 
 # Key for write access to the registry API (machine-specific)
 config/api-token
+config/api-key
+config/api-key.env
 
 # Live configuration: rendered from config/llama-swap.example.yaml by 'llm init',
 # contains absolute paths of this machine.

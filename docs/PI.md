@@ -214,6 +214,22 @@ One caveat worth respecting: the effort instruction is rendered at the very fron
 of the prompt, so changing it between turns invalidates the whole prompt cache.
 Choose per session, not per task.
 
+## When the server requires an inference key
+
+If `llm key` is on, two things change for a client. The provider block pi
+consumes carries the key, so `GET /api/pi-models.json` is no longer handed out
+without the registry token — configure the token even if the agent is never
+meant to change anything:
+
+```bash
+echo '{"url": "http://<server-ip>:8081", "token": "<llm api token>"}' \
+  > ~/.pi/agent/llm-box.json
+```
+
+The extension then reads the key from the registry along with everything else,
+so a rotation on the server needs nothing on the client but a refresh. `llm api
+client` on the server prints the exact lines.
+
 ## Giving subagents a different model
 
 The registry serves **roles** (`llm role` on the server) alongside the models, so

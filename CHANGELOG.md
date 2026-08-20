@@ -29,6 +29,16 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   reports `canWrite`, `DELETE` ends it. Reads stay open by default — the pi
   extension reads without a token — and `LLM_API_REQUIRE_AUTH=1` requires it for
   reads too, which is worth setting if 8081 is reachable beyond your own machine.
+- **`llm key`** puts an API key in front of port 8080, which llama-swap
+  otherwise leaves default-allow. With one in force every path except `/health`
+  needs `Authorization: Bearer <key>` — measured: `/v1/models`, `/unload`,
+  `/ui`, `/logs`, `/metrics` and `/running` all answer 401 without it. That
+  closes the mutating `GET /unload`, the open playground and the log viewer
+  without moving the port to loopback, so remote inference keeps working. Off by
+  default: turning it on breaks any client that does not know the key yet, so it
+  has to be asked for.
+- `llm doctor` reports the combination that actually matters — port 8080
+  answering on a non-loopback address with no key in force — and names the fix.
 - `tests/ui-matrix.sh` runs the page's script under a minimal DOM against
   payloads from a throwaway `LLM_HOME`. Curling `/ui` would not do: it answers
   200 whatever the JavaScript does, and the first version of that check passed
@@ -50,6 +60,11 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 
 ### Fixed
 
+- **`GET /api/pi-models.json` would have leaked the inference key.** It is the
+  one read that stays open so a client can bootstrap itself, and its payload
+  carries the key — so anyone who could reach port 8081 could have read the key
+  that was supposed to protect port 8080. It now requires the registry token
+  exactly when a key is set, and stays open when there is none.
 - `docs/FLAGS.md` listed `high` as a valid `reasoning_effort`. On the model this
   project ships examples for, it is an HTTP 500.
 - **A service could stay dead after its configuration was fixed.** systemd counts

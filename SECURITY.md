@@ -39,6 +39,42 @@ None of that matters on the shipped `127.0.0.1` default. All of it matters the
 moment you set `LLM_BIND=0.0.0.0`. If you need remote access, prefer the SSH
 tunnel in [docs/REMOTE.md](docs/REMOTE.md) over opening the ports.
 
+### If you do open port 8080: `llm key`
+
+llama-swap is default-allow, but it can require a key. `llm key new` generates
+one, writes it into the configuration and tells you which clients need a nudge:
+
+```bash
+llm key new        # generate and wire it in
+llm restart        # llama-swap starts enforcing it
+llm ui restart     # the chat UI picks it up from config/api-key.env
+llm key            # print it
+llm key off        # back to open
+```
+
+With a key in force, **every path except `/health`** needs
+`Authorization: Bearer <key>` — measured: `/v1/models`, `/unload`, `/ui`,
+`/logs`, `/metrics` and `/running` all answer 401 without it. That closes the
+mutating GET, the open playground and the log viewer in one move, and it does so
+without moving the port to loopback, so remote inference keeps working.
+
+Three consequences worth knowing before you turn it on:
+
+- **Every client needs the key.** The registry hands it to pi, so pi picks it up
+  on its next refresh; Open WebUI reads it from `config/api-key.env` on restart.
+  Anything else you have pointed at `:8080/v1` with a hardcoded key has to be
+  updated by hand.
+- **`GET /api/pi-models.json` stops being open.** That payload carries the key,
+  so once one is set the endpoint requires the registry token — otherwise the
+  key would be readable by anyone who can reach port 8081, which would undo the
+  whole exercise. `llm api client` prints the line pi needs.
+- **The key travels in plain HTTP.** It is a door, not a secret channel. On a
+  network you do not control, put TLS in front (llama-swap takes
+  `-tls-cert-file`/`-tls-key-file`) or use the SSH tunnel.
+
+`llm doctor` reports the combination that matters: port 8080 answering on a
+non-loopback address with no key in force.
+
 ## Opening it up on purpose
 
 Everything binds to loopback until you say otherwise:

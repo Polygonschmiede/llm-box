@@ -20,7 +20,12 @@ StartLimitIntervalSec=0
 [Service]
 # Backend = llama-swap (ONE endpoint for every model)
 Environment=OPENAI_API_BASE_URL=http://127.0.0.1:8080/v1
+#  A placeholder first, then the generated file if there is one: systemd applies
+#  these in order, so 'llm key new' takes effect on the next restart without the
+#  unit having to be re-rendered. llama.cpp ignores the value while no apiKeys
+#  block is in force.
 Environment=OPENAI_API_KEY=sk-local
+EnvironmentFile=-@LLM_HOME@/config/api-key.env
 #  Shipped WITH authentication: the database under DATA_DIR holds every chat and
 #  every API key anyone pastes into one. To open it deliberately, set False here -
 #  see SECURITY.md.

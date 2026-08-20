@@ -473,7 +473,21 @@ def api_state():
 
 
 @app.get("/api/pi-models.json")
-def api_pi_models():
+def api_pi_models(x_llm_token: str | None = Header(default=None),
+                  llm_session: str | None = Cookie(default=None)):
+    """The provider block pi consumes. Open, EXCEPT when it carries a secret.
+
+    This one endpoint stays reachable without a token so a client can bootstrap
+    itself - but once an inference key is set (llm key new) the payload contains
+    it, and handing that to anyone who can reach the port would undo the whole
+    point of setting it. So the rule follows the content: no key, no
+    authentication; key, token or session required.
+    """
+    if llmreg.api_key():
+        want = llmreg.api_token(create=False)
+        if not (want and (x_llm_token == want or _session_valid(llm_session))):
+            raise HTTPException(401, "an inference key is set, so this payload carries a "
+                                     "secret - send X-LLM-Token (llm api token)")
     return llmreg.pi_models_json(CAT.all())
 
 

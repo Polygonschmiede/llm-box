@@ -73,8 +73,9 @@ is this set up", use `llm ls`, `llm role` and the registry.
 
 **`GET /unload` unloads everything** and needs no authentication. It is a
 mutating GET, so a browser prefetch or anything that follows links can empty
-your VRAM. See [../SECURITY.md](../SECURITY.md); the short answer is not to have
-port 8080 reachable from anywhere you do not control.
+your VRAM. `llm key new` closes it — with a key in force, everything here except
+`/health` answers 401 without `Authorization: Bearer <key>`, this page included.
+See [../SECURITY.md](../SECURITY.md).
 
 ## What only the CLI knows
 

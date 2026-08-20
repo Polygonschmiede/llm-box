@@ -116,6 +116,9 @@ ${c_y}── MODELS (you choose; nothing downloads on its own) ─────�
                    --ttl SEC   idle time before unloading (0 = never; default 900)
                    -- ...      any further llama-server flags (e.g. --top-p 0.9)
   llm ls                  show configured models
+  llm key                 the API key for port 8080 (show | new | off)
+                          off by default: without one, anyone who can reach the
+                          port can run models and empty the VRAM
   llm role                roles: one name, several models behind it (for subagents)
         llm role set coder spillover <big-model> <small-model> --spillover=2
         llm role set fast pin <small-model>       |  llm role rm <name>
@@ -449,6 +452,22 @@ cmd_doctor(){
     [[ -f "$HOME/.config/systemd/user/$u.service" ]] && _ok "$u installed ($(systemctl --user is-active "$u"))" \
       || _warn "$u is not installed" "sudo bash $LLM_HOME/setup-system.sh"
   done
+
+  #  Reachability IS access on port 8080 unless a key is set: llama-swap is
+  #  default-allow, and a plain GET /unload frees the VRAM - no person needed,
+  #  a browser prefetch will do it.
+  info "Exposure"
+  local unit="$HOME/.config/systemd/user/llama-swap.service" bind="" key=""
+  [[ -f "$unit" ]] && bind="$(sed -n 's/.*--listen \([^:]*\):.*/\1/p' "$unit" | head -1)"
+  key="$(reg api-key 2>/dev/null)"
+  if [[ -z "$bind" || "$bind" == "127.0.0.1" || "$bind" == localhost ]]; then
+    _ok "port 8080 is on loopback${key:+ and needs a key}"
+  elif [[ -n "$key" ]]; then
+    _ok "port 8080 is on $bind and needs an API key"
+  else
+    _warn "port 8080 answers on $bind with no key - anyone who reaches it can run models, read the logs and empty the VRAM" \
+          "llm key new    (or bind to 127.0.0.1 and use an SSH tunnel, see SECURITY.md)"
+  fi
 
   echo
   if [[ $fails -eq 0 && $warns -eq 0 ]]; then ok "Everything checks out."
@@ -848,6 +867,41 @@ cmd_rm(){
   reg remove-model "$name" "$files" || return 1
 }
 
+# --- The API key for the inference endpoint -------------------------------
+#  Off by default. Turning it on breaks every client that does not know the key,
+#  so it says which ones and what to do about them rather than just doing it.
+cmd_key(){
+  case "${1:-show}" in
+    ""|show)
+      local k; k="$(reg api-key)"
+      if [[ -z "$k" ]]; then
+        warn "the inference endpoint on port 8080 is open - no key required."
+        echo  "  Anyone who can reach it can run any model, read the logs through"
+        echo  "  /ui, and empty the VRAM with a plain GET /unload."
+        echo  "  Turn it on:  llm key new"
+      else
+        #  Only the key on stdout: this is used in command substitution, and a
+        #  hint mixed in ends up inside an Authorization header.
+        printf '%s\n' "$k"
+        info "clients must send:  Authorization: Bearer <this>" >&2
+      fi;;
+    new)
+      local old; old="$(reg api-key)"
+      reg api-key new >/dev/null || return 1
+      ok "$([[ -n "$old" ]] && echo "key rotated" || echo "key created")"
+      echo  "  The registry now hands this key to pi, so pi picks it up on its next"
+      echo  "  refresh. What does NOT update itself:"
+      echo  "    Open WebUI      llm ui restart   (it reads the key from its unit)"
+      echo  "    anything else pointed at :8080/v1 with a hardcoded key"
+      warn "for llama-swap to enforce it:  llm restart";;
+    off)
+      reg api-key off >/dev/null || return 1
+      ok "key removed - port 8080 is open again."
+      warn "for llama-swap to notice:  llm restart";;
+    *) err "llm key [show|new|off]"; return 1;;
+  esac
+}
+
 # --- Roles (llama-swap selectors): virtual model names --------------------
 #  A client asks for a ROLE, llama-swap picks a real model for it. That is how a
 #  subagent gets a different model from the main agent without the client
@@ -995,7 +1049,9 @@ ${c_b}Once on the client machine - for the pi agent:${c_0}
   pi install $LLM_REPO_URL
   export LLM_BOX_URL=http://$ip:8081
 
-  ${c_y}# only needed if the agent may also CHANGE things (card, context, load):${c_0}
+  ${c_y}# needed if the agent may also CHANGE things (card, context, load) -
+  # and NOT optional once 'llm key' is on, because the model list then
+  # carries the inference key and is no longer handed out unauthenticated:${c_0}
   echo '{"url": "http://$ip:8081", "token": "$tok"}' > ~/.pi/agent/llm-box.json
 
   ${c_y}# leftovers, if the server used to be configured there by hand:${c_0}
@@ -1099,6 +1155,7 @@ case "${1:-}" in
   # Overview / monitoring
   status|st) cmd_dash;;
   role|roles) require_config || exit 1; shift; cmd_role "$@";;
+  key)     require_config || exit 1; shift; cmd_key "$@";;
   gpu)     case "${2:-}" in
              list)  reg gpus --table;;
              sync)  if [[ "${3:-}" == "--dry-run" ]]; then
