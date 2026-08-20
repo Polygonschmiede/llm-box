@@ -135,8 +135,14 @@ def slots_of(cmd: str, role: str = "chat") -> tuple[int | None, bool | None]:
 
 
 def set_flag(cmd: str, name: str, value) -> str:
-    """Set a flag (replace or append). value=None -> a bare switch."""
-    cmd = del_flag(cmd, name)
+    """Set a flag (replace or append). value=None -> a bare switch.
+
+    The with_value hand-off matters: del_flag() removes the flag AND the token
+    after it by default, so setting a valueless switch used to eat whatever
+    followed it. On '-np 3 -kvu' plus set_flag('-kvu', None) that produced
+    '3 -kvu' - a command line llama-server refuses to start.
+    """
+    cmd = del_flag(cmd, name, with_value=value is not None)
     return _tidy(cmd + (" %s %s" % (name, value) if value is not None else " " + name))
 
 
@@ -1466,7 +1472,7 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
         for f in ("--parallel", "-np"):
             cmd = del_flag(cmd, f)
         for f in ("-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"):
-            cmd = del_flag(cmd, f)
+            cmd = del_flag(cmd, f, with_value=False)   # bare switches
         cmd = set_flag(cmd, "-np", np_)
         # Shared KV pool: one long request may still use the whole -c.
         cmd = set_flag(cmd, "-kvu", None)
