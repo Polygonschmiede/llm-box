@@ -38,6 +38,13 @@ from fastapi.responses import JSONResponse, StreamingResponse            # noqa:
 
 import llmreg                                                            # noqa: E402
 
+#  Same source as bin/llm, so the CLI and the API can never disagree.
+try:
+    with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as _fh:
+        LLM_BOX_VERSION = _fh.read().strip() or "unknown"
+except OSError:
+    LLM_BOX_VERSION = "unknown"
+
 #  Loopback by default: started by hand, the service is not accidentally on the
 #  network. The unit sets LLM_API_HOST explicitly, so the decision lives in one
 #  greppable place.
@@ -352,7 +359,7 @@ async def lifespan(_app: FastAPI):
         yield
 
 
-app = FastAPI(title="llm-box registry", version="1.0", lifespan=lifespan,
+app = FastAPI(title="llm-box registry", version=LLM_BOX_VERSION, lifespan=lifespan,
               description="Model registry of the local LLM server")
 
 
@@ -376,7 +383,8 @@ def versions() -> dict:
             return None
     swap = out(os.path.join(llmreg.LLM_HOME, "bin", "llama-swap"), "--version")
     lcpp = os.path.realpath(os.path.join(llmreg.LLM_HOME, "llama.cpp", "build"))
-    return {"llamaSwap": (swap or "").replace("version: ", "").split("\n")[0] or None,
+    return {"llmBox": LLM_BOX_VERSION,
+            "llamaSwap": (swap or "").replace("version: ", "").split("\n")[0] or None,
             "llamaCpp": os.path.basename(lcpp).replace("build-", "") if lcpp else None}
 
 

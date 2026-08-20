@@ -1,0 +1,109 @@
+# Changelog
+
+All notable changes to llm-box. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Version numbers describe **llm-box itself**, not the engines it drives —
+`llm versions` reports those, and `llm update` moves them independently.
+
+## [1.2.0] — 2026-08-20
+
+Maintenance: the first tests for the parts that decide whether a model loads,
+CI, and five bugs those tests found.
+
+### Fixed
+
+- `HIP_VISIBLE_DEVICES` was written with the **logical** card number while that
+  variable counts absolute cards the way `rocm-smi` does. `gpu_of()` already
+  read it back through `to_logical()`, so read and write disagreed. Invisible
+  on a machine whose discrete cards sit at 0,1; on an iGPU-first machine
+  `PATCH {"gpu": 0}` on a whisper model addressed the wrong card.
+- `sync_groups()` returned the configuration unchanged when its marker block
+  was missing, and all four callers reported success — while every card-pinned
+  model quietly stayed in llama-swap's default group, which swaps and is
+  exclusive. It now creates the block, or refuses if there is no `models:`
+  section at all.
+- `derive()` looped forever on a model whose `-m` path lies outside `models/`.
+  A single such entry hung `llm ls` and `GET /api/models`.
+- `set_flag(name, None)` removed the bare switch **and the token after it**, so
+  patching slots twice turned `-np 3 -kvu` into `3 -kvu` — a command line
+  llama-server refuses to start. Reachable through `PATCH {"parallel": N}`.
+- The VRAM fit check ran against the state *before* the patch, so adding
+  `-ctk q8_0` — which halves the KV cache — was judged at f16 and could be
+  refused although it frees room.
+- `PATCH /api/models/{id}` accepted a card the machine does not have; the check
+  existed only on `POST /api/models`.
+- A checkout without a configuration answered `GET /api/models` with a 500 and
+  a traceback. It now returns 503 naming `llm init`.
+- `llm gpu sync` could never work: bash took the configuration lock and then
+  called Python, which takes the same lock — a self-deadlock — and the success
+  message was printed regardless of the exit status.
+- `llm llama|llm|api <action>` could never match `api`, and would have been
+  wrong if it had: `api` is the registry.
+- `llm ls` printed card 0 as `-`, because 0 is falsy in Python.
+
+### Added
+
+- `tests/run-all.sh` plus three new suites — 158 checks in total, none of which
+  needs a GPU or touches the machine's own configuration. `tests/lib.sh` holds
+  the shared harness; a temporary `LLM_HOME` exercises the real config write
+  path.
+- `.github/workflows/ci.yml`: ruff, shellcheck, the suites, a guard against
+  committing machine paths or LAN addresses, and a markdown link check.
+- `pyproject.toml` (lint rules only), `.shellcheckrc`, `.editorconfig`.
+- `llm --version`, and `llmBox` in `GET /api/health`. A single `VERSION` file
+  feeds the CLI, the registry and `package.json`.
+- This changelog, and `CONTRIBUTING.md` — which is the first place that says
+  how to run the tests.
+
+### Changed
+
+- `kv_cache_bytes()` takes an optional pre-read GGUF header, so the three cache
+  layouts can be tested without committing gigabytes of model files.
+- Card-pinned models share **one** routing group (`pinned`) instead of one per
+  card. The settings were identical anyway, and a `spillover` role requires all
+  of its targets in a single group.
+
+## [1.1.0] — 2026-08-20
+
+### Added
+
+- **Slots.** Models serve four requests at once instead of queueing. `-c` is the
+  total KV cache either way, so slots cost no cache — measured, the worst-case
+  latency for two clients fell from 24.7 s to 5.0 s while total throughput
+  stayed flat. One card has a fixed budget; slots make it fair, not faster.
+- **Roles** (`llm role`): one name in front of several models, resolved per
+  request. `spillover` sends the overflow to the second card without the client
+  knowing. A role reports the smallest context and the intersection of the
+  capabilities of its targets.
+- `-cram 16384` for the prompt cache — host RAM, no VRAM. It is what makes a
+  returning agent skip re-reading its whole prompt.
+- `llm add --slots N`, `parallel` in `PATCH /api/models/{id}`, and `kind`,
+  `kvUnified` and role entries in the catalog.
+
+### Fixed
+
+- Whisper pins its card through `env:` rather than `--device`, so the group
+  generator never saw it and a single transcription unloaded **both** cards.
+  Card groups are now written `persistent: true`.
+- The catalog reported one slot for models with no `-np` flag, where llama.cpp
+  actually runs four with a unified KV cache.
+
+### Changed
+
+- Embedding and reranker buffers halved (`-b/-ub 4096`, `-c 4096`): the
+  always-on trio dropped from 21.6 GB to 15.3 GB, freeing 6.3 GB. A single
+  input over 4096 tokens is now rejected rather than truncated; batches are
+  still split internally.
+
+## [1.0.0] — 2026-08-17
+
+Initial release. One OpenAI-compatible endpoint for chat, embeddings, reranking
+and speech-to-text; models that load and unload themselves; the `llm` CLI;
+versioned engine builds with rollback; a registry with an HTTP catalog and MCP
+for agents; ROCm-first, no Docker.
+
+[1.2.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.2.0
+[1.1.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.1.0
+[1.0.0]: https://github.com/Polygonschmiede/llm-box/releases/tag/v1.0.0

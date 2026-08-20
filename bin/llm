@@ -16,6 +16,11 @@ LLAMA_SERVER="$LLM_HOME/llama.cpp/build/bin/llama-server"
 SERVICE="llama-swap"                      # systemd --user unit
 API="http://127.0.0.1:8080"
 
+#  One source for the version: the VERSION file. bin/llm is the main artifact
+#  and used to report every engine's version but never its own, so there was no
+#  way to say which llm-box a bug report came from.
+llm_version(){ cat "$LLM_HOME/VERSION" 2>/dev/null || echo unknown; }
+
 # The address OTHER machines use to reach the OpenAI API (not 127.0.0.1!).
 # Detected, not hardcoded - otherwise every installation points at the network of
 # whoever edited this file last.
@@ -117,6 +122,7 @@ ${c_y}── OVERVIEW ───────────────────�
   llm status              dashboard: services, loaded model, GPU temperature
   llm url                 the addresses (API / chat / images / registry)
   llm doctor              check everything and say how to fix what is broken
+  llm --version           which llm-box this is (engines: llm versions)
 
 ${c_y}── FIRST RUN ─────────────────────────────────────────────────────${c_0}
   llm init                create the configuration from config/llama-swap.example.yaml
@@ -1541,6 +1547,7 @@ case "${1:-}" in
   on)      info "starting the LLM API + registry + chat UI ..."; systemctl --user start llama-swap llm-api open-webui 2>/dev/null; ok "on. (ComfyUI separately: llm comfy on)";;
   off)     info "Stopping ALL services (the GPUs become free) ..."; systemctl --user stop comfyui open-webui llm-api llama-swap 2>/dev/null; ok "Everything off.";;
 
+  -V|--version|version) printf 'llm-box %s\n' "$(llm_version)";;
   # Overview / monitoring
   status|st) cmd_dash;;
   role|roles) shift; cmd_role "$@";;

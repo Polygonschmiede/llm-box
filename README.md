@@ -175,6 +175,13 @@ tests/                  card-detection matrix with fake rocm-smi fixtures
 docs/                   the documentation above
 ```
 
+## Contributing
+
+`bash tests/run-all.sh` — no GPU needed, and it does not touch your
+configuration. Details, the lint commands and where code belongs:
+[CONTRIBUTING.md](CONTRIBUTING.md). What changed when:
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Credits
 
 Built on [llama.cpp](https://github.com/ggml-org/llama.cpp),
