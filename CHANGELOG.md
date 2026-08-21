@@ -177,6 +177,23 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   `lib/update.sh` rather than `bin/llm`, and `GGML_CCACHE=ON` is llama.cpp's own
   default rather than something this project sets.
 
+- **`llm update llama` moved the source tree before checking it could build.**
+  The backend prerequisites were validated at the cmake call, by which point
+  `git fetch` and `git checkout <tag>` had already run — so a machine missing
+  `glslc` was left with a checkout on a version nothing was built from. The
+  active build was never at risk, which is what the versioned build directories
+  are for. The check runs before the fetch now, for llama.cpp and whisper.cpp.
+- The Vulkan build prerequisite check was wrong twice before it was right, and
+  both ways are worth recording: looking for `/usr/include/vulkan/vulkan.h`
+  fails on a hand-installed SDK, and preprocessing that header succeeds while
+  cmake's `find_package(Vulkan)` still fails for want of the link-time library.
+  It compiles and links now, and covers `spirv-headers` too — determined by
+  building it: leaving any of the three packages out fails at configure. It also
+  *runs* `glslc` rather than merely finding it — ggml probes shader extensions by looking for "extension not supported" in
+  glslc's output and treats anything else as supported, so a `glslc` that cannot
+  start makes every extension look available and the build dies thousands of
+  shader lines later.
+
 ### Added
 
 - **Updates and rollbacks from the control page.** The System tab now has
@@ -222,6 +239,71 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   Security Advisories now. The hardware template asks for raw `rocm-smi` output,
   because "which card, which ROCm version" is always the first question and
   `tests/fixtures/` exists so a machine nobody here owns can be reproduced.
+
+- **A Vulkan backend, chosen at setup.** `llm init --backend vulkan` (or
+  `llm gpu backend vulkan` later) builds llama.cpp and whisper.cpp with
+  `-DGGML_VULKAN=ON` instead of HIP. It exists because `docs/INSTALL.md` used to
+  begin "from a bare ROCm machine": an AMD card ROCm has dropped, an Intel Arc or
+  an NVIDIA card had no way in at all. Vulkan needs no `AMDGPU_TARGETS` and no
+  HIP compiler — one cmake flag and three distribution packages — so it also
+  cannot be built for hardware it has not met. ROCm stays the default wherever it
+  is complete, because it is faster where it works.
+
+  What this touches, and what it does not:
+
+  - **`lib/gpu_rocm.py` and `lib/gpu_vulkan.py`** — the only split out of
+    `lib/llmreg.py`, and it exists because the card detection would otherwise be
+    written twice. Everything above it is shared: the absolute↔logical
+    translation, the `LLM_DGPUS` override, the fit arithmetic.
+  - **Card readings under Vulkan** come from `vulkaninfo` for identity and order
+    and from amdgpu's sysfs for temperature, watts, utilisation and VRAM, joined
+    by the DRM card number the driver reports rather than by list position.
+    Cross-checked against `rocm-smi` on the same two cards: identical VRAM to the
+    byte and identical junction temperatures, with power and utilisation differing
+    only by the seconds between the two samples.
+  - **`discrete` is now a fact, not a guess.** Vulkan states the device type, so
+    the integrated GPU — and `llvmpipe`, the software rasteriser Vulkan offers on
+    every mesa machine and nobody wants a model on — are excluded outright.
+    Under ROCm the same distinction still has to be inferred from a CPU brand name
+    and a VRAM threshold.
+  - **A card the driver says nothing about is still a card.** On a non-amdgpu
+    driver those sensors are absent; the card is detected, placed and counted, and
+    shows `?`. `check_fit` answers "the fit was not checked" instead of refusing —
+    treating absent VRAM as zero would have blocked every model on such a card
+    while claiming it had "0.0 GB free".
+  - **`config/hardware.env`** carries `LLM_BACKEND`, and the visible-devices mask
+    under its own name — `HIP_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`, never
+    both.
+  - **A switch rewrites the configuration**: `--device ROCm0` becomes
+    `--device Vulkan0`, and a whisper entry's mask is renamed too, which is not
+    cosmetic — whisper has no `--device` flag, and a mask the runtime does not read
+    is not a mask. Reading always accepts either spelling, so a config survives a
+    switch in both directions.
+  - **A build belongs to one backend.** `build-<tag>/.llm-backend` records which,
+    and a build for the other one is rebuilt rather than reused. The cost is
+    stated in `docs/UPDATES.md`: switching means rebuilding, and the rollback
+    stock is per backend.
+  - **ComfyUI stays ROCm-only** and says so instead of downloading three gigabytes
+    of PyTorch wheel and then failing on `torch.version.hip`. There is no Vulkan
+    build of PyTorch.
+  - `llm doctor` checks the tools of the backend in force rather than both, names
+    it, and reports the one failure that looks like nothing else: llama.cpp seeing
+    zero devices because the build is for the other backend.
+  - **Vulkan turned out to be faster here, not slower.** Measured on one R9700
+    with Qwen3.5-4B-Q4_K_M, 200-token generations, three runs each: 111.9 · 114.2
+    · 113.8 tok/s under Vulkan against 97.7 · 99.4 · 99.5 under ROCm 7.1 — about
+    14 % ahead. One small dense model on one card, generation only, so the docs
+    say exactly that rather than turning it into a ranking. The first draft of
+    those docs claimed Vulkan was slower; it was corrected after measuring.
+  - 47 new checks in `tests/gpu-matrix.sh` against `tests/fixtures/mk-vulkan.py`,
+    which fakes both sources. The expectations are the **same numbers** as the
+    ROCm ones — that is the claim being tested — and the fixtures are hostile on
+    purpose: the DRM card minors are permuted, so pairing the two device lists by
+    position instead of by the reported minor turns seven checks red, and one
+    fixture puts the software rasteriser FIRST, because ggml skips CPU-type
+    devices and counting them would shift every index against what
+    `--device VulkanN` means. Verified by breaking four things deliberately and
+    watching the suite catch each.
 
 ## [1.3.0] — 2026-08-20
 

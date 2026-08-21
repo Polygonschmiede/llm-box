@@ -6,7 +6,7 @@ command to drive the whole thing.
 
 It is a thin, readable layer over [llama.cpp](https://github.com/ggml-org/llama.cpp)
 and [llama-swap](https://github.com/mostlygeek/llama-swap) — not a rewrite of them,
-and not Ollama. No Docker. No cloud. ROCm first.
+and not Ollama. No Docker. No cloud. ROCm first, Vulkan where ROCm will not go.
 
 ```
 $ llm status
@@ -46,9 +46,20 @@ Versions: llama.cpp b10453 · llama-swap v250 · whisper.cpp v1.9.2  up to date
 
 ## Requirements
 
-- Linux with a working **ROCm** installation (`rocm-smi` and `hipcc` on `PATH`).
-  Developed and tested on Ubuntu with 2× AMD Radeon AI PRO R9700 (gfx1201, 32 GB
-  each) and ROCm 7.1. Any ROCm-supported Radeon should work.
+- Linux, and one of two ways to reach the GPU:
+  - **ROCm** (`rocm-smi` and `hipcc` on `PATH`) — the default where it is
+    complete, and the better-supported path. Developed and tested on Ubuntu with
+    2× AMD Radeon AI PRO R9700 (gfx1201, 32 GB each) and ROCm 7.1; any
+    ROCm-supported Radeon should work.
+  - **Vulkan** (`vulkaninfo` plus a driver) — needs none of ROCm, and works on
+    AMD cards ROCm has dropped, on Intel and on NVIDIA. `llm init --backend
+    vulkan`, or let `llm init` detect it. The one thing it cannot do is ComfyUI:
+    PyTorch has no Vulkan build. Not necessarily slower, either — measured here
+    it was ~14 % faster on a 4B model, see [docs/INSTALL.md](docs/INSTALL.md).
+
+  Which one is in force is recorded once and everything follows it — the build
+  flags, the card readings, `--device ROCmN` versus `--device VulkanN`.
+  `llm gpu backend` switches, and says that the engines need rebuilding.
 - The user in the `render` and `video` groups
 - [`uv`](https://docs.astral.sh/uv/) for model downloads and the Python
   environments; `cmake` and a compiler for building llama.cpp
@@ -166,7 +177,7 @@ its subagents at another, and you never touch the client again when models chang
 
 | | |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | from a bare ROCm machine to a working endpoint |
+| [docs/INSTALL.md](docs/INSTALL.md) | from a bare machine to a working endpoint, either backend |
 | [docs/MODELS.md](docs/MODELS.md) | choosing, adding and removing models; quants; per-model settings |
 | [docs/FLAGS.md](docs/FLAGS.md) | every llama.cpp option this stack sets, and why |
 | [docs/UPDATES.md](docs/UPDATES.md) | staying current, with rollback |

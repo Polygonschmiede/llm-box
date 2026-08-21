@@ -86,6 +86,15 @@ the command that updates it; `tests/ui-matrix.sh` checks that every class and
 token the page asks for still exists afterwards, which is the failure an upgrade
 actually produces.
 
+### The Cards tab says which backend answered
+
+Every number on that tab is read differently under each backend, so the tab
+carries a `backend rocm` / `backend vulkan` tag whose tooltip says where the
+figures came from. Under Vulkan a card whose driver is not amdgpu shows `?` for
+temperature, watts and utilisation — it is still listed, still placed, still
+counted for the fit arithmetic. The prose about logical numbering names
+`--device ROCmN` or `--device VulkanN` to match.
+
 ## llama-swap's UI — the one nobody mentions
 
 It ships with llama-swap and is not this project's work, which is probably why
