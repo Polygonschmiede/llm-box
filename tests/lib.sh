@@ -104,8 +104,11 @@ YAMLEOF
 }
 
 #  One sandbox for the read-only probes, so they never depend on the checkout.
-#  Cheap: a mkdir and a heredoc.
-PROBE_HOME="$(sandbox)"
+#  Cheap: a mkdir and a heredoc. The empty argument is deliberate - it selects
+#  the minimal config, and it is also the first call to sandbox() from inside
+#  this file, which shellcheck would otherwise read as "the parameter is never
+#  passed by anyone" (SC2120).
+PROBE_HOME="$(sandbox "")"
 
 #  Append a marker block for one model to a sandbox config. Only blocks with
 #  markers are visible to parse_config, so a hand-added entry is invisible.
