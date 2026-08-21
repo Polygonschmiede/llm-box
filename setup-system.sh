@@ -12,6 +12,8 @@
 #     LLM_LAN=<subnet>     subnet for the firewall  ('none' = no rules)
 #     LLM_BIND=0.0.0.0     make the services reachable on the network
 #                          (default 127.0.0.1, i.e. local only - see SECURITY.md)
+#     LLM_BACKEND=vulkan   install the Vulkan build dependencies instead of
+#                          expecting ROCm (default: whichever is already there)
 #
 #  Pass them THROUGH sudo - it resets the environment, so setting them in front
 #  of 'sudo' has no effect here:
@@ -51,16 +53,53 @@ if ! apt-get install -y build-essential cmake git curl ca-certificates pkg-confi
   exit 1
 fi
 
-echo ">>> 2/8  Checking ROCm (not installed automatically, on purpose)"
-missing=""
-for t in rocm-smi hipcc; do command -v "$t" >/dev/null || missing="$missing $t"; done
-if [ -n "$missing" ]; then
-  echo "    MISSING:$missing"
-  echo "    On Ubuntu usually:  sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs"
-  echo "    Otherwise follow AMD's guide: https://rocm.docs.amd.com/"
-  echo "    Nothing runs on the GPU without ROCm - install it, then continue here."
+#  Two ways to run models on a GPU here, and this step only reports on the one
+#  that applies. ROCm is the faster path on supported AMD cards but is several GB
+#  with a different path per distribution and card generation, so it is
+#  deliberately not installed automatically. Vulkan works on anything with a
+#  Vulkan driver - including AMD cards ROCm does not support, Intel and NVIDIA -
+#  and its build dependencies are two small distribution packages, so those ARE
+#  installed when that is the chosen backend.
+#
+#  Chosen how: LLM_BACKEND if set, otherwise whichever is already present, with
+#  ROCm winning when both are. 'llm init --backend' records the decision.
+echo ">>> 2/8  Checking the compute backend"
+BACKEND="${LLM_BACKEND:-}"
+if [ -z "$BACKEND" ]; then
+  if command -v rocm-smi >/dev/null && command -v hipcc >/dev/null; then BACKEND=rocm
+  elif command -v vulkaninfo >/dev/null; then BACKEND=vulkan
+  else BACKEND=rocm; fi
+fi
+echo "    backend: $BACKEND   (override with  sudo env LLM_BACKEND=... bash setup-system.sh)"
+if [ "$BACKEND" = vulkan ]; then
+  #  glslc compiles the shaders, libvulkan-dev has the headers and the link-time
+  #  library, spirv-headers the cmake config ggml's find_package looks for, and
+  #  vulkan-tools brings vulkaninfo - which is what the card detection reads.
+  #  Determined by building it: leaving any of the three out fails at configure.
+  if ! apt-get install -y glslc libvulkan-dev spirv-headers vulkan-tools; then
+    echo "    Installing the Vulkan build dependencies failed."
+    echo "    By hand:  sudo apt-get install glslc libvulkan-dev spirv-headers vulkan-tools"
+  fi
+  if command -v vulkaninfo >/dev/null && vulkaninfo --summary 2>/dev/null | grep -q "deviceName"; then
+    echo "    ok: $(command -v vulkaninfo) reports a device"
+  else
+    echo "    WARNING: vulkaninfo reports no device."
+    echo "    A driver is still needed: mesa on AMD and Intel (mesa-vulkan-drivers),"
+    echo "    the proprietary one on NVIDIA. Without it nothing runs on the GPU."
+  fi
 else
-  echo "    ok: $(command -v rocm-smi), $(command -v hipcc)"
+  missing=""
+  for t in rocm-smi hipcc; do command -v "$t" >/dev/null || missing="$missing $t"; done
+  if [ -n "$missing" ]; then
+    echo "    MISSING:$missing"
+    echo "    On Ubuntu usually:  sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs"
+    echo "    Otherwise follow AMD's guide: https://rocm.docs.amd.com/"
+    echo "    Nothing runs on the GPU without ROCm - install it, then continue here."
+    echo "    Or use Vulkan instead, which needs none of it:"
+    echo "      sudo env LLM_BACKEND=vulkan bash setup-system.sh"
+  else
+    echo "    ok: $(command -v rocm-smi), $(command -v hipcc)"
+  fi
 fi
 
 echo ">>> 3/8  GPU access (groups render, video)"
@@ -140,6 +179,7 @@ cat <<EOF
 
   Continue as your normal user:
      $SRC/bin/llm init          # create the configuration from the template
+                                #   (--backend rocm|vulkan to force one)
      $SRC/bin/llm setup         # create the Python environments
      $SRC/bin/llm update swap   # fetch the llama-swap binary
      $SRC/bin/llm update llama  # fetch and build llama.cpp
