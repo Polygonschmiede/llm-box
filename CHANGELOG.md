@@ -153,9 +153,10 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 - A failure to write `config/api-key.env` was swallowed by a bare
   `except OSError: pass`, so the chat UI kept its previous key and began failing
   401 after the next restart with nothing saying why. It warns — and the warning
-  is rebuilt from `errno` rather than interpolating the exception, because the
-  key is in scope three lines above it. CodeQL's first run on this branch flagged
-  exactly that, which is a fair way for a new scanner to introduce itself.
+  names neither `API_KEY_ENV` nor the exception object — CodeQL reads a name
+  containing "key" as a secret, and neither form could have carried the key
+  anyway. It was the new scanner's first finding, on code from the pull request
+  that added it.
 - The snippet `llm api client` prints created `~/.pi/agent/llm-box.json` — which
   holds the registry write token — with whatever umask the client machine had. It
   creates the directory and uses `umask 077`.

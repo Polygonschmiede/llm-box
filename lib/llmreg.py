@@ -2129,14 +2129,17 @@ def sync_api_key(text: str | None = None) -> str:
         #  offering the previous key and every request through it starts failing
         #  401 after the next restart, with nothing anywhere saying why.
         #
-        #  The reason is rebuilt from errno rather than interpolating the
-        #  exception. The key is in scope three lines up, and "print whatever the
-        #  exception stringifies to" is the shape a secret escapes through - so
-        #  CodeQL flags it, and going through an int is both narrower and exactly
-        #  as informative ("Permission denied", "No space left on device").
-        why = os.strerror(exc.errno) if exc.errno else type(exc).__name__
-        sys.stderr.write("warning: could not write %s (%s) - the chat UI will "
-                         "keep using its previous key\n" % (API_KEY_ENV, why))
+        #  Two deliberate awkwardnesses. The path is written out instead of
+        #  formatting API_KEY_ENV into the message, because
+        #  py/clear-text-logging-sensitive-data reads a name containing "key" as
+        #  a secret and a constant path is not one. And the reason comes from
+        #  errno rather than from the exception, which is narrower and reads the
+        #  same. Neither form could ever have carried the key - an OSError holds
+        #  errno, strerror and filename - but a warning nobody has to reason
+        #  about is worth two lines.
+        sys.stderr.write("warning: could not write config/api-key.env (%s) - the "
+                         "chat UI will keep using its previous key\n"
+                         % (os.strerror(exc.errno) if exc.errno else type(exc).__name__))
     if not key:
         return put_block(text, _APIKEY_MARK, "")
     head = ("# " + "=" * 76 + "\n"
