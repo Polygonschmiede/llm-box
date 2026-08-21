@@ -494,6 +494,7 @@ def health():
             "problems": problems,          # missing files, unknown provenance
             "running": [r.get("model") for r in st["running"]],
             "versions": versions(), "publicApi": llmreg.PUBLIC_API,
+            "backend": llmreg.backend_name(),
             "writeNeedsToken": bool(llmreg.api_token(create=False))}
 
 
@@ -530,8 +531,11 @@ def api_gpus():
 @app.get("/api/state", dependencies=READ)
 def api_state():
     st = llmreg.live()
-    return {"swapUp": st["up"], "running": st["running"],
-            "states": st["states"], "gpus": llmreg.gpus()}
+    #  backend, because everything on the Cards tab is read differently under
+    #  each one - and a card list with no temperatures should say "Vulkan on a
+    #  driver that does not report them" rather than look broken.
+    return {"swapUp": st["up"], "running": st["running"], "states": st["states"],
+            "backend": llmreg.backend_name(), "gpus": llmreg.gpus()}
 
 
 @app.get("/api/pi-models.json")
