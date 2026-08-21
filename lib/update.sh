@@ -23,16 +23,114 @@ GH_WCPP="https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest"
 GH_COMFY="https://api.github.com/repos/comfyanonymous/ComfyUI/releases/latest"
 PYPI_OWUI="https://pypi.org/pypi/open-webui/json"
 UPD_STATE="$LLM_HOME/.update-state"
-hip_flags(){                                # -> Array in HIP_FLAGS
+# ============================================================================
+#  Which backend the engines are built for
+# ============================================================================
+#  ROCm compiles for the exact ISA of the cards it can see; Vulkan compiles
+#  SPIR-V and needs to know nothing about them. That asymmetry is the whole
+#  reason Vulkan is the easier install - and the reason a Vulkan build cannot be
+#  wrong about hardware it has not met.
+#
+#  The choice lives in config/hardware.env as LLM_BACKEND, written by
+#  'llm gpu sync'; LLM_BACKEND in the environment overrides it for one command.
+llm_backend(){                              # -> rocm | vulkan
+  local b="${LLM_BACKEND:-$(hw_get LLM_BACKEND)}"
+  case "$b" in
+    rocm|vulkan) printf '%s' "$b";;
+    #  Nothing recorded yet (a fresh clone, or an installation from before
+    #  backends existed). Ask the library, which detects the same way.
+    *) reg backend 2>/dev/null || printf 'rocm';;
+  esac
+}
+
+backend_flags(){                            # -> array in BACKEND_FLAGS
+  BACKEND_FLAGS=()
+  case "$(llm_backend)" in
+    vulkan) vulkan_flags;;
+    *)      hip_flags;;
+  esac
+}
+
+hip_flags(){                                # -> array in HIP_FLAGS and BACKEND_FLAGS
   local gfx="${LLM_GFX_TARGETS:-$(hw_get LLM_GFX_TARGETS)}"
   local cc="${LLM_HIP_COMPILER:-$(hw_get LLM_HIP_COMPILER)}"
   if [[ -z "$gfx" || -z "$cc" ]]; then      # 'llm gpu sync' has not run yet
     gfx="${gfx:-$(reg hw 2>/dev/null | sed -n 's/.*"gfxTargets": *"\([^"]*\)".*/\1/p')}"
     cc="${cc:-$(reg hw 2>/dev/null | sed -n 's/.*"hipCompiler": *"\([^"]*\)".*/\1/p')}"
   fi
-  [[ -z "$gfx" ]] && { err "No gfx target detected. Does rocm-smi work? Otherwise: LLM_GFX_TARGETS=gfx1201 llm update llama"; return 1; }
-  [[ -z "$cc"  ]] && { err "No HIP compiler found. Is hipcc/ROCm installed? Otherwise set LLM_HIP_COMPILER=..."; return 1; }
+  [[ -z "$gfx" ]] && { err "No gfx target detected. Does rocm-smi work? Otherwise: LLM_GFX_TARGETS=gfx1201 llm update llama, or switch backend: llm gpu backend vulkan"; return 1; }
+  [[ -z "$cc"  ]] && { err "No HIP compiler found. Is hipcc/ROCm installed? Otherwise set LLM_HIP_COMPILER=..., or switch backend: llm gpu backend vulkan"; return 1; }
   HIP_FLAGS=(-DGGML_HIP=ON "-DAMDGPU_TARGETS=$gfx" "-DCMAKE_HIP_COMPILER=$cc")
+  BACKEND_FLAGS=("${HIP_FLAGS[@]}")
+}
+
+vulkan_flags(){                             # -> array in BACKEND_FLAGS
+  #  One cmake flag, and nothing card-specific. What it does need is three build
+  #  dependencies, and a missing one surfaces as a cmake error a hundred lines
+  #  into a log - so they are checked here, the way the build checks them.
+  #
+  #  Determined by building it: glslc alone is not enough, libvulkan-dev alone is
+  #  not enough, and spirv-headers is needed for the SPIRV-HeadersConfig.cmake
+  #  that ggml-vulkan's find_package looks for.
+  local miss=""
+  #  RUN it, do not just find it. A glslc that is on PATH but cannot start - a
+  #  half-installed package, a prefix without its libshaderc on the library path -
+  #  is worse than an absent one: ggml probes each shader extension by looking for
+  #  "extension not supported" in glslc's stderr and treats anything else as
+  #  SUPPORTED, so a glslc that only ever prints "error while loading shared
+  #  libraries" makes every extension look available and the build then dies
+  #  several thousand shader lines later. Observed exactly that way.
+  glslc --version >/dev/null 2>&1 || miss="$miss glslc"
+  #  Compile AND LINK, rather than looking for a header at a path. Two earlier
+  #  versions of this were wrong in different ways: testing for
+  #  /usr/include/vulkan/vulkan.h fails on a hand-installed SDK, and
+  #  preprocessing alone passes while find_package(Vulkan) still fails - it wants
+  #  Vulkan_LIBRARY too, and libvulkan.so (the dev symlink) is in a different
+  #  package from the versioned runtime .so. Linking asks the build's question.
+  printf '#include <vulkan/vulkan.h>\nint main(void){return (int)VK_HEADER_VERSION;}\n' \
+    | c++ -x c++ - -lvulkan -o /dev/null >/dev/null 2>&1 \
+    || miss="$miss libvulkan-dev"
+  printf '#include <spirv/unified1/spirv.h>\n' | c++ -E -x c++ - >/dev/null 2>&1 \
+    || miss="$miss spirv-headers"
+  if [[ -n "$miss" ]]; then
+    err "the Vulkan build needs:$miss"
+    echo "  sudo apt-get install glslc libvulkan-dev spirv-headers" >&2
+    echo "  glslc compiles the shaders, libvulkan-dev has the headers and the" >&2
+    echo "  link-time library, spirv-headers the cmake config ggml looks for." >&2
+    echo "  To RUN a model you additionally need a driver (mesa-vulkan-drivers on" >&2
+    echo "  AMD and Intel) and vulkan-tools, which is where vulkaninfo comes from." >&2
+    return 1
+  fi
+  BACKEND_FLAGS=(-DGGML_VULKAN=ON)
+}
+
+# ============================================================================
+#  One build directory per version - and per backend
+# ============================================================================
+#  build-<tag> carries no backend in its name, so a HIP and a Vulkan build of
+#  the same tag would land in the same place and lcpp_active could not tell them
+#  apart. Rather than change the naming (and with it lcpp_builds, lcpp_prune,
+#  rollback and every recorded version), each build records what it was built
+#  for and a mismatch forces a rebuild.
+#
+#  The cost, and it is real: switching backend means rebuilding, and the
+#  KEEP_BUILDS fallbacks are per backend rather than shared. Holding both at
+#  once for an A/B comparison is not possible without a wait. docs/UPDATES.md
+#  says so.
+build_backend(){                            # $1=build directory -> backend or ''
+  [[ -f "$1/.llm-backend" ]] && cat "$1/.llm-backend" 2>/dev/null && return 0
+  #  No marker: built before backends existed, which can only have been ROCm.
+  [[ -d "$1" ]] && printf 'rocm'
+}
+
+build_backend_set(){ # $1=build directory
+  printf '%s\n' "$(llm_backend)" > "$1/.llm-backend" 2>/dev/null
+}
+
+#  Is this existing build usable as-is, or does it belong to the other backend?
+build_backend_ok(){ # $1=build directory
+  local want have; want="$(llm_backend)"; have="$(build_backend "$1")"
+  [[ "$have" == "$want" ]]
 }
 LCPP_CMAKE_FLAGS=(
   -DCMAKE_BUILD_TYPE=Release
@@ -272,10 +370,16 @@ update_whisper(){ # $1=target tag (empty = the latest release)
   #  llama.cpp checks this too, and a whisper build is not much smaller.
   free=$(df --output=avail -BG "$WCPP" | tail -1 | tr -dc 0-9)
   [[ ${free:-0} -lt 8 ]] && { err "not enough disk space (${free}G free, ~8G needed)."; return 1; }
+  #  Before the fetch, for the same reason as in update_llama.
+  backend_flags || return 1
   if [[ -d "$WCPP/build-$tgt" ]]; then
-    info "build $tgt already exists - testing it, then switching."
-    wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
-    wcpp_switch "$tgt" && wcpp_prune; return $?
+    if build_backend_ok "$WCPP/build-$tgt"; then
+      info "build $tgt already exists - testing it, then switching."
+      wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+      wcpp_switch "$tgt" && wcpp_prune; return $?
+    fi
+    info "build $tgt was made for $(build_backend "$WCPP/build-$tgt"), not $(llm_backend) - rebuilding."
+    rm -rf "$WCPP/build-$tgt"
   fi
   info "fetching whisper.cpp $tgt ..."
   # A shallow clone (--depth 1) does not have the objects of other tags, so a
@@ -291,11 +395,10 @@ update_whisper(){ # $1=target tag (empty = the latest release)
   git -C "$WCPP" checkout --quiet -- "${WCPP_GENERATED[@]}" 2>/dev/null
   git -C "$WCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
   local log="$LLM_HOME/.build-whisper-$tgt.log" t0=$SECONDS
-  info "building whisper.cpp $tgt with $(nproc) threads (log: $log) ..."
-  # The same detected HIP flags as llama.cpp (hip_flags) - only the
-  # project-specific test option differs.
-  hip_flags || return 1
-  if ! cmake -S "$WCPP" -B "$WCPP/build-$tgt" -DCMAKE_BUILD_TYPE=Release "${HIP_FLAGS[@]}" \
+  info "building whisper.cpp $tgt for $(llm_backend) with $(nproc) threads (log: $log) ..."
+  # The same backend flags as llama.cpp - only the project-specific test option
+  # differs. whisper.cpp is ggml too, so -DGGML_VULKAN=ON works there unchanged.
+  if ! cmake -S "$WCPP" -B "$WCPP/build-$tgt" -DCMAKE_BUILD_TYPE=Release "${BACKEND_FLAGS[@]}" \
         -DGGML_NATIVE=ON -DWHISPER_BUILD_TESTS=OFF -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON > "$log" 2>&1; then
     err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$WCPP/build-$tgt"; return 1
   fi
@@ -305,6 +408,7 @@ update_whisper(){ # $1=target tag (empty = the latest release)
     rm -rf "$WCPP/build-$tgt"; return 1
   fi
   ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
+  build_backend_set "$WCPP/build-$tgt"
   wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
   wcpp_switch "$tgt" && wcpp_prune
 }
@@ -334,9 +438,22 @@ smoke_test(){ # $1=build directory
           | sort -n | head -1 | cut -d' ' -f2-)
   if [[ -z "$model" ]]; then warn "no loadable model in the configuration - smoke test skipped."; return 0; fi
   info "smoke test with $(basename "$model") ..."
-  LD_LIBRARY_PATH="$bd/bin" HIP_VISIBLE_DEVICES="$(hw_get HIP_VISIBLE_DEVICES)" \
+  #  The device flag and the mask are spelled per backend: '--device ROCm0' with
+  #  HIP_VISIBLE_DEVICES, '--device Vulkan0' with GGML_VK_VISIBLE_DEVICES. Card 0
+  #  is the LOGICAL first compute card either way, which is what the mask makes
+  #  it - the point of pinning here is that the test does not depend on whichever
+  #  card happens to be free.
+  local dev mask_var mask
+  case "$(llm_backend)" in
+    vulkan) dev=Vulkan0; mask_var=GGML_VK_VISIBLE_DEVICES;;
+    *)      dev=ROCm0;   mask_var=HIP_VISIBLE_DEVICES;;
+  esac
+  mask="$(hw_get "$mask_var")"
+  #  env, not a bare "$mask_var=$mask": bash only treats a LITERAL name=value
+  #  word as an assignment, so an expanded one would be looked up as the command.
+  LD_LIBRARY_PATH="$bd/bin" env "$mask_var=$mask" \
     "$bd/bin/llama-server" \
-    -m "$model" -c 512 -ngl 99 -fa on --device ROCm0 -sm none -mg 0 \
+    -m "$model" -c 512 -ngl 99 -fa on --device "$dev" -sm none -mg 0 \
     --host 127.0.0.1 --port "$port" --no-webui > "$log" 2>&1 &
   pid=$!
   code=""
@@ -416,15 +533,25 @@ update_llama(){ # $1=target tag (empty = the latest release)
   fi
   free=$(df --output=avail -BG "$LCPP" | tail -1 | tr -dc 0-9)
   [[ ${free:-0} -lt 8 ]] && { err "not enough disk space (${free}G free, ~8G needed)."; return 1; }
+  #  Before anything is fetched or checked out. This used to sit at the cmake
+  #  call, so a machine missing glslc had already moved the source tree to the
+  #  new tag by the time it was told - the active build was safe (that is what
+  #  the symlink is for) but the checkout was left on a version nothing was
+  #  built from.
+  backend_flags || return 1
   if repo_dirty "$LCPP"; then
     err "the llama.cpp repository has changes to tracked files - please clean up first."; return 1
   fi
   # Already built? Test it anyway - the directory may be left over from a
   # failed attempt.
   if [[ -d "$LCPP/build-$tgt" ]]; then
-    info "build $tgt already exists - testing it, then switching."
-    smoke_test "$LCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
-    lcpp_switch "$tgt" && lcpp_prune; return $?
+    if build_backend_ok "$LCPP/build-$tgt"; then
+      info "build $tgt already exists - testing it, then switching."
+      smoke_test "$LCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+      lcpp_switch "$tgt" && lcpp_prune; return $?
+    fi
+    info "build $tgt was made for $(build_backend "$LCPP/build-$tgt"), not $(llm_backend) - rebuilding."
+    rm -rf "$LCPP/build-$tgt"
   fi
 
   info "fetching llama.cpp $tgt ..."
@@ -432,9 +559,8 @@ update_llama(){ # $1=target tag (empty = the latest release)
   git -C "$LCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
 
   local log="$LLM_HOME/.build-$tgt.log" t0=$SECONDS
-  info "building $tgt with $(nproc) threads (takes a while; log: $log) ..."
-  hip_flags || return 1
-  if ! cmake -S "$LCPP" -B "$LCPP/build-$tgt" "${LCPP_CMAKE_FLAGS[@]}" "${HIP_FLAGS[@]}" \
+  info "building $tgt for $(llm_backend) with $(nproc) threads (takes a while; log: $log) ..."
+  if ! cmake -S "$LCPP" -B "$LCPP/build-$tgt" "${LCPP_CMAKE_FLAGS[@]}" "${BACKEND_FLAGS[@]}" \
        > "$log" 2>&1; then
     err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$LCPP/build-$tgt"; return 1
   fi
@@ -444,6 +570,7 @@ update_llama(){ # $1=target tag (empty = the latest release)
     rm -rf "$LCPP/build-$tgt"; return 1
   fi
   ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
+  build_backend_set "$LCPP/build-$tgt"
 
   if ! smoke_test "$LCPP/build-$tgt"; then
     err "smoke test failed - $tgt will NOT be activated."
@@ -614,6 +741,21 @@ comfy_smoke(){
 assert torch.cuda.is_available(), "no GPU visible"
 assert torch.version.hip, "torch without ROCm"' 2>&1 | tail -2
 }
+#  ComfyUI is the one part of this stack with no Vulkan path at all: it runs on
+#  PyTorch, PyTorch's GPU support here is the ROCm wheel index, and there is no
+#  Vulkan build of PyTorch to point at. Saying so here is better than failing
+#  somewhere inside a 3 GB wheel download.
+comfy_backend_ok(){
+  [[ "$(llm_backend)" == vulkan ]] || return 0
+  err "ComfyUI needs ROCm and the backend is set to vulkan."
+  echo "  PyTorch has no Vulkan build, so image generation is the one thing here" >&2
+  echo "  that Vulkan cannot do. Options:" >&2
+  echo "    * install ROCm and switch:  llm gpu backend rocm" >&2
+  echo "    * or leave ComfyUI out - everything else works under Vulkan" >&2
+  echo "  See docs/COMFYUI.md." >&2
+  return 1
+}
+
 update_comfy(){ # $1=target tag
   [[ -d "$COMFY/.git" ]] || { err "ComfyUI is not installed ($COMFY). First: bash bin/install-comfyui.sh"; return 1; }
   local tgt="${1:-}" act

@@ -310,6 +310,29 @@ mradermacher, ggml-org). So every model directory carries a
   **proof**, not a guess (`verified: true`).
 - `llm meta` shows the overview, `llm meta show <dir>` a single file.
 
+### Which backend answered
+
+`GET /api/versions`, `GET /api/state` and `GET /api/health` all carry
+`"backend": "rocm" | "vulkan"`. It decides how everything else about the cards was
+read:
+
+- Under **rocm**, one `rocm-smi` query answers temperature, power, utilisation,
+  VRAM, name and ISA target.
+- Under **vulkan**, the cards come from `vulkaninfo` and the measurements from
+  amdgpu's sysfs, joined by the DRM card number the Vulkan driver reports. On a
+  card whose driver is not amdgpu those fields are **absent** rather than zero,
+  and so is `gfx` — the model still runs, there is just no thermometer.
+- `--device ROCmN` versus `--device VulkanN` follows the backend, and so does the
+  visible-devices mask: `HIP_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`. The
+  `hipVisibleDevices` field in `GET /api/hw` keeps its name under both — renaming
+  a documented field to say the same thing differently would break clients for
+  nothing — and `visibleEnv` says which variable it is written under.
+
+Reading a configuration accepts **either** spelling whatever is active, so a
+config written under one backend keeps its card pinnings after a switch;
+`llm gpu backend` rewrites them. And `check_fit` answers "the fit was not
+checked" rather than refusing, when a card's free VRAM cannot be read at all.
+
 ## MCP (Claude Code and others)
 
 The same service speaks MCP over `http://<server-ip>:8081/mcp` (streamable HTTP):

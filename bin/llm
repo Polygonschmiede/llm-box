@@ -64,6 +64,10 @@ LLM_REPO_URL="${LLM_REPO_URL:-https://github.com/Polygonschmiede/llm-box}"
 #  other card or ROCm version. Both now come from the detection (rocm-smi and
 #  hipconfig) and can be overridden by environment. hw_get reads the file written
 #  by 'llm gpu sync', so a build does not need rocm-smi itself.
+#
+#  Under the Vulkan backend neither exists: SPIR-V is compiled once and runs on
+#  every device, which is why that backend needs no ROCm at all. The same file
+#  carries LLM_BACKEND, so hw_get answers "which one" as well.
 HW_ENV="$LLM_HOME/config/hardware.env"
 hw_get(){ # $1=key
   [[ -f "$HW_ENV" ]] && sed -n "s/^$1=\(.*\)$/\1/p" "$HW_ENV" | head -1
@@ -105,7 +109,8 @@ ${c_y}── OVERVIEW ───────────────────�
   llm --version           which llm-box this is (engines: llm versions)
 
 ${c_y}── FIRST RUN ─────────────────────────────────────────────────────${c_0}
-  llm init                create the configuration from config/llama-swap.example.yaml
+  llm init [--backend X]  create the configuration from config/llama-swap.example.yaml
+                          X = rocm | vulkan | auto (default: auto)
   llm setup               create the Python environments (registry, chat UI)
   llm update llama        fetch and build llama.cpp (also the setup step)
 
@@ -144,6 +149,7 @@ ${c_y}── CARDS ────────────────────�
   llm gpu list            the cards this machine has, and what is pinned where
   llm gpu sync            re-match config and cards after a hardware change
                           (--dry-run shows the diff without writing)
+  llm gpu backend [X]     show or change the compute backend (rocm | vulkan)
 
 ${c_y}── STAYING CURRENT ───────────────────────────────────────────────${c_0}
   llm update              just look: what is installed, what is newer
@@ -400,10 +406,23 @@ cmd_doctor(){
       || _bad "$t is missing" "sudo apt-get install $t"
   done
   [[ -x "$UV" ]] && _ok "uv: $UV" || _bad "uv is missing" "curl -LsSf https://astral.sh/uv/install.sh | sh"
-  for t in rocm-smi hipcc; do
-    command -v "$t" >/dev/null && _ok "$t: $(command -v "$t")" \
-      || _bad "$t is missing (ROCm)" "sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs"
-  done
+  #  Which tools have to be there depends on the backend, and checking for the
+  #  other one's would tell a Vulkan machine that a complete install is broken.
+  local backend; backend="$(llm_backend)"
+  info "Backend: $backend"
+  if [[ "$backend" == vulkan ]]; then
+    command -v vulkaninfo >/dev/null && _ok "vulkaninfo: $(command -v vulkaninfo)" \
+      || _bad "vulkaninfo is missing" "sudo apt-get install vulkan-tools"
+    #  Only needed to BUILD, so a note rather than a failure: an installation
+    #  that already has a build runs fine without it.
+    command -v glslc >/dev/null && _ok "glslc: $(command -v glslc)" \
+      || _warn "glslc is missing - needed to build, not to run" "sudo apt-get install glslc libvulkan-dev"
+  else
+    for t in rocm-smi hipcc; do
+      command -v "$t" >/dev/null && _ok "$t: $(command -v "$t")" \
+        || _bad "$t is missing (ROCm)" "sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs"
+    done
+  fi
 
   info "GPU access"
   local grp; grp=$(id -nG)
@@ -415,19 +434,34 @@ cmd_doctor(){
   if [[ "${n:-0}" -gt 0 ]]; then
     _ok "$n compute card(s) detected"
     reg gpus --table 2>/dev/null | sed 's/^/    /'
-    #  Does llama.cpp see the same number? If not, HIP_VISIBLE_DEVICES is wrong.
+    #  Does llama.cpp see the same number? If not, the mask is wrong - or the
+    #  build is for the other backend, which shows up as zero devices here.
     if [[ -x "$LLAMA_SERVER" ]]; then
-      local seen
-      seen=$(HIP_VISIBLE_DEVICES="$(hw_get HIP_VISIBLE_DEVICES)" "$LLAMA_SERVER" --list-devices 2>/dev/null | grep -c '^  ROCm')
-      [[ "${seen:-0}" -eq "$n" ]] && _ok "llama.cpp sees the same $n card(s)" \
-        || _warn "llama.cpp sees $seen instead of $n card(s)" "llm gpu sync"
+      local seen mask_var pfx
+      case "$backend" in
+        vulkan) mask_var=GGML_VK_VISIBLE_DEVICES; pfx=Vulkan;;
+        *)      mask_var=HIP_VISIBLE_DEVICES;     pfx=ROCm;;
+      esac
+      seen=$(env "$mask_var=$(hw_get "$mask_var")" "$LLAMA_SERVER" --list-devices 2>/dev/null | grep -c "^  $pfx")
+      if [[ "${seen:-0}" -eq "$n" ]]; then
+        _ok "llama.cpp sees the same $n card(s) as $pfx"
+      elif [[ "${seen:-0}" -eq 0 ]]; then
+        _bad "llama.cpp reports no $pfx device - the build is probably for the other backend" \
+             "llm update llama    (rebuilds for $backend)"
+      else
+        _warn "llama.cpp sees $seen instead of $n card(s)" "llm gpu sync"
+      fi
     fi
     local have want status
     IFS=$'\t' read -r have want status < <(reg ts-drift 2>/dev/null)
     [[ "$status" == ok ]] && _ok "-ts matches (${want:-none})" \
       || _warn "-ts is '${have:-none}', expected '${want:-none}'" "llm gpu sync"
   else
-    _bad "no compute card detected" "run rocm-smi by hand; check the render/video groups"
+    if [[ "$backend" == vulkan ]]; then
+      _bad "no compute card detected" "run vulkaninfo --summary by hand; check the render/video groups"
+    else
+      _bad "no compute card detected" "run rocm-smi by hand; check the render/video groups"
+    fi
   fi
   [[ -f "$HW_ENV" ]] && _ok "config/hardware.env present" \
     || _warn "config/hardware.env missing - services then see every device incl. the iGPU" "llm gpu sync"
@@ -530,7 +564,7 @@ cmd_update(){
     swap|llama-swap) update_swap  "$ver";;
     whisper|whisper.cpp) update_whisper "$ver";;
     ui|webui|open-webui|openwebui) update_owui "$ver";;
-    comfy|comfyui)   update_comfy "$ver";;
+    comfy|comfyui)   comfy_backend_ok && update_comfy "$ver";;
     all)             update_llama; update_swap
                      #  Each one only if it is installed here at all.
                      [[ -d "$WCPP/.git" ]]        && update_whisper
@@ -859,11 +893,29 @@ cmd_add(){
 #  file paths out of those same lines (GGUF header, VRAM estimate).
 CONFIG_EXAMPLE="$LLM_HOME/config/llama-swap.example.yaml"
 
-cmd_init(){
+cmd_init(){ # [--backend rocm|vulkan|auto]
   [[ -f "$CONFIG_EXAMPLE" ]] || { err "template missing: $CONFIG_EXAMPLE"; return 1; }
+  #  The backend is decided here because it is the first thing every later step
+  #  depends on: what gets built, what the card list comes from, and how a pinned
+  #  card is spelled. 'auto' - the default - takes ROCm where it is complete and
+  #  Vulkan otherwise; both are then recorded in config/hardware.env, so nothing
+  #  after this has to guess.
+  local want=auto
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --backend) want="${2:-}"; shift 2;;
+      --backend=*) want="${1#*=}"; shift;;
+      *) err "usage: llm init [--backend rocm|vulkan|auto]"; return 1;;
+    esac
+  done
+  case "$want" in
+    auto|rocm|vulkan) ;;
+    *) err "unknown backend '$want' - one of: rocm, vulkan, auto"; return 1;;
+  esac
   if [[ -f "$CONFIG" ]]; then
     warn "there is already a configuration: $CONFIG"
     echo  "  It will NOT be overwritten. Move it aside to start over."
+    echo  "  To change only the backend:  llm gpu backend [rocm|vulkan]"
     return 1
   fi
   local wh="${LLM_WHISPER_HOME:-$HOME/whisper.cpp}"
@@ -871,7 +923,18 @@ cmd_init(){
       "$CONFIG_EXAMPLE" > "$CONFIG" || return 1
   chmod 644 "$CONFIG"
   ok "configuration created: $CONFIG"
-  reg gpu-sync >/dev/null 2>&1 && info "cards detected and written (llm gpu list)"
+  #  gpu-sync writes hardware.env, which is where the choice lives. An explicit
+  #  --backend goes through 'reg backend', which refuses one whose tools are not
+  #  there and prints what to install; 'auto' lets the library decide and cannot
+  #  fail that way.
+  if [[ "$want" == auto ]]; then
+    reg gpu-sync >/dev/null 2>&1 && info "backend $(llm_backend), cards detected and written (llm gpu list)"
+  elif reg backend "$want" >/dev/null; then
+    info "backend $want, cards detected and written (llm gpu list)"
+  else
+    warn "the configuration is there, but the backend is not set."
+    echo "  Fix the above, then:  llm gpu backend $want"
+  fi
   echo "  Next:  llm add <hf-repo> <quant>     then:  llm restart"
 }
 
@@ -1146,7 +1209,7 @@ EOF
 
 case "${1:-}" in
   # Models
-  init)    cmd_init;;
+  init)    shift; cmd_init "$@";;
   setup)   cmd_setup;;
   doctor)  cmd_doctor;;
   add)     require_config || exit 1; shift; cmd_add "$@";;
@@ -1166,7 +1229,13 @@ case "${1:-}" in
   #  No 'api' here: that is the registry (cmd_api, above) and this branch could
   #  never be reached for it anyway.
   llama|llm)       shift; svc_ctl llama-swap "${1:-status}" "LLM API";;
-  comfy|comfyui)   shift; svc_ctl comfyui    "${1:-status}" "ComfyUI";;
+  comfy|comfyui)   shift
+                   #  Starting it under Vulkan would download the ROCm torch
+                   #  wheel and then fail on torch.version.hip - say so first.
+                   case "${1:-status}" in
+                     on|start|restart) comfy_backend_ok || exit 1;;
+                   esac
+                   svc_ctl comfyui    "${1:-status}" "ComfyUI";;
   ui|webui|chat)   shift; svc_ctl open-webui "${1:-status}" "chat UI";;
 
   # Shorthands for the LLM API
@@ -1210,8 +1279,30 @@ case "${1:-}" in
                         exit 1
                       fi
                     fi;;
-             ""|show) rocm-smi;;
-             *)     err "llm gpu [list|sync [--dry-run]]";;
+             backend)
+                    if [[ -z "${3:-}" ]]; then llm_backend; echo; else
+                      #  Switching rewrites the configuration and the env files,
+                      #  and the engines then have to be rebuilt for the new
+                      #  backend - say so rather than leaving a machine whose
+                      #  config and binaries disagree.
+                      if reg backend "$3" >/dev/null; then
+                        ok "backend is now $3."
+                        warn "the engines are still built for the other one:  llm update llama"
+                        [[ -d "${LLM_WHISPER_HOME:-$HOME/whisper.cpp}" ]] && \
+                          warn "and whisper.cpp with it:  llm update whisper"
+                      else
+                        exit 1
+                      fi
+                    fi;;
+             ""|show)
+                    #  Was an unconditional 'rocm-smi', which on a Vulkan machine
+                    #  is a command that does not exist.
+                    if [[ "$(llm_backend)" == rocm ]] && command -v rocm-smi >/dev/null; then
+                      rocm-smi
+                    else
+                      reg gpus --table
+                    fi;;
+             *)     err "llm gpu [list|sync [--dry-run]|backend [rocm|vulkan]]";;
            esac;;
   watch)   if command -v watch >/dev/null; then
              #  -c keeps the colours, --no-title drops watch's own header so the

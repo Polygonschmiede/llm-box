@@ -1,29 +1,75 @@
-# Installing — from a bare ROCm machine to a working endpoint
+# Installing — from a bare machine to a working endpoint
 
 Everything here runs as your normal user except one `sudo` step. Nothing is installed
 outside the repository directory, `~/whisper.cpp`, `~/comfyui` and four systemd user
 units.
+
+## Two ways to reach the GPU
+
+Pick one before you start; it is recorded in `config/hardware.env` and everything
+after that follows it.
+
+| | **ROCm** | **Vulkan** |
+|---|---|---|
+| Cards | AMD, and only those ROCm supports | anything with a Vulkan driver: AMD (including cards ROCm dropped), Intel, NVIDIA |
+| To install | several GB, a different path per distribution and card generation | three distribution packages |
+| Built for | the exact ISA of the cards it can see (`AMDGPU_TARGETS`) | SPIR-V, compiled once, runs on every device |
+| Speed | measure it; see below | measure it; see below |
+| Card readings | temperature, watts, utilisation from `rocm-smi` | the same, from amdgpu's sysfs — and nothing at all on a non-AMD driver |
+| ComfyUI | works | **no** — PyTorch has no Vulkan build |
+
+**Do not assume ROCm is faster.** Measured on the development machine — one
+R9700, Qwen3.5-4B-Q4_K_M, 200-token generations, three runs each:
+
+| | tokens/second |
+|---|---|
+| Vulkan (RADV, mesa 26.0) | 111.9 · 114.2 · 113.8 |
+| ROCm 7.1 | 97.7 · 99.4 · 99.5 |
+
+So on that hardware and that model Vulkan was about 14 % **faster**. That is one
+small dense model on one card, generation only — it says nothing about large
+models, several cards at once, or prompt processing, none of which were measured.
+Take it as a reason to test your own case rather than as a ranking.
+
+ROCm is still the default where it is complete, for reasons other than raw speed:
+it is the better-supported path, `llm speed`'s draft-model features are exercised
+there, and ComfyUI needs it. Vulkan exists so that the answer to "my card is not
+on AMD's list" is not "this project is not for you".
 
 ## Prerequisites
 
 | | |
 |---|---|
 | OS | Linux. Developed and tested on Ubuntu. |
-| GPU | one or more ROCm-supported AMD Radeon cards |
-| ROCm | installed, with `rocm-smi` and `hipcc` on `PATH` |
+| GPU | one or more cards, see the table above |
 | Build | `cmake`, `build-essential`, `git`, `curl` |
 | Python | [`uv`](https://docs.astral.sh/uv/) — it brings its own Python 3.12 |
 | Disk | ~10 GB for a llama.cpp build, plus your models |
 
-ROCm itself is deliberately **not** installed by this project: it is several GB and
-the right path differs per distribution and card generation. On Ubuntu the distro
-packages are usually enough:
+**For ROCm**, it is deliberately **not** installed by this project: it is several
+GB and the right path differs per distribution and card generation. On Ubuntu the
+distro packages are usually enough:
 
 ```bash
 sudo apt-get install rocm-smi rocminfo hipcc rocm-device-libs
 ```
 
 Otherwise follow AMD's instructions at <https://rocm.docs.amd.com/>.
+
+**For Vulkan**, `setup-system.sh` installs the build dependencies itself, but a
+**driver** is yours to provide — `mesa-vulkan-drivers` on AMD and Intel, the
+proprietary one on NVIDIA. `vulkaninfo --summary` has to list your card before
+anything here can use it. The three build packages, if you want them by hand:
+
+```bash
+sudo apt-get install glslc libvulkan-dev spirv-headers vulkan-tools
+```
+
+All three are needed: `glslc` compiles the shaders, `libvulkan-dev` carries the
+headers and the link-time library, and `spirv-headers` the cmake config ggml
+looks for. Leaving any one out fails at configure — which is why `llm update
+llama` checks for all three before it touches anything.
+
 `uv`, if missing:
 
 ```bash
@@ -53,8 +99,8 @@ mkdir -p ~/.local/bin && ln -sf "$PWD/bin/llm" ~/.local/bin/llm
 sudo bash setup-system.sh
 ```
 
-This installs the build dependencies, checks for ROCm, adds you to the `render` and
-`video` groups, enables SSH at boot, turns on lingering (so the services survive a
+This installs the build dependencies, checks whichever backend applies — and for
+Vulkan installs its three packages — adds you to the `render` and `video` groups, enables SSH at boot, turns on lingering (so the services survive a
 logout and start at boot), sets up Wake-on-LAN for the detected adapter, adds
 firewall rules if `ufw` is active, and installs the four systemd user units.
 
@@ -64,6 +110,9 @@ adapter, the subnet — is detected, not assumed. Overridable:
 ```bash
 sudo env LLM_NIC=eth0 LLM_LAN=<your-subnet> LLM_BIND=0.0.0.0 bash setup-system.sh
 ```
+
+`LLM_BACKEND=rocm` or `=vulkan` decides which backend's dependencies this step
+looks after. Left unset it takes whichever is already installed, ROCm first.
 
 Your subnet, if you want to set it by hand:
 `ip -o -4 route show dev "$(ip -o -4 route show to default | awk '{print $5}')" scope link`
@@ -77,11 +126,18 @@ in a new session, and without it nothing can talk to the GPU.
 ## 3. Configuration
 
 ```bash
-llm init
+llm init                     # backend detected
+llm init --backend vulkan    # or state it
 ```
 
 This renders `config/llama-swap.yaml` from `config/llama-swap.example.yaml`, filling
-in the real paths. It refuses to overwrite an existing configuration.
+in the real paths, and records the backend in `config/hardware.env` along with the
+card numbers. It refuses to overwrite an existing configuration.
+
+Without `--backend` it takes ROCm when `rocm-smi` and `hipcc` are both there and
+report a card, Vulkan when `vulkaninfo` reports one, and says so. To change it
+later: `llm gpu backend vulkan` — which rewrites the configuration and tells you
+to rebuild, because a build belongs to one backend.
 
 The template also carries a set of proven model entries, all commented out. They are
 settings that were measured to work well on 32 GB Radeon cards, including the MTP
@@ -111,8 +167,12 @@ llm update llama         # clone llama.cpp, build it, smoke-test it, activate it
 ```
 
 `llm update llama` is also the setup step: if llama.cpp is not there it is cloned.
-The build takes a few minutes. The gfx target and HIP compiler are detected from
-`rocm-smi` and `hipconfig`.
+The build takes a few minutes.
+
+Under ROCm the gfx target and the HIP compiler are detected from `rocm-smi` and
+`hipconfig`. Under Vulkan there is nothing to detect — one cmake flag, no ISA, no
+special compiler — which is also why a Vulkan build cannot be wrong about
+hardware it has not met.
 
 Optional, for speech to text:
 
@@ -167,7 +227,9 @@ llm doctor
 
 | Symptom | Likely cause |
 |---|---|
-| `llm doctor` says no card detected | not in `render`/`video` yet (log out and back in), or ROCm not installed |
+| `llm doctor` says no card detected | not in `render`/`video` yet (log out and back in), or the backend's tools are missing — `llm doctor` names which |
+| `llm doctor` says llama.cpp reports no device | the build is for the other backend: `llm update llama` rebuilds |
+| `llm comfy` refuses | ComfyUI needs ROCm; see [COMFYUI.md](COMFYUI.md) |
 | a service will not start | `llm llama logs` / `llm api logs` — the unit's own log says why |
 | a model is missing from `/v1/models` | llama-swap was not restarted: `llm restart` |
 | nothing reachable from another machine | services on loopback (`LLM_BIND=0.0.0.0`) or the firewall — see [REMOTE.md](REMOTE.md) |

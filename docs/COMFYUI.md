@@ -1,5 +1,13 @@
 # ComfyUI — image and video generation
 
+> **ComfyUI needs the ROCm backend.** It runs on PyTorch, PyTorch's GPU support
+> here is the ROCm wheel index, and there is no Vulkan build of PyTorch to point
+> at — so image generation is the one thing in this stack that Vulkan cannot do.
+> Under `llm gpu backend vulkan`, `llm comfy on` and `llm update comfy` say so and
+> stop, instead of downloading three gigabytes of wheel and then failing on
+> `torch.version.hip`. Everything else — chat, embeddings, reranking, speech to
+> text — works under either backend.
+
 ComfyUI lives in `~/comfyui` (override with `LLM_COMFY_HOME`) with its own Python
 environment and **PyTorch built for ROCm**, so the Radeon card does the work. The
 interface listens on port **8188**.

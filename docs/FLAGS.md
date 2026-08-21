@@ -27,7 +27,7 @@ To change an option for *all* models, change the macro — not every model.
 | `--host/--port` | set by llama-swap (`${PORT}`) — do not touch. |
 | `--no-webui` | turn off llama-server's own mini UI (we use Open WebUI). |
 | `-ts 1,1` | tensor split: spread the model evenly over the cards. **Generated** — see below. |
-| `--device ROCm0` | use only this card (what `llm add --gpu N` writes). |
+| `--device ROCm0` | use only this card (what `llm add --gpu N` writes). Spelled `--device Vulkan0` under the Vulkan backend; `llm gpu sync` rewrites it either way, and both spellings are always *read*. |
 | `--min-p 0` | **trap:** llama.cpp filters at `0.05` by default. Models that recommend `min_p=0` (e.g. Qwen3-Coder-Next) need this explicitly. |
 | `--no-context-shift` | no automatic context shifting at the end. Required for hybrid models with recurrent state (Qwen3-Next/DeltaNet), otherwise the state goes inconsistent. |
 
@@ -488,21 +488,57 @@ cannot target another role, and `spillover` targets must share one routing group
 
 ## Build flags
 
-`llm update llama` and `llm update whisper` share one set of HIP flags. The two that
-depend on your hardware are detected, not hardcoded:
+`llm update llama` and `llm update whisper` share one set, and which set depends on
+the backend (`llm gpu backend`).
+
+**Under ROCm** the two flags that depend on your hardware are detected, not
+hardcoded:
 
 - `-DAMDGPU_TARGETS=…` from `rocm-smi --showproductname` (only the discrete cards —
   the iGPU reports a different gfx target and would be wasted build time)
 - `-DCMAKE_HIP_COMPILER=…` from `hipconfig --hipclangpath`
 
 Override with `LLM_GFX_TARGETS` / `LLM_HIP_COMPILER` if the detection is wrong.
-`-DGGML_NATIVE=ON` means the build is tuned for the CPU it was built on, and
-`-DGGML_SCHED_MAX_COPIES=4` is multi-GPU pipeline tuning.
+
+**Under Vulkan** there is one flag, `-DGGML_VULKAN=ON`, and nothing to detect: the
+shaders are compiled to SPIR-V once and run on every device. That is the reason
+this backend cannot be built for the wrong card — and the reason it needs three
+build packages instead of several GB of ROCm (`glslc`, `libvulkan-dev`,
+`spirv-headers`).
+
+One thing worth knowing about that build: ggml decides which shader extensions to
+use by running `glslc` and looking for *"extension not supported"* in its output.
+A `glslc` that cannot start at all therefore looks like one that supports
+everything, and the build then fails thousands of shader lines later — so
+`llm update llama` runs `glslc --version` rather than merely finding it on
+`PATH`. On Ubuntu two extensions (`GL_EXT_float_e2m1`,
+`GL_NV_cooperative_matrix_decode_vector`) are genuinely absent from the packaged
+`glslc`; ggml skips those shaders and the build is fine.
+
+Common to both: `-DGGML_NATIVE=ON` means the build is tuned for the CPU it was
+built on, and `-DGGML_SCHED_MAX_COPIES=4` is multi-GPU pipeline tuning.
+
+### Which is faster
+
+Measured, rather than assumed. One R9700, Qwen3.5-4B-Q4_K_M, `-c 2048 -ngl 99
+-fa on`, pinned to one card, 200-token generations, three runs each:
+
+| backend | tokens/second |
+|---|---|
+| Vulkan (RADV, mesa 26.0) | 111.9 · 114.2 · 113.8 |
+| ROCm 7.1 | 97.7 · 99.4 · 99.5 |
+
+Vulkan came out ~14 % ahead, which is the opposite of the usual expectation.
+Read it narrowly: one small dense model, one card, generation only. Prompt
+processing was measured on prompts of 4 to 24 tokens, which is far too short to
+mean anything, and neither a large model nor a two-card `-ts` split was tested at
+all. If throughput matters for your model, run `llm speed` under both.
 
 ## Useful checks
 
 ```bash
-llm gpu          # rocm-smi: VRAM, temperature, load
+llm gpu          # rocm-smi under ROCm, this stack's own table under Vulkan
+llm gpu backend  # which backend is in force
 llm gpu list     # cards as this stack sees them, and what is pinned where
 llm logs         # what llama-swap and the model are doing
 llm ps           # which model is loaded right now

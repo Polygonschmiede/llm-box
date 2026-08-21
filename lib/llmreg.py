@@ -30,6 +30,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+#  The two card-detection backends. Beside this file, so importing them needs no
+#  path juggling: every entry point already puts lib/ on sys.path to get here.
+import gpu_rocm
+import gpu_vulkan
+
 #  The fallback is the location of THIS file, not ~/llm: bin/llm calls the
 #  library as "python3 lib/llmreg.py <command>", and a checkout in a different
 #  directory has to find its own configuration.
@@ -574,62 +579,108 @@ def live() -> dict:
 #  translates first, with to_smi().
 #  ---------------------------------------------------------------------------
 
-#  Overridable so the 1-card, 3-card and iGPU cases can be tested without the
-#  matching hardware (see tests/fixtures).
-ROCM_SMI = os.environ.get("LLM_ROCM_SMI", "rocm-smi")
+#  ---------------------------------------------------------------------------
+#  TWO BACKENDS behind one interface (see lib/gpu_rocm.py for the contract).
+#
+#  ROCm and Vulkan differ in four things and in nothing else that matters here:
+#  how cards are enumerated, what '--device <prefix>N' is called, which
+#  environment variable hides a card from the runtime, and what cmake needs. So
+#  each backend is a module answering cards()/gfx_targets()/compiler(), and the
+#  part this project keeps getting wrong - absolute versus logical numbering -
+#  stays here, written once, shared.
+#
+#  The choice is a machine fact like the card count, so it lives in
+#  config/hardware.env next to the visible-devices mask, written by
+#  'llm gpu sync'. LLM_BACKEND in the environment wins over the file, and the
+#  systemd units pull the file in with EnvironmentFile=- so the services agree
+#  with the CLI.
+#  ---------------------------------------------------------------------------
+BACKENDS = ("rocm", "vulkan")
 
-#  The iGPU (or CPU path) appears as another "GPU" in rocm-smi and carries a CPU
-#  name. Filtering by VRAM alone is unreliable: rocm-smi reports 0.5 GB for that
-#  device while HIP reports 31 GB of system memory for the SAME device. On an APU
-#  with a large UMA carve-out a threshold therefore flips - the name is the more
-#  dependable signal, the threshold only a fallback.
-_CPU_NAME_RE = re.compile(r"ryzen|epyc|threadripper|athlon|core processor", re.I)
+
+def _env_file_get(path: str, key: str) -> str | None:
+    """One KEY=value out of a systemd EnvironmentFile, without importing it."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(key + "="):
+                    return line[len(key) + 1:].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def backend_name() -> str:
+    """'rocm' or 'vulkan'. Explicit choice first, then the file, then detection.
+
+    Detection prefers ROCm where it is complete: it is the faster path on the
+    hardware this project was built for, and every existing installation is
+    already on it. Vulkan is the answer for everything else - it needs no
+    AMDGPU_TARGETS and no HIP compiler, so it cannot be built for the wrong card.
+    """
+    want = (os.environ.get("LLM_BACKEND") or "").strip().lower()
+    if want not in BACKENDS:
+        want = (_env_file_get(HARDWARE_ENV, "LLM_BACKEND") or "").strip().lower()
+    if want in BACKENDS:
+        return want
+    if gpu_rocm.available():
+        return "rocm"
+    return "vulkan" if gpu_vulkan.available() else "rocm"
+
+
+def backend():
+    """The module for the active backend."""
+    return gpu_vulkan if backend_name() == "vulkan" else gpu_rocm
+
+
+def device_prefix() -> str:
+    """'ROCm' or 'Vulkan' - the N in '--device <this>N' is always LOGICAL."""
+    return backend().DEVICE_PREFIX
+
+
+def visible_env() -> str:
+    """HIP_VISIBLE_DEVICES or GGML_VK_VISIBLE_DEVICES, whichever applies."""
+    return backend().VISIBLE_ENV
+
+
+#  Both prefixes and both variable names are always ACCEPTED when reading a
+#  configuration, whichever backend is active. A config that survives a backend
+#  switch is worth more than a strict parser: the alternative is every model
+#  silently losing its card pinning the moment someone runs 'llm gpu backend'.
+_ALL_DEVICE_PREFIXES = tuple(m.DEVICE_PREFIX for m in (gpu_rocm, gpu_vulkan))
+_ALL_VISIBLE_ENVS = tuple(m.VISIBLE_ENV for m in (gpu_rocm, gpu_vulkan))
+
+#  Kept as a module attribute because the tests and docs name it.
+ROCM_SMI = gpu_rocm.SMI
+
+#  Fallback filter for a backend that cannot say whether a device is discrete.
+#  rocm-smi cannot: the iGPU appears as another "GPU" carrying a CPU name, and
+#  filtering by VRAM alone is unreliable - rocm-smi reports 0.5 GB for that
+#  device while HIP reports 31 GB of system memory for the SAME one, so on an APU
+#  with a large UMA carve-out a threshold flips. The name is the more dependable
+#  signal, the threshold only a backstop. Vulkan needs neither: it states the
+#  device type.
+_CPU_NAME_RE = gpu_rocm.CPU_NAME_RE
 _MIN_DGPU_VRAM = _num(os.environ.get("LLM_MIN_VRAM_GB"), 2) * 1024**3
 
-_SMI_CACHE: tuple[float, dict[int, dict]] | None = None
+_SMI_CACHE: tuple[str, float, dict[int, dict]] | None = None
 
 
 def _smi_cards(max_age: float = 1.0) -> dict[int, dict]:
-    """EVERY device rocm-smi knows about, iGPU included. Keys are absolute.
+    """Every device the active backend knows about, iGPU included.
 
-    One query yields temperature, power draw, utilisation, VRAM, name and gfx
-    target. Cached briefly because several callers ask within the same request
-    (gpus, gpu_of, check_fit); 1 s is short enough to keep 'llm watch' live.
+    Keys are absolute indices - the numbers the visible-devices mask wants.
+    Cached briefly because several callers ask within the same request (gpus,
+    gpu_of, check_fit); 1 s is short enough to keep 'llm watch' live. Keyed by
+    backend as well, so a switch inside one process is not served the other
+    one's answer.
     """
     global _SMI_CACHE
-    if _SMI_CACHE and (time.time() - _SMI_CACHE[0]) < max_age:
-        return _SMI_CACHE[1]
-    try:
-        raw = subprocess.run([ROCM_SMI, "--showtemp", "--showpower", "--showuse",
-                              "--showmeminfo", "vram", "--showproductname"],
-                             capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        raw = ""
-    cards: dict[int, dict] = {}
-    for line in raw.splitlines():
-        m = re.match(r"GPU\[(\d+)\]\s*:\s*(.*)", line.strip())
-        if not m:
-            continue
-        idx, rest = int(m.group(1)), m.group(2)
-        val = rest.split(":")[-1].strip()
-        c = cards.setdefault(idx, {"smiIndex": idx})
-        if "junction" in rest.lower():
-            c["tempJunctionC"] = _num(val)
-        #  Discrete cards report "Average Graphics Package Power", an APU
-        #  "Current Socket Graphics Package Power" - match the part they share.
-        elif "Graphics Package Power" in rest:
-            c["powerW"] = _num(val)
-        elif "GPU use (%)" in rest:
-            c["busyPercent"] = _num(val)
-        elif "Total Memory" in rest:
-            c["vramTotalBytes"] = _num(val)
-        elif "Used Memory" in rest:
-            c["vramUsedBytes"] = _num(val)
-        elif "Card Series" in rest:
-            c["name"] = val
-        elif "GFX Version" in rest:
-            c["gfx"] = val
-    _SMI_CACHE = (time.time(), cards)
+    name = backend_name()
+    if _SMI_CACHE and _SMI_CACHE[0] == name and (time.time() - _SMI_CACHE[1]) < max_age:
+        return _SMI_CACHE[2]
+    cards = backend().cards()
+    _SMI_CACHE = (name, time.time(), cards)
     return cards
 
 
@@ -645,6 +696,12 @@ def dgpu_smi_indices() -> list[int]:
     if forced:
         want = {int(x) for x in re.findall(r"\d+", forced)}
         return sorted(i for i in cards if i in want)
+    #  A backend that knows gets to say so. Vulkan reports the device type, so
+    #  the integrated GPU and llvmpipe - which Vulkan offers and nobody wants a
+    #  model on - are excluded by fact rather than by brand name.
+    if cards and all("discrete" in c for c in cards.values()):
+        keep = [i for i, c in cards.items() if c["discrete"]]
+        return sorted(keep) if keep else sorted(cards)
     keep = [i for i, c in cards.items()
             if not _CPU_NAME_RE.search(c.get("name") or "")
             and (c.get("vramTotalBytes") or 0) >= _MIN_DGPU_VRAM]
@@ -676,7 +733,7 @@ def gpu_count() -> int:
 
 
 def to_smi(logical) -> int | None:
-    """Logical card number -> absolute (what HIP_VISIBLE_DEVICES wants)."""
+    """Logical card number -> absolute (what the visible-devices mask wants)."""
     idx = _num(logical)
     dg = dgpu_smi_indices()
     return dg[idx] if isinstance(idx, int) and 0 <= idx < len(dg) else None
@@ -690,32 +747,23 @@ def to_logical(smi) -> int | None:
 
 
 def gfx_targets() -> str:
-    """gfx targets of the compute cards for AMDGPU_TARGETS, e.g. 'gfx1201'.
+    """ISA targets of the compute cards, for the build. '' when not applicable.
 
-    Discrete cards only - building for the iGPU's gfx target would be wasted
-    build time and fails outright on some ROCm versions.
+    Under ROCm this is AMDGPU_TARGETS, e.g. 'gfx1201' or 'gfx1100;gfx1201', and
+    discrete cards only - building for the iGPU's target is wasted time and fails
+    outright on some ROCm versions. Under Vulkan it is empty: SPIR-V is compiled
+    once and runs on every device.
     """
-    cards = _smi_cards()
-    seen = sorted({cards[i].get("gfx") for i in dgpu_smi_indices() if cards[i].get("gfx")})
-    return ";".join(seen)
+    return backend().gfx_targets(_smi_cards(), dgpu_smi_indices())
 
 
 def hip_compiler() -> str | None:
-    """Path to the HIP compiler for CMAKE_HIP_COMPILER."""
-    try:
-        p = subprocess.run(["hipconfig", "--hipclangpath"],
-                           capture_output=True, text=True, timeout=10).stdout.strip()
-        if p and os.path.exists(os.path.join(p, "clang++")):
-            return os.path.join(p, "clang++")
-    except (OSError, subprocess.SubprocessError):
-        pass
-    for cand in ("/opt/rocm/llvm/bin/clang++", shutil.which("amdclang++"),
-                 shutil.which("hipcc")):
-        if cand and os.path.exists(cand):
-            return cand
-    #  Newest llvm from the distribution, otherwise nothing.
-    found = sorted(glob.glob("/usr/lib/llvm-*/bin/clang++"))
-    return found[-1] if found else None
+    """Path to the backend's compiler, where it needs a particular one.
+
+    ROCm needs CMAKE_HIP_COMPILER; Vulkan uses the ordinary C++ compiler and
+    answers None.
+    """
+    return backend().compiler()
 
 
 def tensor_split() -> str | None:
@@ -734,13 +782,22 @@ def hw() -> dict:
     """Everything that depends on the hardware, in one answer."""
     cards = gpus()
     warnings = []
+    name = backend_name()
     if not cards:
-        warnings.append("no compute card detected - is rocm-smi working? is the user "
-                        "in the render and video groups?")
+        tool = "rocm-smi" if name == "rocm" else "vulkaninfo"
+        warnings.append("no compute card detected - is %s working? is the user "
+                        "in the render and video groups?" % tool)
     if len({c.get("vramTotalBytes") for c in cards}) > 1:
         warnings.append("cards of different size: the even -ts split does not fit "
                         "that case, see docs/FLAGS.md.")
+    #  hipVisibleDevices keeps its name in the payload even under Vulkan, where
+    #  the variable is called GGML_VK_VISIBLE_DEVICES. Renaming a documented API
+    #  field to say the same thing differently would break the pi extension and
+    #  the control page for no gain; visibleEnv says which name it is written
+    #  under, and that is the part a caller actually needs.
     return {
+        "backend": name,
+        "visibleEnv": visible_env(),
         "dgpus": cards,
         "hipVisibleDevices": ",".join(str(i) for i in dgpu_smi_indices()),
         "gfxTargets": gfx_targets(),
@@ -762,11 +819,12 @@ def pinned_models() -> dict[int, list[str]]:
 def gpu_of(entry: dict) -> dict:
     """Which card does this model run on? Whisper steers that through env."""
     dev = flag(entry["cmd"], "--device")
-    if dev and dev.startswith("ROCm"):
-        n = _num(dev[4:])
-        return {"mode": "single", "device": n, "group": PINNED_GROUP, "via": "flag"}
+    for prefix in _ALL_DEVICE_PREFIXES:
+        if dev and dev.startswith(prefix):
+            n = _num(dev[len(prefix):])
+            return {"mode": "single", "device": n, "group": PINNED_GROUP, "via": "flag"}
     for e in entry.get("env") or []:
-        m = re.match(r"HIP_VISIBLE_DEVICES=([\d,]+)", e)
+        m = re.match(r"(?:%s)=([\d,]+)" % "|".join(_ALL_VISIBLE_ENVS), e)
         if m:
             #  The env holds the ABSOLUTE number (that is how HIP counts);
             #  outwards we report the logical one. Several indices = no pinning.
@@ -1221,8 +1279,9 @@ def sync_groups(text: str | None = None) -> str:
             "#  CARD GROUPS  —  maintained by 'llm add --gpu N' / 'llm gpu sync'\n"
             "# " + "=" * 76 + "\n"
             "#  Every model pinned to a card goes into ONE group called '%s' -\n"
-            "#  whether it was pinned with --device ROCmN or with\n"
-            "#  env: HIP_VISIBLE_DEVICES=N (whisper has no --device flag).\n"
+            "#  whether it was pinned with the --device flag or with the\n"
+            "#  visible-devices mask in env: (whisper has no --device flag).\n"
+            "#  Both are spelled per backend; 'llm gpu sync' keeps them current.\n"
             "#   swap: false      -> members do not evict each other\n"
             "#   exclusive: false -> and do not evict anything from other groups\n"
             "#   persistent: true -> and NO other group may evict them either\n"
@@ -1452,15 +1511,26 @@ def write_env() -> dict:
     """
     info = hw()
     head = ("# GENERATED by 'llm gpu sync' - do not edit by hand.\n"
-            "# The card numbers in here are ABSOLUTE (the way HIP counts) - see lib/llmreg.py.\n")
+            "# The card numbers in here are ABSOLUTE (the way the backend counts) -\n"
+            "# see lib/llmreg.py. LLM_BACKEND selects which backend that is.\n")
+    #  The mask is written under the active backend's name and no other, so the
+    #  file cannot end up carrying two of them saying different things after a
+    #  switch. LLM_GFX_TARGETS and LLM_HIP_COMPILER stay in the file even when
+    #  empty: lib/update.sh reads them with hw_get, and an absent key and an
+    #  empty one mean the same thing there while a MISSING line reads as "this
+    #  file predates the backend that needs it".
     body = "".join("%s=%s\n" % kv for kv in (
-        ("HIP_VISIBLE_DEVICES", info["hipVisibleDevices"]),
+        ("LLM_BACKEND", info["backend"]),
+        (info["visibleEnv"], info["hipVisibleDevices"]),
         ("LLM_GFX_TARGETS", info["gfxTargets"] or ""),
         ("LLM_HIP_COMPILER", info["hipCompiler"] or ""),
         ("LLM_TENSOR_SPLIT", info["tensorSplit"] or ""),
     ))
     #  ComfyUI holds VRAM for as long as it runs, so it only sees one card -
-    #  which one is a matter of taste and settable with LLM_COMFY_GPU.
+    #  which one is a matter of taste and settable with LLM_COMFY_GPU. Always
+    #  HIP_VISIBLE_DEVICES here whatever the backend is: ComfyUI runs on a ROCm
+    #  torch wheel and there is no Vulkan one, so this file is meaningless under
+    #  Vulkan rather than differently spelled. docs/COMFYUI.md says so.
     comfy_logical = _num(os.environ.get("LLM_COMFY_GPU"), 0)
     comfy_smi = to_smi(comfy_logical)
     for path, text in ((HARDWARE_ENV, head + body),
@@ -1475,17 +1545,62 @@ def write_env() -> dict:
             "warnings": info["warnings"]}
 
 
+def sync_device_names(text: str) -> str:
+    """Rewrite both ways of naming a card into the active backend's spelling.
+
+    Two rewrites, and the second one is not cosmetic:
+
+    * '--device ROCm0' -> '--device Vulkan0' (and --spec-draft-device with it).
+      gpu_of() reads either prefix, so nothing breaks without this - but the file
+      would keep saying ROCm on a Vulkan machine, and that lie survives into
+      every diff and every screenshot.
+    * 'HIP_VISIBLE_DEVICES=1' -> 'GGML_VK_VISIBLE_DEVICES=1' in a model's env:.
+      This one changes behaviour. It is how whisper gets its card - it has no
+      --device flag - and a mask the runtime does not read is not a mask: the
+      entry would spread over every card instead of the one it names.
+
+    The numbers are untouched. The prefix takes the LOGICAL card and the mask the
+    ABSOLUTE one, and neither meaning depends on the backend.
+    """
+    mine, mine_env = device_prefix(), visible_env()
+    others = [p for p in _ALL_DEVICE_PREFIXES if p != mine]
+    other_envs = [v for v in _ALL_VISIBLE_ENVS if v != mine_env]
+    if others:
+        pat = re.compile(r"(--device\s+|--spec-draft-device\s+)(?:%s)(\d+)"
+                         % "|".join(re.escape(p) for p in others))
+        text = pat.sub(lambda m: "%s%s%s" % (m.group(1), mine, m.group(2)), text)
+    if other_envs:
+        #  Only in an env: list item, so a mask named in a comment or in a cmd
+        #  line is left alone. The quotes are optional in the pattern and
+        #  preserved in the replacement: parse_config() reads ONLY the quoted
+        #  form (`- "VAR=1"`), which is what everything in this project writes,
+        #  but a hand-edited config without them should still be renamed rather
+        #  than silently skipped - it was skipped by the first version of this,
+        #  which is why the quotes are in the pattern at all.
+        pat = re.compile(r'^(\s*-\s*"?)(?:%s)(=[\d,]+"?\s*)$'
+                         % "|".join(re.escape(v) for v in other_envs), re.M)
+        text = pat.sub(lambda m: "%s%s%s" % (m.group(1), mine_env, m.group(2)), text)
+    return text
+
+
+def _SMI_CACHE_RESET() -> None:
+    """Forget the cached card list, e.g. after the backend changed."""
+    global _SMI_CACHE
+    _SMI_CACHE = None
+
+
 def gpu_sync(dry_run: bool = False) -> dict:
     """Bring configuration and environment files in line with the hardware.
 
-    Collects everything that can drift apart after a card change: the GPU groups,
-    the -ts in the chat macros, and HIP_VISIBLE_DEVICES.
+    Collects everything that can drift apart after a card change or a backend
+    switch: the GPU groups, the -ts in the chat macros, the device prefix in
+    every pinned model's cmd, and the visible-devices mask.
     """
     old = config_text()
-    new = sync_tensor_split(sync_groups(old))
+    new = sync_tensor_split(sync_groups(sync_device_names(old)))
     changed = new != old
     out = {"configChanged": changed, "tensorSplit": tensor_split(),
-           "cards": gpu_count(), "dryRun": dry_run}
+           "cards": gpu_count(), "backend": backend_name(), "dryRun": dry_run}
     if dry_run:
         import difflib
         out["diff"] = "\n".join(difflib.unified_diff(
@@ -1504,10 +1619,11 @@ def set_gpu(cmd: str, mode, is_mtp: bool) -> str:
     for f in ("--device", "-sm", "-mg", "--spec-draft-device"):
         cmd = del_flag(cmd, f)
     if mode != "both":
-        cmd = _tidy("%s --device ROCm%s -sm none -mg 0" % (cmd, mode))
+        dev = device_prefix()
+        cmd = _tidy("%s --device %s%s -sm none -mg 0" % (cmd, dev, mode))
         if is_mtp:
             # An MTP drafter needs the card stated SEPARATELY or llama-server aborts.
-            cmd = _tidy("%s --spec-draft-device ROCm%s" % (cmd, mode))
+            cmd = _tidy("%s --spec-draft-device %s%s" % (cmd, dev, mode))
     return cmd
 
 
@@ -1539,6 +1655,18 @@ def check_fit(model: dict, ctx: int | None = None, gpu=None) -> dict:
     if not cards:
         return {"ok": True, "needBytes": need, "freeBytes": None, "target": label,
                 "kvCacheBytes": kv, "weightsBytes": weights, "perCard": [], "reason": None}
+    #  A card whose VRAM size is not known is not a card with zero VRAM. Under
+    #  Vulkan the figures come from amdgpu's sysfs, and a card on any other
+    #  driver has none - so treating absent as empty would refuse every model on
+    #  an Intel or NVIDIA card while claiming it has "0.0 GB free". Same rule as
+    #  no cards at all: no refusal, and say why rather than answer a number that
+    #  was never measured.
+    if any(not c.get("vramTotalBytes") for c in cards):
+        return {"ok": True, "needBytes": need, "freeBytes": None, "target": label,
+                "kvCacheBytes": kv, "weightsBytes": weights, "perCard": [],
+                "reason": "needs about %.1f GB; free VRAM is not readable for %s "
+                          "on this driver, so the fit was not checked"
+                          % (need / 1024**3, label)}
     #  An even split, exactly as the generated -ts prescribes.
     share = need / len(cards)
     per, tight = [], None
@@ -1612,17 +1740,26 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
         gpu = "both" if str(gpu) == "both" else int(gpu)
         if before["role"] == "stt":
             # Whisper gets its card through the environment, not through flags -
-            # and HIP_VISIBLE_DEVICES counts ABSOLUTE cards the way rocm-smi
-            # does, while `gpu` here is the logical index. Writing the logical
-            # one addresses the wrong card on any machine whose iGPU does not
-            # sort last. gpu_of() reads this back through to_logical().
+            # and the mask counts ABSOLUTE cards the way the backend does, while
+            # `gpu` here is the logical index. Writing the logical one addresses
+            # the wrong card on any machine whose iGPU does not sort last.
+            # gpu_of() reads this back through to_logical().
             if gpu == "both":
                 raise ValueError("whisper always runs on exactly one card")
             smi = to_smi(gpu)
             if smi is None:
                 raise ValueError("card %d is not a compute card (llm gpu list)" % gpu)
-            body_new = re.sub(r'(HIP_VISIBLE_DEVICES=)\d+', r"\g<1>%d" % smi, body_new)
-            notes.append("env HIP_VISIBLE_DEVICES=%d (logical card %d)" % (smi, gpu))
+            #  Rewrite whichever spelling is in the entry rather than the active
+            #  backend's, so a config written under ROCm keeps working after a
+            #  switch instead of gaining a second, contradictory mask. Renaming
+            #  it is 'llm gpu sync'.
+            var = next((v for v in _ALL_VISIBLE_ENVS if v + "=" in body_new), visible_env())
+            body_new, hits = re.subn(r'(%s=)\d+' % var, r"\g<1>%d" % smi, body_new)
+            if not hits:
+                raise ValueError(
+                    "this entry pins no card through the environment - expected a "
+                    "'%s=<n>' line under env:" % var)
+            notes.append("env %s=%d (logical card %d)" % (var, smi, gpu))
         else:
             cmd = set_gpu(cmd, gpu, is_mtp=before["runtime"]["specDecoding"] == "mtp")
 
@@ -1991,7 +2128,10 @@ def engine_versions() -> dict:
     out["comfyUI"] = entry(comfy_active,
                            [v for v in (comfy_active, prev.get("comfy_prev")) if v],
                            "comfy", "llm rollback comfy", comfy_root)
-    return {"llmBox": _read_version(), "engines": out,
+    #  The backend belongs with the engine versions rather than in a ninth call
+    #  from the control page: it is what the engines were BUILT for, and a build
+    #  for the other one is exactly the thing the System tab should show.
+    return {"llmBox": _read_version(), "engines": out, "backend": backend_name(),
             "cacheAgeSeconds": int(time.time() - os.path.getmtime(UPDATE_CACHE))
             if os.path.exists(UPDATE_CACHE) else None}
 
@@ -2237,7 +2377,8 @@ def _cli(argv: list[str]) -> int:
             #  second time in awk, with its own iGPU rule and a cap at 8 cards.
             cards = gpus()
             if not cards:
-                print("  no compute card detected (is rocm-smi there? groups render/video?)")
+                tool = "rocm-smi" if backend_name() == "rocm" else "vulkaninfo"
+                print("  no compute card detected (is %s there? groups render/video?)" % tool)
             #  Every field is labelled rather than columnar: this block is
             #  printed inside 'llm status' and by 'llm gpu list', where a header
             #  row would be one more thing to scroll past. A missing sensor is
@@ -2257,6 +2398,26 @@ def _cli(argv: list[str]) -> int:
             print(json.dumps(gpus(), indent=2))
     elif cmd == "hw":
         print(json.dumps(hw(), indent=2))
+    elif cmd == "backend":                          # backend [rocm|vulkan]
+        #  Reading prints the active one. Writing goes through gpu_sync, because
+        #  the choice changes the device prefix in every pinned model's cmd line
+        #  and the name of the mask in hardware.env - setting the variable alone
+        #  would leave the configuration talking about the other backend.
+        want = next((a for a in argv[1:] if not a.startswith("-")), None)
+        if want is None:
+            print(backend_name())
+        elif want not in BACKENDS:
+            sys.stderr.write("unknown backend '%s' - one of: %s\n"
+                             % (want, ", ".join(BACKENDS)))
+            return 2
+        else:
+            mod = gpu_vulkan if want == "vulkan" else gpu_rocm
+            if not mod.available() and "--force" not in argv:
+                sys.stderr.write(mod.missing_hint() + "\n")
+                return 1
+            os.environ["LLM_BACKEND"] = want
+            _SMI_CACHE_RESET()
+            print(json.dumps(dict(gpu_sync(), backend=want), indent=2, ensure_ascii=False))
     elif cmd == "gpu-sync":                         # gpu-sync [--dry-run]
         r = gpu_sync(dry_run="--dry-run" in argv)
         print(json.dumps(r, indent=2, ensure_ascii=False))

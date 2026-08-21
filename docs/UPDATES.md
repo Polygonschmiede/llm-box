@@ -112,6 +112,34 @@ Two things a rollback cannot fix, so they are worth knowing:
 - An Open WebUI downgrade restores the database snapshot, which means anything
   written *after* the upgrade is not in it.
 
+## One build belongs to one backend
+
+`build-<tag>` says nothing about **which** backend it was built for, so a HIP and
+a Vulkan build of the same tag would land in the same directory and `llm versions`
+could not tell them apart. Each build therefore records it in
+`build-<tag>/.llm-backend`, and a build for the other backend is rebuilt rather
+than reused.
+
+Two consequences worth knowing before you switch:
+
+- **A backend switch costs a rebuild.** `llm gpu backend vulkan` rewrites the
+  configuration and the environment file in a second, then tells you to run
+  `llm update llama` (and `llm update whisper` if it is installed).
+- **The rollback stock is per backend.** `KEEP_BUILDS` fallbacks are counted per
+  directory, and after a switch the fallbacks belong to the other backend — so
+  they are rebuilt too rather than rolled back into. Holding a ROCm and a Vulkan
+  build of the same version side by side for an A/B comparison is not possible
+  without waiting for one of them.
+
+A build with no marker at all was made before backends existed, which can only
+have been ROCm; it is treated as such rather than rebuilt for no reason.
+
+The prerequisites are checked **before** anything is fetched or checked out. That
+was not true at first: a machine missing `glslc` had already moved the llama.cpp
+source tree to the new tag by the time it was told. The active build was safe -
+that is what the symlink is for - but the checkout was left on a version nothing
+was built from.
+
 ## Build time and flags
 
 A llama.cpp build takes a couple of minutes on a modern desktop CPU. The two flags
@@ -123,7 +151,20 @@ that depend on your hardware are detected rather than hardcoded — see
 | `-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON` | every build loads its **own** `.so` files. Without it the RUNPATH is absolute to `…/build/bin`, and a test build would load the libraries of the *active* build — which defeats the whole point of testing before switching. |
 | `-DLLAMA_BUILD_TESTS=OFF` | saves build time; the server does not need the test binaries |
 
-The flags live as `LCPP_CMAKE_FLAGS` and `hip_flags()` in `lib/update.sh`.
+The flags live as `LCPP_CMAKE_FLAGS` and `backend_flags()` in `lib/update.sh`.
+`backend_flags` picks one of two sets:
+
+| backend | flags |
+|---|---|
+| `rocm` | `-DGGML_HIP=ON -DAMDGPU_TARGETS=<detected> -DCMAKE_HIP_COMPILER=<detected>` |
+| `vulkan` | `-DGGML_VULKAN=ON` — that is the whole difference |
+
+The Vulkan side needs three build packages (`glslc`, `libvulkan-dev`,
+`spirv-headers`) and checks for all three by compiling and linking a trivial
+program rather than looking for a file at a path — two earlier versions of that
+check were wrong, one because a hand-installed SDK puts the header elsewhere and
+one because preprocessing succeeds while cmake's `find_package(Vulkan)` still
+fails for want of the link-time library.
 
 **Tip:** with `ccache` installed, rebuilds of the same version get much faster.
 Nothing here passes `GGML_CCACHE`; llama.cpp's own `ggml/CMakeLists.txt` defaults

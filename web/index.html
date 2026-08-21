@@ -993,12 +993,28 @@ function roleForm(name, cur) {
 //  Cards
 // ==========================================================================
 function cards() {
+  //  Which backend answered decides how each of these numbers was read, so the
+  //  page says it rather than leaving a card with no temperature looking broken.
+  //  From /api/versions, which is where the backend the engines were built for
+  //  lives - not a separate call, and the same value the System tab shows.
+  const vk = (S.versions || {}).backend === "vulkan";
+  const pfx = vk ? "Vulkan" : "ROCm";
   const out = [el("h2", { class: "eyebrow", text: "Cards" }),
+    el("div", { class: "row" },
+      el("span", { class: "stl-tag stl-tag--kelp" }, gloss("backend",
+        vk ? "Vulkan: the cards come from vulkaninfo and the temperature, watts "
+           + "and utilisation from amdgpu's sysfs, because Vulkan reports none of "
+           + "them. On a card whose driver is not amdgpu those fields read '?' - "
+           + "the model still runs, just without a thermometer."
+           : "ROCm: one rocm-smi query answers everything on this tab. The "
+           + "faster path on supported AMD cards, and the one that has to be "
+           + "built for the exact ISA of the cards it can see.",
+        "backend " + ((S.versions || {}).backend || "?")))),
     el("div", { class: "stl-banner stl-banner--info note" },
       "This is the filtered view: integrated graphics are left out and the numbers are "
-      + "the logical ones, the N in --device ROCmN. llama-swap's own hardware page shows "
-      + "every device the driver exposes, so on a machine with an iGPU it lists one card "
-      + "too many.")];
+      + "the logical ones, the N in --device " + pfx + "N. llama-swap's own hardware page "
+      + "shows every device the driver exposes, so on a machine with an iGPU it lists one "
+      + "card too many.")];
   for (const c of S.gpus) {
     const frac = c.vramTotalBytes ? c.vramUsedBytes / c.vramTotalBytes : 0;
     out.push(el("div", { class: "stl-card card" },
@@ -1024,10 +1040,12 @@ function cards() {
                 + "decode can read 100 % while most of the card idles.",
                 "busy " + c.busyPercent + " %")) : null,
         c.smiIndex !== c.index ? el("span", { class: "stl-tag stl-tag--citron" },
-          gloss("smiIndex", "Two numberings exist. HIP_VISIBLE_DEVICES uses this "
-            + "absolute one, the way rocm-smi counts; --device ROCmN and -mg use "
-            + "the logical position among the discrete cards, which is the number "
-            + "on the left.", "rocm-smi calls it " + c.smiIndex)) : null),
+          gloss("smiIndex", "Two numberings exist. The visible-devices mask ("
+            + (vk ? "GGML_VK_VISIBLE_DEVICES" : "HIP_VISIBLE_DEVICES") + ") uses "
+            + "this absolute one, the way the backend counts; --device " + pfx + "N "
+            + "and -mg use the logical position among the discrete cards, which is "
+            + "the number on the left.",
+            (vk ? "vulkaninfo" : "rocm-smi") + " calls it " + c.smiIndex)) : null),
       el("div", { class: "stl-card__body body" },
         el("div", { class: "row row--flush" },
           el("span", { class: "stl-progress bar" }, el("i", {

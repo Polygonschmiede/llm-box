@@ -122,11 +122,32 @@ GGUF headers, detects cards and computes VRAM. `bin/llm` is a front end, and
 YAML itself, that is a bug waiting — the two parsers drift apart, which has
 already happened once with the `-ts` line.
 
+`lib/gpu_rocm.py` and `lib/gpu_vulkan.py` are the **only** split out of
+`llmreg.py`, and it exists because that code would otherwise be written twice.
+Each answers `cards()`, `gfx_targets()`, `compiler()`, `available()` and
+`missing_hint()`, and declares `DEVICE_PREFIX` and `VISIBLE_ENV`. Everything
+above them — the absolute↔logical translation, the `LLM_DGPUS` override, the fit
+arithmetic, the config rewriting — stays in `llmreg.py`, written once. A new
+backend is a third module and a name in `BACKENDS`; **if you find yourself
+adding an `if backend == ...` outside those two modules and the dispatch
+functions beside them, that is the sign the seam is in the wrong place.**
+
+One contract detail worth keeping: a sensor the driver does not answer is an
+**absent key**, never a zero. `?` in the table and `null` in JSON are honest; a
+confident `0 W` is not. `check_fit` follows the same rule and answers "not
+checked" rather than refusing a model on a card whose free VRAM cannot be read.
+
 Two numbering spaces exist and mixing them up is the bug class this project
-keeps hitting: `HIP_VISIBLE_DEVICES` uses **absolute** indices as `rocm-smi`
-counts them, `--device ROCmN` and everything the API reports use the **logical**
-position among the discrete cards. `to_smi()` and `to_logical()` translate.
-Anything that writes a card number needs one of them.
+keeps hitting: the visible-devices mask (`HIP_VISIBLE_DEVICES`, or
+`GGML_VK_VISIBLE_DEVICES` under Vulkan) uses **absolute** indices as the backend
+counts them, while `--device ROCmN`/`--device VulkanN` and everything the API
+reports use the **logical** position among the discrete cards. `to_smi()` and
+`to_logical()` translate. Anything that writes a card number needs one of them.
+
+`tests/fixtures/mk-vulkan.py` is hostile about this on purpose: it permutes the
+DRM card minors, so pairing the Vulkan device list against sysfs by position
+instead of by the reported minor reads the wrong card's temperature and seven
+checks go red.
 
 ## Commits
 
