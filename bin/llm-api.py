@@ -218,12 +218,24 @@ def _session_valid(sid: str | None) -> bool:
     return True
 
 
+def _token_ok(given: str | None, want: str | None) -> bool:
+    """Constant-time token comparison.
+
+    `==` on a secret leaks its length and its matching prefix through timing.
+    Over a LAN that is a thin channel, but this is the only comparison in the
+    project that guards anything, and it is one function call.
+    """
+    if not given or not want:
+        return False
+    return secrets.compare_digest(given, want)
+
+
 def require_token(x_llm_token: str | None = Header(default=None),
                   llm_session: str | None = Cookie(default=None)):
     want = llmreg.api_token(create=False)
     if not want:
         raise HTTPException(503, "no token configured - run 'llm api token' on the server")
-    if x_llm_token == want or _session_valid(llm_session):
+    if _token_ok(x_llm_token, want) or _session_valid(llm_session):
         return True
     raise HTTPException(401, "wrong or missing X-LLM-Token (or expired session)")
 
@@ -276,10 +288,15 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
+#  Origins get the same list as hosts rather than "*". The Host check is the
+#  DNS-rebinding protection; leaving Origin open kept half the door ajar for a
+#  browser-driven request, and this service answers with a session cookie. An
+#  MCP client that is not a browser sends no Origin at all and is unaffected -
+#  LLM_API_ALLOWED_HOSTS widens both if you need it to.
 mcp = FastMCP("llm-box", stateless_http=True, streamable_http_path="/mcp",
               transport_security=TransportSecuritySettings(
                   allowed_hosts=_allowed_hosts(),
-                  allowed_origins=["*"]))
+                  allowed_origins=_allowed_hosts()))
 
 
 def _mcp_token() -> str | None:
@@ -292,9 +309,22 @@ def _mcp_token() -> str | None:
 
 def _mcp_check_token():
     want = llmreg.api_token(create=False)
-    if not want or _mcp_token() != want:
+    if not want or not _token_ok(_mcp_token(), want):
         raise ValueError("this action needs the X-LLM-Token header "
                          "(contents of config/api-token on the server).")
+
+
+def _mcp_check_read():
+    """The read half of the MCP surface, gated the same way HTTP reads are.
+
+    Without this, LLM_API_REQUIRE_AUTH closed /api/models over HTTP and left
+    list_models, get_model, gpu_status and job_status wide open over MCP - the
+    same catalog, the same filesystem paths, through a different door. Whoever
+    sets that variable means "reads need a token", not "reads need a token
+    unless you ask in MCP".
+    """
+    if READ_NEEDS_AUTH:
+        _mcp_check_token()
 
 
 async def _thread(fn, *a, **kw):
@@ -344,6 +374,7 @@ def _slim(m: dict) -> dict:
 @mcp.tool(description="All local models with their configuration, GPU placement and "
                       "Hugging Face provenance. Always the real, current state.")
 async def list_models(role: str | None = None) -> list[dict]:
+    _mcp_check_read()
     models = await _thread(CAT.all)
     return [_slim(m) for m in models if not role or m["role"] == role]
 
@@ -351,6 +382,7 @@ async def list_models(role: str | None = None) -> list[dict]:
 @mcp.tool(description="Every detail of one model including the full llama-server "
                       "command line, its files and its VRAM requirement.")
 async def get_model(model_id: str) -> dict:
+    _mcp_check_read()
     return await _thread(CAT.one, model_id)
 
 
@@ -358,6 +390,7 @@ async def get_model(model_id: str) -> dict:
                       "to which card. The card count depends on the machine, so "
                       "call this before pinning anything.")
 async def gpu_status() -> list[dict]:
+    _mcp_check_read()
     return await _thread(llmreg.gpus)
 
 
@@ -423,6 +456,9 @@ async def remove_model(model_id: str, delete_files: bool = False) -> dict:
 
 @mcp.tool(description="State and log of a background job (e.g. a download).")
 async def job_status(job_id: str) -> dict:
+    #  Job logs carry the full build and download output, including the argv the
+    #  job was started with - so they are a read like any other.
+    _mcp_check_read()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -435,6 +471,12 @@ async def job_status(job_id: str) -> dict:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    #  Create the write token here rather than under __main__: started through an
+    #  ASGI server directly (uvicorn bin.llm-api:app, gunicorn, a reload wrapper)
+    #  that branch never runs, and then every write answers 503 "no token
+    #  configured" while 'llm api token' shows one - because the CLI creates it
+    #  and the service did not.
+    llmreg.api_token(create=True)
     async with mcp.session_manager.run():
         yield
 
@@ -505,7 +547,7 @@ def api_pi_models(x_llm_token: str | None = Header(default=None),
     """
     if llmreg.api_key():
         want = llmreg.api_token(create=False)
-        if not (want and (x_llm_token == want or _session_valid(llm_session))):
+        if not (want and (_token_ok(x_llm_token, want) or _session_valid(llm_session))):
             raise HTTPException(401, "an inference key is set, so this payload carries a "
                                      "secret - send X-LLM-Token (llm api token)")
     return llmreg.pi_models_json(CAT.all())
@@ -541,7 +583,7 @@ def api_session(response: Response, body: dict = Body(default={})):
     want = llmreg.api_token(create=False)
     if not want:
         raise HTTPException(503, "no token configured - run 'llm api token' on the server")
-    if str(body.get("token") or "") != want:
+    if not _token_ok(str(body.get("token") or ""), want):
         raise HTTPException(401, "wrong token")
     sid, ttl = _session_new()
     response.set_cookie(SESSION_COOKIE, sid, max_age=ttl, httponly=True,
@@ -563,7 +605,8 @@ def api_session_state(llm_session: str | None = Cookie(default=None),
                       x_llm_token: str | None = Header(default=None)):
     """Whether this caller may write. The page asks before showing any button."""
     want = llmreg.api_token(create=False)
-    return {"canWrite": bool(want) and (x_llm_token == want or _session_valid(llm_session)),
+    return {"canWrite": bool(want) and (_token_ok(x_llm_token, want)
+                                       or _session_valid(llm_session)),
             "tokenConfigured": bool(want), "readNeedsAuth": READ_NEEDS_AUTH}
 
 
@@ -966,5 +1009,4 @@ app.mount("/", mcp.streamable_http_app())
 
 if __name__ == "__main__":
     import uvicorn
-    llmreg.api_token(create=True)                     # create it on first start
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
