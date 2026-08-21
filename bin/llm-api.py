@@ -131,6 +131,13 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 
+#  bin/llm colours its output, and cmake/git/uv do too when they think they are
+#  on a terminal. Those escapes would show up literally in the web page, so the
+#  child is asked to keep quiet (NO_COLOR) and whatever still slips through is
+#  stripped here.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "kind": kind, "argv": argv, "state": "running",
@@ -139,12 +146,12 @@ def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
         JOBS[job_id] = job
 
     def run():
-        e = dict(os.environ, HF_HUB_DISABLE_XET="1", **(env or {}))
+        e = dict(os.environ, HF_HUB_DISABLE_XET="1", NO_COLOR="1", **(env or {}))
         try:
             p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, env=e)
             for line in p.stdout:                      # type: ignore[union-attr]
-                line = line.rstrip("\n")
+                line = ANSI.sub("", line.rstrip("\n"))
                 with JOBS_LOCK:
                     job["log"].append(line)
                     del job["log"][:-400]              # keep only the last lines
@@ -158,6 +165,19 @@ def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
 
     threading.Thread(target=run, daemon=True).start()
     return job_id
+
+
+def job_running(*kinds: str) -> dict | None:
+    """A running job of one of these kinds, or None.
+
+    Updates need this: two of them would fetch into the same repository, move
+    the same symlink and restart the same unit at the same time.
+    """
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job["state"] == "running" and job["kind"] in kinds:
+                return {k: v for k, v in job.items() if k != "log"}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +797,85 @@ def api_job(job_id: str):
     return job
 
 
+# ---------------------------------------------------------------------------
+#  Updates and rollbacks
+# ---------------------------------------------------------------------------
+#  The machinery stays in lib/update.sh - this only starts 'llm update' /
+#  'llm rollback' through the same job runner the downloads use, so the control
+#  page can follow along instead of telling people to open a shell.
+#
+#  An allowlist rather than a pattern: these strings become a command line, and
+#  a path parameter must never be able to contribute a word of its own.
+UPDATE_COMPONENTS = ("llama", "swap", "whisper", "ui", "comfy")
+
+
+def _check_component(component: str, allow_all: bool) -> str:
+    known = UPDATE_COMPONENTS + (("all",) if allow_all else ())
+    if component not in known:
+        raise HTTPException(400, "component must be one of: %s" % ", ".join(known))
+    return component
+
+
+def _check_version(body: dict | None) -> str | None:
+    """An explicit target tag, as 'llm update llama b10516' takes one."""
+    version = (body or {}).get("version")
+    if version in (None, ""):
+        return None
+    version = str(version)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", version):
+        raise HTTPException(400, "version must be a tag such as 'b10545' or 'v1.9.3'")
+    return version
+
+
+def _start_update(kind: str, argv: list[str]) -> dict:
+    #  One at a time: two of these would fetch into the same repository, move the
+    #  same symlink and restart the same unit at once.
+    busy = job_running("update", "rollback", "check")
+    if busy:
+        raise HTTPException(409, "'%s' is still running (job %s) - these have to "
+                                 "take turns, they share the repositories and the "
+                                 "services" % (" ".join(busy["argv"][1:]), busy["id"]))
+    job_id = job_start(kind, argv)
+    return {"jobId": job_id, "argv": argv[1:],
+            "hint": "progress: GET /api/jobs/%s" % job_id}
+
+
+@app.post("/api/updates/check", dependencies=WRITE, status_code=202)
+def api_update_check():
+    """Ask upstream for the newest versions, now.
+
+    Registered before /api/updates/{component} on purpose - the other route
+    would swallow this path. .update-cache is up to a day old (UPD_MAXAGE in
+    lib/update.sh) and until now only the CLI could refresh it, so the version
+    table could show a stale 'latest' with no way to correct it from here.
+    'llm update status' does the querying and prints what it found.
+    """
+    return _start_update("check", [LLM_CLI, "update", "status"])
+
+
+@app.post("/api/updates/{component}", dependencies=WRITE, status_code=202)
+def api_update(component: str, body: dict | None = Body(default=None)):
+    """Build or install a component and switch to it. 'all' does every one.
+
+    This takes a while - a llama.cpp build is tens of minutes - and llama-swap
+    is down for a few seconds while the symlink moves. A smoke test decides
+    whether the new version becomes active at all; when it fails, the running
+    one stays. The full build output goes to a log file on the server, the job
+    log carries the progress lines.
+    """
+    component = _check_component(component, allow_all=True)
+    version = _check_version(body)
+    argv = [LLM_CLI, "update", component] + ([version] if version else [])
+    return _start_update("update", argv)
+
+
+@app.post("/api/rollback/{component}", dependencies=WRITE, status_code=202)
+def api_rollback(component: str):
+    """Back to the previous version. /api/versions says whether there is one."""
+    component = _check_component(component, allow_all=False)
+    return _start_update("rollback", [LLM_CLI, "rollback", component])
+
+
 WEB_PAGE = os.path.join(ROOT, "web", "index.html")
 
 
@@ -796,6 +895,46 @@ def api_ui():
                         headers={"Cache-Control": "no-store"})
 
 
+#  The page's stylesheets. A table rather than a static mount: this process reads
+#  every model file and config/api-token, and a path parameter that reaches the
+#  filesystem is how that turns into someone else's shell. The names are what the
+#  page asks for; the paths are ours.
+UI_ASSETS = {
+    "stellar.css": os.path.join(ROOT, "web", "vendor", "stellar", "index.css"),
+    "stellar-auto-dark.css": os.path.join(ROOT, "web", "vendor", "stellar", "auto-dark.css"),
+}
+
+
+@app.get("/ui/{asset}")
+def api_ui_asset(asset: str, if_none_match: str | None = Header(default=None)):
+    """One of the page's stylesheets, by name.
+
+    Registered before the MCP mount for the same reason /ui is.
+
+    'no-cache' rather than 'no-store', plus the conditional check by hand:
+    FileResponse sends an ETag but does not answer If-None-Match itself (that
+    lives in StaticFiles, which this deliberately is not), so without these four
+    lines the browser would re-fetch 78 KB of unchanged CSS on every page load.
+    A long max-age is not the answer either - the URL stays the same across
+    versions, so it would serve the old design system after an upgrade.
+    """
+    path = UI_ASSETS.get(asset)
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "no such asset - the page asks for %s"
+                                 % ", ".join(sorted(UI_ASSETS)))
+    #  stat_result eagerly: without it FileResponse only computes the ETag while
+    #  it is being sent, and there would be nothing here to compare against.
+    r = FileResponse(path, media_type="text/css; charset=utf-8",
+                     stat_result=os.stat(path),
+                     headers={"Cache-Control": "no-cache"})
+    #  Its own ETag, so the two can never be computed differently.
+    tag = r.headers.get("etag")
+    if tag and if_none_match and tag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers={"ETag": tag,
+                                                 "Cache-Control": "no-cache"})
+    return r
+
+
 @app.get("/")
 def root():
     return JSONResponse({
@@ -804,11 +943,13 @@ def root():
         "ui": "/ui",
         "read": ["/api/health", "/api/models", "/api/models/{id}", "/api/gpus",
                  "/api/state", "/api/versions", "/api/config", "/api/config/diff",
-                 "/api/roles", "/api/jobs", "/api/pi-models.json", "/api/events"],
+                 "/api/roles", "/api/jobs", "/api/pi-models.json", "/api/events",
+                 "/ui/{asset}"],
         "write": ["PATCH /api/models/{id}", "POST /api/models",
                   "POST /api/models/{id}/load", "POST /api/unload",
                   "DELETE /api/models/{id}", "PUT /api/roles/{name}",
-                  "DELETE /api/roles/{name}"],
+                  "DELETE /api/roles/{name}", "POST /api/updates/check",
+                  "POST /api/updates/{component}", "POST /api/rollback/{component}"],
         "mcp": "/mcp",
         "docs": "/docs",
         "hint": "writing needs the X-LLM-Token header, or a session cookie from "

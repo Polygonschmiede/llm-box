@@ -7,6 +7,8 @@ cat <<'SMI'
 GPU[0]		: Temperature (Sensor edge) (C): 30.0
 GPU[0]		: Temperature (Sensor junction) (C): 29.0
 GPU[0]		: Temperature (Sensor memory) (C): 34.0
+GPU[0]		: Current Socket Graphics Package Power (W): 17.0
+GPU[0]		: GPU use (%): 42
 GPU[0]		: VRAM Total Memory (B): 17179869184
 GPU[0]		: VRAM Total Used Memory (B): 171778048
 GPU[0]		: Card Series: 		AMD Ryzen 7 8700G w/ Radeon 780M Graphics
@@ -15,6 +17,8 @@ GPU[0]		: GFX Version: 		gfx1103
 GPU[1]		: Temperature (Sensor edge) (C): 30.0
 GPU[1]		: Temperature (Sensor junction) (C): 30.0
 GPU[1]		: Temperature (Sensor memory) (C): 34.0
+GPU[1]		: Average Graphics Package Power (W): 18.0
+GPU[1]		: GPU use (%): 0
 GPU[1]		: VRAM Total Memory (B): 34208743424
 GPU[1]		: VRAM Total Used Memory (B): 73072640
 GPU[1]		: Card Series: 		AMD Radeon AI PRO R9700

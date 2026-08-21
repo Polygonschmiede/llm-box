@@ -43,6 +43,13 @@ add_block "$H" whisper '/bin/whisper-server -m /home/x/models/w/w.bin --request-
   '    env:
       - "HIP_VISIBLE_DEVICES=1"'
 printf 'testtoken\n' > "$H/config/api-token"
+#  Enough of the update layout for the version table to have something to say:
+#  an active build, one to roll back to, and a cache claiming a newer release.
+#  Without this every engine reports 'unknown' and the buttons never render.
+mkdir -p "$H/llama.cpp/build-b10000" "$H/llama.cpp/build-b9999" "$H/whisper.cpp/build-v1.9.2"
+ln -sfn build-b10000 "$H/llama.cpp/build"
+ln -sfn build-v1.9.2 "$H/whisper.cpp/build"
+printf 'llama=b10001\nwhisper=v1.9.2\n' > "$H/.update-cache"
 LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
   pyx "
 llmreg.set_selector('mix', 'warm', ['big', 'spread'])
@@ -55,6 +62,7 @@ llmreg.write_meta('$H/models/big', {'repo': 'unsloth/Fixture-7B-GGUF', 'quant': 
 #  Dump exactly what the page fetches, through the real app.
 FX="$TMP/ui-fx"; mkdir -p "$FX"
 LLM_HOME="$H" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+LLM_WHISPER_HOME="$H/whisper.cpp" LLM_COMFY_HOME="$H/comfyui" \
 LLM_SWAP_API="http://127.0.0.1:9" pyapi "
 import importlib.util, json, pathlib
 spec = importlib.util.spec_from_file_location('llmapi', '$REPO/bin/llm-api.py')
@@ -87,6 +95,45 @@ check "nothing is fetched from another host" "0" \
   "$(grep -coE '(src|href)="https?://' "$REPO/web/index.html" || true)"
 check "the script is inline" "1" \
   "$(grep -c '<script>' "$REPO/web/index.html")"
+#  The design system is a verbatim copy in web/vendor/stellar, loaded from the
+#  same origin - so the page still needs nothing but this server. Two things can
+#  break that: a link to a file that is not there, and a vendored sheet that
+#  fetches something itself.
+check "every stylesheet it links exists" "" \
+  "$(sed -n 's|.*<link rel="stylesheet" href="/ui/\([^"]*\)".*|\1|p' \
+       "$REPO/web/index.html" | while read -r a; do
+       case "$a" in
+         stellar.css)           f=index.css;;
+         stellar-auto-dark.css) f=auto-dark.css;;
+         *)                     echo "unmapped:$a"; continue;;
+       esac
+       [ -f "$REPO/web/vendor/stellar/$f" ] || echo "missing:$a"
+     done)"
+check "and there are two of them" "2" \
+  "$(grep -c '<link rel="stylesheet"' "$REPO/web/index.html")"
+#  Not a plain search for "http": Stellar's checkbox tick is an inline data: SVG
+#  and carries an xmlns, which is a namespace and not a fetch.
+check "the vendored CSS fetches nothing" "0" \
+  "$(grep -coE '@import|url\(["'"'"']?https?:' "$REPO"/web/vendor/stellar/*.css \
+     | awk -F: '{s+=$NF} END {print s+0}')"
+#  The one failure a screenshot would not explain: an upgrade of the design
+#  system renames a class or a token, the page keeps asking for the old name,
+#  and everything quietly falls back to unstyled. Both directions are checked -
+#  the classes the page uses, and the tokens its own style block reads.
+check "every class and token it uses exists" "ok" \
+  "$(python3 -c "
+import re, pathlib
+page = pathlib.Path('$REPO/web/index.html').read_text()
+css = pathlib.Path('$REPO/web/vendor/stellar/index.css').read_text() \
+    + pathlib.Path('$REPO/web/vendor/stellar/auto-dark.css').read_text()
+cls = set(re.findall(r'(?<!-)\b(stl-[a-z0-9_]+(?:__[a-z0-9_]+)?(?:--[a-z0-9_]+)?)\b', page))
+cls |= {'stl-banner--' + k for k in ('danger', 'warn', 'success', 'info')}  # built at runtime
+have = set(re.findall(r'\.([a-z][a-z0-9_-]*)', css))
+style = re.search(r'<style>(.*?)</style>', page, re.S).group(1)
+tok = set(re.findall(r'var\((--[a-z0-9-]+)', style))
+hav2 = set(re.findall(r'(--[a-z0-9-]+)\s*:', css))
+bad = sorted(cls - have) + sorted(tok - hav2)
+print(', '.join(bad) if bad else 'ok')")"
 
 #  One check, because the node script either gets through all of it or does
 #  not; the lines it prints are the detail, not separate assertions here.

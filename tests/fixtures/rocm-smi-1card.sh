@@ -7,6 +7,8 @@ cat <<'SMI'
 GPU[0]		: Temperature (Sensor edge) (C): 30.0
 GPU[0]		: Temperature (Sensor junction) (C): 29.0
 GPU[0]		: Temperature (Sensor memory) (C): 34.0
+GPU[0]		: Average Graphics Package Power (W): 17.0
+GPU[0]		: GPU use (%): 42
 GPU[0]		: VRAM Total Memory (B): 34208743424
 GPU[0]		: VRAM Total Used Memory (B): 171778048
 GPU[0]		: Card Series: 		AMD Radeon AI PRO R9700

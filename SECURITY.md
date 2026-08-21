@@ -35,6 +35,15 @@ Three specifics on port 8080 that are easy to miss:
 - **Reads on the registry, port 8081, need no token** and return every model's
   filesystem path, SHA-256 and Hugging Face repo, plus live VRAM per card.
 
+One specific on port 8081 for the same reason: a write there can now **start a
+build and restart a service**. `POST /api/updates/<component>` and
+`POST /api/rollback/<component>` run the same `llm update` / `llm rollback` the
+CLI does — minutes of CPU, a few seconds of downtime, and a different binary
+afterwards. They need the token or a session, like every other write, and the
+component is checked against a fixed list rather than a pattern because it
+becomes part of a command line. Nothing new is reachable without the token; what
+is new is how much one leaked token can do with it.
+
 None of that matters on the shipped `127.0.0.1` default. All of it matters the
 moment you set `LLM_BIND=0.0.0.0`. If you need remote access, prefer the SSH
 tunnel in [docs/REMOTE.md](docs/REMOTE.md) over opening the ports.

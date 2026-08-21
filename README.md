@@ -18,8 +18,8 @@ Services:
 
 Loaded model: qwen3.8-27b-q6_k
 Cards:
-  card 0  junction 30°C  VRAM 28.6/32 GB  AMD Radeon AI PRO R9700  [qwen3.8-27b-q6_k]
-  card 1  junction 27°C  VRAM 0.1/32 GB   AMD Radeon AI PRO R9700
+  card 0  junction   30°C   243 W  busy  98 %  VRAM 28.6/32 GB  AMD Radeon AI PRO R9700  [qwen3.8-27b-q6_k]
+  card 1  junction   27°C    16 W  busy   0 %  VRAM 0.1/32 GB  AMD Radeon AI PRO R9700
 Versions: llama.cpp b10453 · llama-swap v250 · whisper.cpp v1.9.2  up to date
 ```
 

@@ -164,6 +164,32 @@ check "/ui is html"            "True" \
   "$(api "print('text/html' in c.get('/ui').headers['content-type'])")"
 check "the index points at it" "/ui" \
   "$(api "print(c.get('/').json()['ui'])")"
+#  The page loads the design system from this server, so those two files are
+#  part of the endpoint surface now. A table of names, not a path under the
+#  document root: this process can read every model file and config/api-token.
+check "/ui/stellar.css"        "200" \
+  "$(api "print(c.get('/ui/stellar.css').status_code)")"
+check "it is served as CSS"    "True" \
+  "$(api "print('text/css' in c.get('/ui/stellar.css').headers['content-type'])")"
+check "and it is the real file" "True" \
+  "$(api "print('--paper-0' in c.get('/ui/stellar.css').text)")"
+check "the dark overlay too"   "200" \
+  "$(api "print(c.get('/ui/stellar-auto-dark.css').status_code)")"
+check "an unknown asset"       "404" \
+  "$(api "print(c.get('/ui/nonsense.css').status_code)")"
+check "and no way out of the table" "404" \
+  "$(api "print(c.get('/ui/..%2f..%2fconfig%2fapi-token').status_code)")"
+check "the index lists the route" "True" \
+  "$(api "print(any('/ui/' in r for r in c.get('/').json()['read']))")"
+#  78 KB of design system on every page load, or not. FileResponse sends an
+#  ETag but answers no conditional request by itself, so this is the check that
+#  the four lines doing it by hand still work.
+check "an unchanged sheet is a 304" "304" \
+  "$(api "
+tag = c.get('/ui/stellar.css').headers['etag']
+print(c.get('/ui/stellar.css', headers={'If-None-Match': tag}).status_code)")"
+check "and a stale one is not"     "200" \
+  "$(api "print(c.get('/ui/stellar.css', headers={'If-None-Match': '\"old\"'}).status_code)")"
 
 #  Roles were CLI-only until now, which meant a UI could show them and not
 #  change them.
@@ -252,5 +278,39 @@ check "health stays open regardless" "200" \
 llmreg = __import__('llmreg')
 llmreg.api_key(create=True)
 print(c.get('/api/health').status_code)")"
+
+#  Updating used to be CLI-only, so the control page could show a stale version
+#  and do nothing about it. These checks never let a real update start: the
+#  refusals all happen before job_start, and the 'busy' case injects a job
+#  instead of running one.
+section "updates over HTTP"
+check "an update needs the token"   "401" \
+  "$(api "print(c.post('/api/updates/llama').status_code)")"
+check "a rollback needs the token"  "401" \
+  "$(api "print(c.post('/api/rollback/llama').status_code)")"
+check "an unknown component"        "400" \
+  "$(api "print(c.post('/api/updates/nonsense', headers=TOK).status_code)")"
+check "the refusal lists the real ones" "True" \
+  "$(api "print('whisper' in c.post('/api/updates/nonsense', headers=TOK).json()['detail'])")"
+check "'all' is an update, not a rollback" "400" \
+  "$(api "print(c.post('/api/rollback/all', headers=TOK).status_code)")"
+check "a version with metacharacters" "400" \
+  "$(api "print(c.post('/api/updates/llama', json={'version': '; reboot'}, headers=TOK).status_code)")"
+check "one at a time"               "409" \
+  "$(api "
+mod.JOBS['fake'] = {'id': 'fake', 'kind': 'update', 'state': 'running',
+                    'argv': ['llm', 'update', 'llama'], 'log': []}
+print(c.post('/api/updates/whisper', headers=TOK).status_code)")"
+check "and it says which one"       "True" \
+  "$(api "
+mod.JOBS['fake'] = {'id': 'fake', 'kind': 'update', 'state': 'running',
+                    'argv': ['llm', 'update', 'llama'], 'log': []}
+print('update llama' in c.post('/api/updates/whisper', headers=TOK).json()['detail'])")"
+check "the index lists them"        "True" \
+  "$(api "print(any('updates' in w for w in c.get('/').json()['write']))")"
+#  The job log ends up in a web page, where an escape sequence would be printed
+#  rather than interpreted.
+check "colour is stripped from a job log" "build ok" \
+  "$(api "print(mod.ANSI.sub('', '\033[0;36mbuild\033[0m \033[0;32mok\033[0m'))")"
 
 summary

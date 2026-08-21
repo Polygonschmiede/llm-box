@@ -1,10 +1,18 @@
 <!--
   llm-box control page  —  served by bin/llm-api.py at /ui
   ===========================================================================
-  One file, no build step, no external requests. That is deliberate: this
-  project installs llama.cpp and two venvs and nothing else, and a page that
-  needed npm would be the only reason to add a toolchain. Same origin as the
-  API, so there is no CORS to configure either.
+  This file plus a verbatim copy of the design system in web/vendor/stellar,
+  and nothing else: no build step, no external request. That is deliberate.
+  This project installs llama.cpp and two venvs; a page that needed npm would
+  be the only reason in the tree to own a JavaScript toolchain, and a page that
+  pulled from a CDN would stop working on a machine with no internet - which is
+  most of the point of running models locally. Same origin as the API, so there
+  is no CORS to configure either.
+
+  The style block below is UNLAYERED and therefore beats the whole
+  @layer stellar stack whichever file the browser sees first. So it holds only
+  what Stellar does not cover, or covers differently than a page of dense
+  tables wants; everything deleted from it is something Stellar took over.
 
   What it deliberately does NOT do: charts, logs, a playground, per-request
   telemetry. llama-swap's own UI on :8080/ui does all of that better, and this
@@ -14,89 +22,141 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llm-box</title>
+<!--  Absolute paths on purpose: /ui and /ui/ are both routes, so a relative
+      href would resolve to two different places depending on which one the
+      browser asked for. Served by api_ui_asset in bin/llm-api.py.  -->
+<link rel="stylesheet" href="/ui/stellar.css">
+<link rel="stylesheet" href="/ui/stellar-auto-dark.css">
 <style>
   :root {
-    --bg: #fbfbfa; --panel: #fff; --line: #e4e4e1; --ink: #1b1b19;
-    --dim: #6b6b66; --accent: #2f6f4f; --warn: #8a5a00; --bad: #a33;
-    --code: #f4f4f2;
+    /*  Native controls - the checkbox, the select popup, ::backdrop - do not
+        read our tokens, they read this. Without it they stay light while
+        everything around them turns dark. */
+    color-scheme: light dark;
+    /*  llm-box has always been green, and Stellar ships an ember orange. This
+        is the one knob that matters: --ember, --link and every primary surface
+        derive from --accent, so the three lines below recolour all of them.
+        Same lightness and chroma relationships as the ember ramp, at the hue
+        of the #2f6f4f this page used before. */
+    --accent: oklch(49% 0.09 158);
+    --accent-soft: oklch(93% 0.035 158);
+    --accent-ink: oklch(36% 0.08 158);
+    /*  Not derived upstream: a hair darker than --accent so a near-white label
+        on it clears WCAG AA. Nothing on this page is a primary button yet, but
+        the token should not be left orange underneath. */
+    --btn-primary-bg: oklch(45% 0.09 158);
   }
+  /*  Mirrors what auto-dark.css does to the ember ramp - lighter accent, dark
+      soft, light ink - so the green survives the dark theme instead of sinking
+      into the background. */
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #17181a; --panel: #1e2022; --line: #2f3235; --ink: #e8e8e6;
-      --dim: #9a9a94; --accent: #7fc4a0; --warn: #d8a441; --bad: #e58a86;
-      --code: #14161a;
+    :root:not([data-theme]) {
+      --accent: oklch(76% 0.09 160);
+      --accent-soft: oklch(33% 0.055 158);
+      --accent-ink: oklch(84% 0.08 160);
     }
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  }
-  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { margin: 0; }
+  /*  'hidden' is this page's only visibility mechanism: tab switching and the
+      collapsed card bodies both set the property, never a class. A display
+      value from any stylesheet beats the UA rule and would unfold all four
+      tabs at once, so pin it. */
+  [hidden] { display: none !important; }
+
+  /* --- Chrome ------------------------------------------------------------ */
   header {
-    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
-    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
-    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: baseline; gap: var(--space-5); flex-wrap: wrap;
+    padding: var(--space-5) var(--space-7);
+    background: var(--paper-1); border-bottom: 1px solid var(--paper-rule);
+    position: sticky; top: 0; z-index: var(--z-sticky);
   }
-  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; }
-  header .ver { color: var(--dim); font-size: 12px; }
-  header .grow { flex: 1; }
-  nav { display: flex; gap: 4px; padding: 0 20px; border-bottom: 1px solid var(--line);
-        background: var(--panel); overflow-x: auto; }
-  nav button {
-    background: none; border: 0; border-bottom: 2px solid transparent; color: var(--dim);
-    padding: 9px 12px; font: inherit; cursor: pointer; white-space: nowrap;
-  }
-  nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
-  main { padding: 20px; max-width: 1100px; }
-  section[hidden] { display: none; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
-       color: var(--dim); margin: 26px 0 10px; font-weight: 600; }
-  h2:first-child { margin-top: 0; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-          margin-bottom: 10px; }
-  .row { display: flex; gap: 12px; align-items: center; padding: 10px 14px;
-         flex-wrap: wrap; }
-  .row + .body { border-top: 1px solid var(--line); padding: 12px 14px; }
-  .name { font-weight: 600; }
-  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px;
-         border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
-  .tag.on { color: var(--accent); border-color: currentColor; }
-  .tag.warn { color: var(--warn); border-color: currentColor; }
-  .tag.bad { color: var(--bad); border-color: currentColor; }
+  header h1 { font-family: var(--font-sans); font-size: var(--fs-lg); margin: 0;
+              font-weight: var(--weight-semibold); letter-spacing: var(--tracking-tight);
+              color: var(--ink-1); }
+  .ver { color: var(--ink-3); font-size: var(--fs-2xs); }
   .grow { flex: 1; }
-  .dim { color: var(--dim); }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  td, th { text-align: left; padding: 3px 12px 3px 0; vertical-align: top; }
-  th { color: var(--dim); font-weight: 500; white-space: nowrap; }
-  pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px;
-        padding: 10px 12px; overflow-x: auto; font-size: 12px; margin: 8px 0 0; }
-  button.act, .act {
-    font: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer;
-    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
-  }
-  button.act:hover { border-color: var(--accent); }
-  button.act:disabled { opacity: .45; cursor: not-allowed; }
-  input, select { font: inherit; padding: 4px 7px; border-radius: 6px;
-                  border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
-  input[type=number] { width: 8.5em; }
-  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden;
-         min-width: 120px; flex: 1; }
-  .bar > i { display: block; height: 100%; background: var(--accent); }
-  .bar > i.warn { background: var(--warn); }
-  .bar > i.bad { background: var(--bad); }
-  .note { border-left: 3px solid var(--warn); padding: 8px 12px; margin: 10px 0;
-          background: var(--panel); color: var(--dim); font-size: 13px; }
-  .note.bad { border-left-color: var(--bad); }
-  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
-           color: var(--ink); max-width: 640px; width: 92vw; padding: 0; }
-  dialog::backdrop { background: rgba(0,0,0,.45); }
-  dialog .row { border-bottom: 1px solid var(--line); }
-  dialog .foot { border-top: 1px solid var(--line); justify-content: flex-end; }
-  .fields { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px;
-            align-items: center; padding: 14px; }
-  .err { color: var(--bad); }
-  .ok { color: var(--accent); }
+  nav { display: flex; padding: var(--space-4) var(--space-7);
+        background: var(--paper-1); border-bottom: 1px solid var(--paper-rule);
+        overflow-x: auto; }
+  /*  Stellar's tab trigger reads data-state; this page has always written
+      aria-selected and the tab handler still does, so bridge the two here.
+      The sliding chip itself is .stl-tabs__list::before, positioned from
+      --stl-ind-w / --stl-ind-x, which moveTabChip() sets. */
+  nav button[aria-selected="true"] { color: var(--ink-1); }
+  main { padding: var(--space-7); max-width: 1100px; }
+  h2.eyebrow { margin: var(--space-8) 0 var(--space-3); }
+  h2.eyebrow:first-child { margin-top: 0; }
+
+  /* --- Rows, cards, meters ----------------------------------------------- */
+  /*  .stl-card brings its own padding; here the rows carry it, because a card
+      is a stack of full-width rows with rules between them. */
+  .card { padding: 0; margin-bottom: var(--space-3); }
+  .row { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap;
+         padding: var(--space-3) var(--space-5); }
+  .body { padding: var(--space-4) var(--space-5); }
+  .row + .body { border-top: 1px solid var(--paper-rule); }
+  .row--flush { padding: 0; gap: var(--space-3); }
+  .row--tight { padding: var(--space-1) 0; }
+  .row--top { padding: var(--space-4) 0 0; }
+  .stack { margin-top: var(--space-3); }
+  .name { font-weight: var(--weight-semibold); color: var(--ink-1); }
+  .dim { color: var(--ink-3); }
+  .err { color: var(--crimson-ink); }
+  .ok { color: var(--kelp-ink); }
+  .note { display: block; font-size: var(--fs-xs); margin: var(--space-3) 0; }
+  /*  .stl-progress is width:100%; in a row it has to share. */
+  .bar { min-width: 120px; flex: 1; }
+  .bar > i.warn { background: var(--citron); }
+  .bar > i.bad { background: var(--crimson); }
+
+  /* --- Tables: denser than .stl-table, on purpose ------------------------ */
+  table { border-collapse: collapse; width: 100%; font-size: var(--fs-xs); }
+  td, th { text-align: left; padding: var(--space-1) var(--space-4) var(--space-1) 0;
+           vertical-align: top; }
+  th { color: var(--ink-3); font-weight: var(--weight-medium); white-space: nowrap; }
+
+  /*  max-height matters: jobLog scrolls the log to the bottom on every poll,
+      which does nothing at all in a box that just keeps growing. */
+  pre { font-size: var(--fs-2xs); padding: var(--space-4) var(--space-5);
+        margin: var(--space-2) 0 0; max-height: 60vh; overflow: auto; }
+
+  /* --- Fields ------------------------------------------------------------ */
+  /*  .stl-input is width:100%, which is right in the two-column form grid and
+      wrong for a number four digits wide. */
+  input[type=number].stl-input { width: 8.5em; }
+  select.stl-input { padding-right: var(--space-3); }
+  .fields { display: grid; grid-template-columns: max-content 1fr;
+            gap: var(--space-3) var(--space-4); align-items: center;
+            padding: var(--space-5); }
+
+  /* --- Dialog ------------------------------------------------------------ */
+  /*  .stl-dialog carries the surface. A native <dialog> brings its own
+      backdrop, so .stl-dialog__overlay would only duplicate it - but the
+      backdrop is a UA element and needs the token spelled out. */
+  dialog { padding: 0; }
+  dialog::backdrop { background: color-mix(in oklch, var(--ink-1) 28%, transparent); }
+  dialog .row { border-bottom: 1px solid var(--paper-rule); }
+  dialog .foot { border-top: 1px solid var(--paper-rule); border-bottom: 0;
+                 justify-content: flex-end; }
+
+  /* --- The glossary ------------------------------------------------------ */
+  /*  Q4_K_M, -kvu, gfx1201: every one of them is the right word and none of
+      them explains itself. A dotted underline is the promise that hovering
+      will say more; see GLOSS in the script. */
+  abbr.gloss { text-decoration: none; border-bottom: 1px dotted var(--ink-4);
+               cursor: help; }
+  abbr.gloss:focus-visible { outline: 0; box-shadow: var(--ring-focus);
+                             border-radius: var(--r-1); }
+  /*  Inside a command line there is one of these every few characters, so the
+      underline goes and only the pointer promises anything. */
+  pre abbr.gloss { border-bottom: 0; }
+  pre abbr.gloss:hover { background: var(--paper-3); border-radius: var(--r-1); }
+  /*  .stl-tooltip is the design system's skin; the placement is ours, because
+      upstream leaves that to Radix. */
+  .stl-tooltip { position: fixed; max-width: 34em; white-space: normal;
+                 line-height: var(--lh-normal); pointer-events: none;
+                 z-index: var(--z-tooltip); }
 </style>
 
 <header>
@@ -104,15 +164,21 @@
   <span class="ver" id="ver"></span>
   <span class="grow"></span>
   <span id="who" class="ver"></span>
-  <button class="act" id="auth">sign in</button>
-  <button class="act" id="reload">refresh</button>
+  <button class="stl-btn" id="auth">sign in</button>
+  <button class="stl-btn" id="reload">refresh</button>
 </header>
 
+<!--  The buttons sit in their own .stl-tabs__list so <nav> can stay the
+      full-width bar it has always been while the list is the pill that holds
+      the sliding chip. "nav button" still matches, which the tab handler and
+      tests/dom-stub.js both rely on.  -->
 <nav>
-  <button data-tab="models" aria-selected="true">Models</button>
-  <button data-tab="roles">Roles</button>
-  <button data-tab="cards">Cards</button>
-  <button data-tab="system">System</button>
+  <div class="stl-tabs__list" id="tabs">
+    <button class="stl-tabs__trigger" data-tab="models" aria-selected="true">Models</button>
+    <button class="stl-tabs__trigger" data-tab="roles">Roles</button>
+    <button class="stl-tabs__trigger" data-tab="cards">Cards</button>
+    <button class="stl-tabs__trigger" data-tab="system">System</button>
+  </div>
 </nav>
 
 <main>
@@ -123,7 +189,7 @@
   <section id="tab-system" hidden></section>
 </main>
 
-<dialog id="dlg"></dialog>
+<dialog id="dlg" class="stl-dialog"></dialog>
 
 <script>
 "use strict";
@@ -147,6 +213,251 @@ const num = n => n === null || n === undefined ? "–" : n.toLocaleString("en-US
 
 let S = { models: [], gpus: [], versions: null, config: null, diff: null,
           roles: {}, jobs: [], session: { canWrite: false } };
+//  Which detail bodies are open. The 15-second refresh re-renders the whole
+//  tab, and the body used to be built with hidden:true every time - so an
+//  expanded card snapped shut on its own within 15 seconds, which looked like a
+//  stray event handler and was really a re-render throwing the state away.
+const OPEN = new Set();
+
+// ==========================================================================
+//  The glossary
+// ==========================================================================
+//  Q4_K_M, -kvu, gfx1201, q8_0, spillover: every one of them is the right word
+//  and not one of them explains itself. The prose that does explain them is
+//  already written - docs/FLAGS.md, docs/MODELS.md, docs/API.md and the
+//  docstrings in lib/llmreg.py - so this is that wording cut to one sentence
+//  and hung on hover, rather than added to the page, where it would drown the
+//  numbers the page exists to show.
+//
+//  A term that is not in here renders as plain text. No empty tooltip.
+const GLOSS = {
+  // --- the row labels in a model's details ---
+  "VRAM": "What this model needs on the card, weights plus KV cache plus 8 % "
+    + "for compute buffers - and per card, not as a sum: with an even tensor "
+    + "split a 30 GB model needs 15 GB on each of two cards.",
+  "Context": "How many tokens the model can hold at once, its working memory. "
+    + "More context, more VRAM.",
+  "Slots": "How many requests this model serves at the same time instead of "
+    + "queueing them. The context is the total either way, so slots cost no KV "
+    + "memory - only a little extra compute buffer.",
+  "KV cache": "Where the attention keys and values live. Quantising it roughly "
+    + "halves the memory the context costs, with no quality loss anyone has "
+    + "been able to measure. Worth it from about 64k context.",
+  "Token prediction": "Several tokens are guessed ahead and then verified in a "
+    + "single pass - more tokens per second at identical quality, because wrong "
+    + "guesses are discarded.",
+  "Thinking": "How long a reasoning model deliberates before it answers. The "
+    + "accepted values come from the model's chat template, not from llama.cpp.",
+  "Idle unload": "Seconds this model may sit idle before its VRAM is handed "
+    + "back. Never means it stays resident.",
+  "Group": "A routing group. llama-swap only evicts across group boundaries, so "
+    + "members of one group can stay loaded next to each other.",
+  "Came from": "Which Hugging Face repository these weights were fetched from, "
+    + "at which commit - recorded at download time, not guessed later.",
+  "Architecture": "The model family the GGUF header declares, and how many "
+    + "transformer layers it has.",
+  "Problems": "Something in this block does not add up. The text says what.",
+  // --- tags and short labels ---
+  "ctx": "Context: how many tokens fit in the model's working memory at once.",
+  "slots": "Requests served at the same time instead of queueing.",
+  "ttl": "Idle seconds before the model is unloaded and its VRAM handed back. "
+    + "0 means never.",
+  "chat": "An ordinary conversation model, on /v1/chat/completions.",
+  "embed": "Turns text into a vector, on /v1/embeddings. Without one a "
+    + "knowledge base finds nothing at all.",
+  "rerank": "Re-sorts search hits by real relevance, on /v1/rerank.",
+  "stt": "Speech to text - whisper.cpp, on /v1/audio/transcriptions. It is "
+    + "loaded and unloaded like any other model.",
+  "ready": "Loaded in VRAM and answering right now.",
+  "unloaded": "Not in VRAM. The next request loads it, which takes as long as "
+    + "reading the file.",
+  "loading": "On its way into VRAM.",
+  "unknown": "llama-swap did not say - usually because it is not running.",
+  "mtp": "Multi-token prediction: uses the prediction heads built into the "
+    + "model. Only some models have them (Qwen3.x, DeepSeek V3/R1 and kin).",
+  "ngram": "Guesses the next tokens from the text so far. No draft model "
+    + "needed, works with any model, and strongest on code and repetitive text.",
+  "warm": "Takes the first target that is already running, and cold-starts the "
+    + "first one only if none are. Saves a 30 GB load for a one-line question.",
+  "pin": "Always the first target. The remaining entries are documentation.",
+  "spillover": "Fills the first target up to a set number of concurrent "
+    + "requests, then starts the next one. With one model per card that is "
+    + "automatically card 0 and then card 1.",
+  "swap": "Whether members of this group replace each other in VRAM.",
+  "exclusive": "Whether starting a member unloads models from other groups.",
+  "persistent": "Whether other groups are allowed to unload these. This is the "
+    + "flag that actually protects a pinned model.",
+  "gfx": "The card's ISA target, what the build was compiled for.",
+  "checksums verified": "The commit hash was checked against the Hugging Face "
+    + "API. That is proof, not a guess.",
+  "up to date": "Same commit as the newest release - which is not the same as "
+    + "the same tag name: whisper.cpp ships one commit under two of them.",
+  "running": "Still going. The log shows how far it got.",
+  "done": "Finished, exit code 0.",
+  "failed": "Exited non-zero. The log says why; nothing was switched over.",
+  // --- flags, as they appear inside a command line ---
+  "-ngl": "How many layers go on the GPU. 99 means all of them.",
+  "--n-gpu-layers": "How many layers go on the GPU. 99 means all of them.",
+  "-c": "Context size, the token memory. Larger means more VRAM.",
+  "--ctx-size": "Context size, the token memory. Larger means more VRAM.",
+  "-fa": "Flash attention - faster and leaner. Leave it on.",
+  "--flash-attn": "Flash attention - faster and leaner. Leave it on.",
+  "-ctk": "Quantise the KV cache keys: halves what the context costs in memory, "
+    + "with no measurable quality loss.",
+  "-ctv": "Quantise the KV cache values, the counterpart to -ctk.",
+  "-np": "Slots: how many requests are served at the same time.",
+  "--parallel": "Slots: how many requests are served at the same time.",
+  "-kvu": "Makes the context one shared pool, so a lone request may use all of "
+    + "it. Without it every slot gets a hard context-divided-by-slots share.",
+  "--kv-unified": "Makes the context one shared pool, so a lone request may use "
+    + "all of it. Without it every slot gets a hard share.",
+  "-ts": "Tensor split: how the model is spread over the cards. Generated - "
+    + "llm gpu sync rewrites it to match the cards actually present.",
+  "--tensor-split": "Tensor split: how the model is spread over the cards, "
+    + "rewritten by llm gpu sync to match the cards actually present.",
+  "-sm": "Split mode. 'none' keeps the model on one card and disables the "
+    + "macro's tensor split.",
+  "--split-mode": "Split mode. 'none' keeps the model on one card.",
+  "-mg": "The main card, the one that holds the shared buffers.",
+  "--main-gpu": "The main card, the one that holds the shared buffers.",
+  "--device": "Use only this card. ROCmN counts the discrete cards, so ROCm0 is "
+    + "the first one llm gpu list shows.",
+  "-cram": "How much host RAM may hold prompt caches, so a returning agent does "
+    + "not re-read its whole prompt. Costs no VRAM.",
+  "--cache-ram": "How much host RAM may hold prompt caches. Costs no VRAM.",
+  "--jinja": "Use the model's real chat template, which is what makes tool "
+    + "calling work. Essential for agents and editors.",
+  "--reasoning-effort": "The thinking depth for clients that send none of their "
+    + "own - which is most of them. A request that sends one still wins.",
+  "--no-reasoning-preserve": "Drop earlier deliberation from the conversation "
+    + "instead of re-feeding the model its own thinking from every past turn.",
+  "--no-webui": "Turn off llama-server's own mini interface. Open WebUI is the "
+    + "one this stack uses.",
+  "--embedding": "Serve /v1/embeddings instead of chat.",
+  "--reranking": "Serve /v1/rerank instead of chat.",
+  "--mmproj": "The vision projector, for models that can look at images.",
+  "--spec-type": "Which kind of token prediction to use.",
+  "-b": "Logical batch size: how many tokens are prepared per pass.",
+  "-ub": "Physical batch size: how many of them are computed at once.",
+  "-m": "The weights file this entry loads.",
+  "--host": "Which address llama-server listens on.",
+  "--port": "Which port llama-server listens on. llama-swap hands it out.",
+  "--request-path": "The path this entry answers on, so one port can serve "
+    + "transcription next to chat.",
+};
+//  Aliases: the same explanation under a second spelling the page happens to
+//  print. Kept out of GLOSS so the table above stays one term per line.
+GLOSS["slots*"] = GLOSS["-kvu"];
+GLOSS["q8_0"] = GLOSS["-ctk"];
+GLOSS["q4_0"] = GLOSS["-ctk"];
+GLOSS["f16 (unquantised)"] = "The KV cache is not quantised. Quantising it would "
+  + "roughly halve what the context costs in memory.";
+GLOSS["context"] = GLOSS["Context"];
+GLOSS["ctv"] = GLOSS["-ctv"];
+GLOSS["ctk"] = GLOSS["-ctk"];
+
+//  Quants are combinatorial, so a table would either be enormous or wrong. The
+//  sizing judgement is docs/MODELS.md: Q4_K_M is the default and almost always
+//  fits, Q5_K_M when there is VRAM to spare, Q6_K and Q8_0 are near lossless.
+const QUANT_SIZE = { XS: "the smallest of its family", S: "the small variant",
+                     M: "the middle variant, the usual choice",
+                     L: "the large variant", XL: "the largest of its family" };
+function quantTip(q) {
+  const m = /^(UD-|i|I)?(?:Q(\d+)|(BF16|F16|F32))(_K)?(?:_(XS|S|M|L|XL))?$/.exec(q || "");
+  if (!m) return null;
+  if (m[3]) return m[3].toUpperCase() === "F32"
+    ? "Unquantised weights, four bytes each. Twice the file of BF16 for no gain "
+      + "anyone can hear."
+    : "Unquantised weights, two bytes each - the full-quality reference, and "
+      + "roughly four times the size of a 4-bit quant.";
+  const bits = Number(m[2]);
+  const parts = ["Weights packed to about " + bits + " bits each"];
+  parts.push(bits <= 3 ? "which starts to show" : bits === 4
+    ? "very good quality and the size that almost always fits - the default here"
+    : bits === 5 ? "a step better than 4-bit, worth it when there is VRAM to spare"
+    : "near lossless, for small models where maximum quality is affordable");
+  let tail = "";
+  if (m[4]) tail += " K-quant: the layers that matter carry more bits than the rest.";
+  if (m[5] && QUANT_SIZE[m[5]]) tail += " " + m[5] + " is " + QUANT_SIZE[m[5]] + ".";
+  if (m[1] === "UD-") tail += " UD is unsloth's dynamic mix, quantised per layer.";
+  if (m[1] && m[1] !== "UD-") tail += " The i prefix means an importance matrix "
+    + "was used to decide what to keep.";
+  return parts.join(", ") + "." + tail;
+}
+
+// ==========================================================================
+//  Tooltips
+// ==========================================================================
+//  .stl-tooltip is the design system's skin; upstream leaves the placement to
+//  Radix, so that part is ours. One node, moved around.
+const TIP = el("div", { class: "stl-tooltip", role: "tooltip", hidden: true });
+
+//  <abbr> is the honest element for an abbreviation, and tabindex makes the
+//  explanation reachable without a pointer. Flags inside a <pre> get the
+//  tooltip but no tabindex - thirty extra tab stops in one command line would
+//  be worse than the missing focus (docs/UI.md says so out loud).
+function gloss(term, tip = null, label = null) {
+  const text = label === null ? term : label;
+  const t = tip || GLOSS[term];
+  if (!t) return text;
+  return el("abbr", { class: "gloss", "data-tip": t, tabindex: "0" }, text);
+}
+function glossFlat(term, tip = null, label = null) {
+  const text = label === null ? term : label;
+  const t = tip || GLOSS[term];
+  return t ? el("abbr", { class: "gloss", "data-tip": t }, text) : text;
+}
+
+//  A command line, with every flag it knows explained. This is the only place
+//  the flags are visible at all - a model's cmd, a macro body, a dry-run diff -
+//  so it is also the only place they can be explained.
+function glossCmd(str) {
+  const out = [];
+  for (const piece of String(str || "").split(/(\s+)/)) {
+    //  Split off a '=' so '--flag=value' still finds '--flag'.
+    const flag = /^(--?[A-Za-z][\w-]*)(=.*)?$/.exec(piece);
+    if (flag && GLOSS[flag[1]]) {
+      out.push(glossFlat(flag[1]));
+      if (flag[2]) out.push(flag[2]);
+    } else out.push(piece);
+  }
+  return out;
+}
+
+function tipInit() {
+  const body = document.body;
+  if (!body || !body.append || !document.addEventListener) return;   // the DOM stub
+  body.append(TIP);
+  const hide = () => { TIP.hidden = true; };
+  const show = e => {
+    const t = e.target && e.target.closest && e.target.closest("[data-tip]");
+    if (!t) return hide();
+    TIP.textContent = t.getAttribute("data-tip");
+    TIP.hidden = false;
+    const r = t.getBoundingClientRect(), box = TIP.getBoundingClientRect();
+    const pad = 8;
+    //  Above by preference, below when there is no room up there, and never
+    //  past either edge.
+    const top = r.top - box.height - pad;
+    TIP.style.top = (top < pad ? r.bottom + pad : top) + "px";
+    TIP.style.left = Math.max(pad, Math.min(r.left,
+      (window.innerWidth || 0) - box.width - pad)) + "px";
+  };
+  document.addEventListener("pointerover", show);
+  document.addEventListener("pointerout", hide);
+  document.addEventListener("focusin", show);
+  document.addEventListener("focusout", hide);
+  document.addEventListener("keydown", e => { if (e.key === "Escape") hide(); });
+  //  Touch: pointerover does not reliably fire, and a tap has to be able to
+  //  close it again.
+  document.addEventListener("click", e => {
+    const t = e.target && e.target.closest && e.target.closest("[data-tip]");
+    if (!t) hide(); else if (TIP.hidden) show(e); else hide();
+  });
+  //  A tooltip pinned to a rectangle that has moved is worse than none.
+  window.addEventListener("scroll", hide, true);
+  window.addEventListener("resize", hide);
+}
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { credentials: "same-origin", ...opts });
@@ -157,8 +468,12 @@ async function api(path, opts = {}) {
   return body;
 }
 
+//  This page has always called the loud one 'bad'; Stellar calls it 'danger'.
+//  One map rather than renaming every call site.
+const BANNER = { bad: "danger", warn: "warn", ok: "success", info: "info" };
 function banner(msg, kind = "bad") {
-  $("#banner").replaceChildren(msg ? el("div", { class: "note " + kind }, msg) : "");
+  $("#banner").replaceChildren(msg ? el("div", {
+    class: "stl-banner note stl-banner--" + (BANNER[kind] || "info") }, msg) : "");
 }
 
 async function load() {
@@ -195,14 +510,14 @@ $("#auth").onclick = async () => {
     el("div", { class: "row" }, el("b", { text: "Sign in" })),
     el("div", { class: "fields" },
       el("label", { text: "Token", for: "tok" }),
-      el("input", { id: "tok", type: "password", placeholder: "contents of config/api-token",
+      el("input", { class: "stl-input", id: "tok", type: "password", placeholder: "contents of config/api-token",
                     autocomplete: "off" }),
       el("span", {}), el("span", { class: "dim",
         text: "On the server: llm api token" })),
     el("div", { class: "row foot" },
       el("span", { class: "err grow", id: "authErr" }),
-      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
-      el("button", { class: "act", onclick: submit }, "sign in")));
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", onclick: submit }, "sign in")));
   d.showModal();
   $("#tok").focus();
   $("#tok").onkeydown = e => { if (e.key === "Enter") submit(); };
@@ -217,11 +532,23 @@ $("#auth").onclick = async () => {
 };
 $("#reload").onclick = () => load();
 
+//  .stl-tabs__list::before is the sliding chip behind the active tab, and it
+//  reads its geometry from these two variables - the one place the look needs
+//  JavaScript rather than a class. Guarded because tests/dom-stub.js has no
+//  layout to measure.
+function moveTabChip(b) {
+  const list = $("#tabs");
+  if (!list || !list.style || b.offsetWidth === undefined) return;
+  list.style.setProperty("--stl-ind-w", b.offsetWidth + "px");
+  list.style.setProperty("--stl-ind-x", b.offsetLeft - list.clientLeft + "px");
+}
+
 for (const b of document.querySelectorAll("nav button")) b.onclick = () => {
   for (const o of document.querySelectorAll("nav button"))
     o.setAttribute("aria-selected", String(o === b));
   for (const s of document.querySelectorAll("main section"))
     s.hidden = s.id !== "tab-" + b.dataset.tab;
+  moveTabChip(b);
 };
 
 // --------------------------------------------------------------------------
@@ -242,14 +569,14 @@ async function confirmWrite(title, path, body, method = "PATCH") {
     : preview ? JSON.stringify(preview.after || preview, null, 2) : "";
   d.replaceChildren(
     el("div", { class: "row" }, el("b", { text: title })),
-    el("div", { class: "body" },
-      error ? el("div", { class: "note bad" }, error) : el("pre", { text: diff }),
+    el("div", { class: "stl-card__body body" },
+      error ? el("div", { class: "stl-banner stl-banner--danger note" }, error) : el("pre", {}, glossCmd(diff)),
       preview && preview.fit && preview.fit.ok === false
-        ? el("div", { class: "note" }, preview.fit.reason) : null),
+        ? el("div", { class: "stl-banner stl-banner--info note" }, preview.fit.reason) : null),
     el("div", { class: "row foot" },
       el("span", { class: "err grow", id: "wErr" }),
-      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
-      el("button", { class: "act", disabled: !!error, onclick: apply }, "apply")));
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", disabled: !!error, onclick: apply }, "apply")));
   d.showModal();
   async function apply() {
     try {
@@ -257,6 +584,30 @@ async function confirmWrite(title, path, body, method = "PATCH") {
                         body: JSON.stringify(body) });
       d.close(); load();
     } catch (e) { $("#wErr").textContent = e.message; }
+  }
+}
+
+// --------------------------------------------------------------------------
+//  A write with consequences but nothing to preview: updates and rollbacks.
+//  confirmWrite does not fit - it needs a ?dryRun endpoint, and an update has
+//  no dry run, only a smoke test on the way. So: spell out what will happen,
+//  then start the job and hand the same dialog over to its log.
+// --------------------------------------------------------------------------
+function confirmAct(title, prose, path, label) {
+  const d = $("#dlg");
+  d.replaceChildren(
+    el("div", { class: "row" }, el("b", { text: title })),
+    el("div", { class: "stl-card__body body" }, el("div", { class: "stl-banner stl-banner--info note" }, prose)),
+    el("div", { class: "row foot" },
+      el("span", { class: "err grow", id: "aErr" }),
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", onclick: go }, label)));
+  d.showModal();
+  async function go() {
+    try {
+      const r = await api(path, { method: "POST" });
+      jobLog(r.jobId, title);
+    } catch (e) { $("#aErr").textContent = e.message; }
   }
 }
 
@@ -279,7 +630,7 @@ function models() {
   const list = S.models.filter(m => m.kind !== "role");
   const cardUsed = {};
   for (const c of S.gpus) cardUsed[c.index] = c;
-  const out = [el("h2", { text: "Models" })];
+  const out = [el("h2", { class: "eyebrow", text: "Models" })];
   for (const m of list) {
     const r = m.runtime || {}, g = r.gpu || {}, v = m.vram || {};
     const loaded = m.state === "ready" || m.state === "loading";
@@ -288,50 +639,67 @@ function models() {
     //  A model pinned to a card but in no group is evicted by anything else -
     //  the same warning llm ls prints with a bang.
     const ungrouped = g.device !== null && g.device !== undefined && !g.group;
-    out.push(el("div", { class: "card" },
+    out.push(el("div", { class: "stl-card card" },
       el("div", { class: "row" },
         el("span", { class: "name", text: m.id }),
-        el("span", { class: "tag" + (loaded ? " on" : ""), text: m.state }),
-        el("span", { class: "tag", text: m.role }),
-        el("span", { class: "tag" + (ungrouped ? " warn" : ""),
-                     title: ungrouped ? "pinned but in no group: anything else evicts it" : "",
-                     text: card + (ungrouped ? " !" : "") }),
-        r.contextWindow ? el("span", { class: "tag", text: num(r.contextWindow) + " ctx" }) : null,
-        r.parallel ? el("span", { class: "tag",
-          title: "requests served at the same time" + (r.kvUnified ? "; one shared KV pool" : ""),
-          text: r.parallel + " slots" + (r.kvUnified ? "*" : "") }) : null,
+        el("span", { class: "stl-tag" + (loaded ? " stl-tag--kelp" : "") }, gloss(m.state)),
+        el("span", { class: "stl-tag" }, gloss(m.role)),
+        el("span", { class: "stl-tag" + (ungrouped ? " stl-tag--citron" : "") },
+          gloss(card, ungrouped
+            ? "Pinned to this card but in no group, so anything else that starts "
+              + "will evict it - the bang llm ls prints for the same reason."
+            : "Which card this model is pinned to. The numbers are the logical "
+              + "ones, the N in --device ROCmN.",
+            card + (ungrouped ? " !" : ""))),
+        r.contextWindow ? el("span", { class: "stl-tag" },
+          gloss("ctx", null, num(r.contextWindow) + " ctx")) : null,
+        r.parallel ? el("span", { class: "stl-tag" },
+          gloss(r.kvUnified ? "slots*" : "slots", null,
+                r.parallel + " slots" + (r.kvUnified ? "*" : ""))) : null,
         el("span", { class: "grow" }),
-        el("button", { class: "act", onclick: e => {
+        el("button", { class: "stl-btn", onclick: e => {
+          //  Toggled in place rather than by re-rendering, so the button keeps
+          //  focus - but recorded, so the next refresh agrees.
           const b = e.target.closest(".card").querySelector(".body");
           b.hidden = !b.hidden;
+          if (b.hidden) OPEN.delete(m.id); else OPEN.add(m.id);
         } }, "details"),
-        w ? el("button", { class: "act", onclick: () => loaded
+        w ? el("button", { class: "stl-btn", onclick: () => loaded
             ? act("/api/models/" + encodeURIComponent(m.id) + "/unload")
             : act("/api/models/" + encodeURIComponent(m.id) + "/load") },
           loaded ? "unload" : "load") : null),
-      el("div", { class: "body", hidden: true }, modelBody(m, cardUsed, w))));
+      el("div", { class: "stl-card__body body", hidden: !OPEN.has(m.id) },
+        modelBody(m, cardUsed, w))));
   }
   if (w) out.push(el("div", { class: "row" },
-    el("button", { class: "act", onclick: addModel }, "+ fetch a model from Hugging Face")));
-  if (S.jobs && S.jobs.length) {
-    out.push(el("h2", { text: "Downloads" }));
-    for (const j of S.jobs) out.push(el("div", { class: "card" },
-      el("div", { class: "row" },
-        el("span", { class: "name", text: (j.argv || []).slice(1).join(" ") || j.kind }),
-        el("span", { class: "tag" + (j.state === "failed" ? " bad"
-          : j.state === "done" ? " on" : " warn"), text: j.state }),
-        el("span", { class: "grow" }),
-        el("button", { class: "act", onclick: () => jobLog(j.id) }, "log"))));
-  }
+    el("button", { class: "stl-btn", onclick: addModel }, "+ fetch a model from Hugging Face")));
+  //  Downloads only: updates run through the same job runner and are listed on
+  //  the System tab, next to the versions they change.
+  const downloads = (S.jobs || []).filter(j => j.kind === "add");
+  if (downloads.length) out.push(el("h2", { class: "eyebrow", text: "Downloads" }), ...jobCards(downloads));
   $("#tab-models").replaceChildren(...out);
+}
+
+function jobCards(list) {
+  return list.map(j => el("div", { class: "stl-card card" },
+    el("div", { class: "row" },
+      el("span", { class: "name", text: (j.argv || []).slice(1).join(" ") || j.kind }),
+      el("span", { class: "stl-tag " + (j.state === "failed" ? "stl-tag--crimson"
+        : j.state === "done" ? "stl-tag--kelp" : "stl-tag--citron") }, gloss(j.state)),
+      el("span", { class: "grow" }),
+      el("button", { class: "stl-btn", onclick: () => jobLog(j.id,
+        j.kind === "add" ? "Download log" : "Update log") }, "log"))));
 }
 
 function modelBody(m, cardUsed, w) {
   const r = m.runtime || {}, v = m.vram || {}, src = m.source || {}, a = m.architecture || {};
   const g = r.gpu || {};
   const rows = [];
+  //  Every row label goes through here, so glossing it here glosses all of
+  //  them - VRAM, Context, Slots, KV cache, Token prediction, Thinking, Idle
+  //  unload, Group, Came from, Architecture, Problems.
   const add = (k, val) => val !== null && val !== undefined && val !== "" &&
-    rows.push(el("tr", {}, el("th", { text: k }), el("td", {}, val)));
+    rows.push(el("tr", {}, el("th", {}, gloss(k)), el("td", {}, val)));
 
   //  Estimated against measured. The registry knows what a model needs and
   //  /api/gpus knows what is free; nothing put the two side by side, and
@@ -347,10 +715,11 @@ function modelBody(m, cardUsed, w) {
     const tight = over.reduce((a, c) =>
       !a || (c.vramFreeBytes || 0) < (a.vramFreeBytes || 0) ? c : a, null);
     const frac = tight && tight.vramTotalBytes ? share / tight.vramTotalBytes : 0;
-    add("VRAM", el("div", { class: "row", style: "padding:0;gap:10px" },
+    add("VRAM", el("div", { class: "row row--flush" },
       el("span", { class: "mono", text: fmt(v.estimatedBytes) + " estimated" }),
-      el("span", { class: "bar" }, el("i", {
-        class: frac > .95 ? "bad" : frac > .85 ? "warn" : "",
+      el("span", { class: "stl-progress bar" }, el("i", {
+        class: "stl-progress__indicator "
+          + (frac > .95 ? "bad" : frac > .85 ? "warn" : ""),
         style: "width:" + Math.min(100, frac * 100).toFixed(1) + "%" })),
       el("span", { class: "dim mono", text: pinned
         ? "of " + fmt(pinned.vramTotalBytes, 0) + " on card " + pinned.index
@@ -369,8 +738,8 @@ function modelBody(m, cardUsed, w) {
       ? " — the context above is one shared pool, so a single request may use all of it"
       : " — each slot gets a hard " + num(Math.floor(r.contextWindow / r.parallel)) + " share")
       : null);
-  add("KV cache", r.kvCacheQuant || "f16 (unquantised)");
-  add("Token prediction", r.specDecoding === "none" ? null : r.specDecoding);
+  add("KV cache", gloss(r.kvCacheQuant || "f16 (unquantised)"));
+  add("Token prediction", r.specDecoding === "none" ? null : gloss(r.specDecoding));
   //  Skip it for models that do not think: "no fixed set of values" is noise
   //  next to a model whose capabilities say reasoning: false.
   if (r.reasoningEffort && ((m.capabilities || {}).reasoning
@@ -391,19 +760,21 @@ function modelBody(m, cardUsed, w) {
   if (src.repo) add("Came from", el("span", {}, el("a", {
     href: src.url || ("https://huggingface.co/" + src.repo), target: "_blank",
     rel: "noreferrer noopener" }, src.repo),
-    src.quant ? " · " + src.quant : "",
+    src.quant ? el("span", {}, " · ", gloss(src.quant, quantTip(src.quant))) : "",
     src.revision ? el("span", { class: "dim mono", text: " · " + src.revision.slice(0, 12) }) : null,
-    src.verified ? el("span", { class: "tag on", text: "checksums verified" }) : null));
+    src.verified ? el("span", { class: "stl-tag stl-tag--kelp" },
+      gloss("checksums verified")) : null));
   else add("Came from", el("span", { class: "dim",
     text: "unknown — on the server: llm meta backfill" }));
   add("Architecture", a.arch ? a.arch + (a.layers ? " · " + a.layers + " layers" : "") : null);
   if (m.issues && m.issues.length) add("Problems",
     el("span", { class: "err", text: m.issues.join(" · ") }));
 
-  const body = [el("table", {}, el("tbody", {}, rows)), el("pre", { text: r.cmd || "" })];
+  const body = [el("table", {}, el("tbody", {}, rows)),
+                el("pre", {}, glossCmd(r.cmd || ""))];
   if (w) {
     const cards = S.gpus.map(c => String(c.index));
-    body.push(el("div", { class: "row", style: "padding:12px 0 0" },
+    body.push(el("div", { class: "row row--top" },
       el("span", { class: "dim", text: "change:" }),
       pick("card", ["both", ...cards], g.mode === "both" ? "both" : String(g.device),
         val => confirmWrite("Move " + m.id, "/api/models/" + encodeURIComponent(m.id),
@@ -415,20 +786,21 @@ function modelBody(m, cardUsed, w) {
       numBox("ttl", m.ttl, val => confirmWrite("Idle unload of " + m.id,
         "/api/models/" + encodeURIComponent(m.id), { ttl: val })),
       el("span", { class: "grow" }),
-      el("button", { class: "act", onclick: () => removeModel(m) }, "remove")));
+      el("button", { class: "stl-btn", onclick: () => removeModel(m) }, "remove")));
   }
   return body;
 }
 
 function pick(label, opts, cur, onpick) {
-  const s = el("select", { onchange: e => onpick(e.target.value) },
+  const s = el("select", { class: "stl-input", onchange: e => onpick(e.target.value) },
     ...opts.map(o => el("option", { value: o, selected: o === cur }, o)));
   return el("label", { class: "dim" }, label + " ", s);
 }
 function numBox(label, cur, onset) {
-  const i = el("input", { type: "number", min: "0", value: cur ?? "" });
+  const i = el("input", { class: "stl-input", type: "number", min: "0", value: cur ?? "" });
   i.onkeydown = e => { if (e.key === "Enter" && i.value !== "") onset(Number(i.value)); };
-  return el("label", { class: "dim", title: "type a value and press Enter" }, label + " ", i);
+  return el("label", { class: "dim", "data-tip": "Type a value and press Enter. "
+    + "The change is previewed before anything is written." }, gloss(label), " ", i);
 }
 
 function removeModel(m) {
@@ -436,16 +808,16 @@ function removeModel(m) {
   const chk = el("input", { type: "checkbox", id: "delf" });
   d.replaceChildren(
     el("div", { class: "row" }, el("b", { text: "Remove " + m.id })),
-    el("div", { class: "body" },
+    el("div", { class: "stl-card__body body" },
       el("div", {}, "The block goes out of the configuration. Any role pointing at "
         + "this model loses the target, and a role left with none is removed too."),
-      el("label", { class: "row", style: "padding:10px 0 0" }, chk,
+      el("label", { class: "row row--top" }, chk,
         " also delete the files on disk"
         + (m.vram && m.vram.weightsBytes ? " (" + fmt(m.vram.weightsBytes, 0) + ")" : ""))),
     el("div", { class: "row foot" },
       el("span", { class: "err grow", id: "rmErr" }),
-      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
-      el("button", { class: "act", onclick: async () => {
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", onclick: async () => {
         try {
           await api("/api/models/" + encodeURIComponent(m.id) + "?files=" + chk.checked,
                     { method: "DELETE" });
@@ -462,18 +834,18 @@ function addModel() {
   d.replaceChildren(
     el("div", { class: "row" }, el("b", { text: "Fetch a model from Hugging Face" })),
     el("div", { class: "fields" },
-      ...field("repo", el("input", { placeholder: "unsloth/Qwen3-8B-GGUF" })),
-      ...field("quant", el("input", { value: "Q4_K_M" })),
-      ...field("context", el("input", { type: "number", value: "8192" })),
-      ...field("card", el("select", {}, el("option", { value: "both" }, "all cards"),
+      ...field("repo", el("input", { class: "stl-input", placeholder: "unsloth/Qwen3-8B-GGUF" })),
+      ...field("quant", el("input", { class: "stl-input", value: "Q4_K_M" })),
+      ...field("context", el("input", { class: "stl-input", type: "number", value: "8192" })),
+      ...field("card", el("select", { class: "stl-input" }, el("option", { value: "both" }, "all cards"),
         ...S.gpus.map(c => el("option", { value: String(c.index) }, "card " + c.index)))),
-      ...field("slots", el("input", { type: "number", placeholder: "4 (llama.cpp default)" })),
+      ...field("slots", el("input", { class: "stl-input", type: "number", placeholder: "4 (llama.cpp default)" })),
       el("span", {}), el("span", { class: "dim",
         text: "Nothing downloads until you press fetch. Progress appears under Downloads." })),
     el("div", { class: "row foot" },
       el("span", { class: "err grow", id: "addErr" }),
-      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
-      el("button", { class: "act", onclick: async () => {
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", onclick: async () => {
         const body = { repo: f.repo.value.trim(), quant: f.quant.value.trim() || "Q4_K_M",
                        contextWindow: Number(f.context.value) || 8192 };
         if (f.card.value !== "both") body.gpu = Number(f.card.value);
@@ -487,14 +859,15 @@ function addModel() {
   d.showModal();
 }
 
-async function jobLog(id) {
+//  confirmAct hands over an open dialog, so showModal() would throw here.
+async function jobLog(id, title = "Download log") {
   const d = $("#dlg");
   const pre = el("pre", { text: "…" });
-  d.replaceChildren(el("div", { class: "row" }, el("b", { text: "Download log" })),
-    el("div", { class: "body" }, pre),
-    el("div", { class: "row foot" }, el("button", { class: "act",
+  d.replaceChildren(el("div", { class: "row" }, el("b", { text: title })),
+    el("div", { class: "stl-card__body body" }, pre),
+    el("div", { class: "row foot" }, el("button", { class: "stl-btn",
       onclick: () => { clearInterval(t); d.close(); load(); } }, "close")));
-  d.showModal();
+  if (!d.open) d.showModal();
   const tick = async () => {
     try {
       const j = await api("/api/jobs/" + encodeURIComponent(id));
@@ -512,14 +885,14 @@ async function jobLog(id) {
 function roles() {
   const w = S.session.canWrite;
   const byId = {}; for (const m of S.models) byId[m.id] = m;
-  const out = [el("h2", { text: "Roles" }),
-    el("div", { class: "note" },
+  const out = [el("h2", { class: "eyebrow", text: "Roles" }),
+    el("div", { class: "stl-banner stl-banner--info note" },
       "A role is one name in front of several models; llama-swap picks a target per "
       + "request. Its context is the SMALLEST of its targets and its capabilities are the "
       + "intersection — pair a 131k model with an 8k one and the role is 8k, because a "
       + "client that trusted the larger number would fail on every second request.")];
   const names = Object.keys(S.roles || {}).sort();
-  if (!names.length) out.push(el("div", { class: "card" },
+  if (!names.length) out.push(el("div", { class: "stl-card card" },
     el("div", { class: "row dim" }, "No roles yet.")));
   for (const n of names) {
     const r = S.roles[n], cat = byId[n] || {}, rt = cat.runtime || {};
@@ -527,23 +900,28 @@ function roles() {
     const weakest = r.targets.map(t => (byId[t] || {}).runtime)
       .filter(Boolean).map(x => x.contextWindow).filter(Boolean);
     const shrunk = weakest.length > 1 && Math.min(...weakest) < Math.max(...weakest);
-    out.push(el("div", { class: "card" },
+    out.push(el("div", { class: "stl-card card" },
       el("div", { class: "row" },
         el("span", { class: "name", text: n }),
-        el("span", { class: "tag", text: r.strategy
-          + (r.strategy === "spillover" ? "/" + ((r.settings || {}).spillover || 1) : "") }),
-        eff ? el("span", { class: "tag" + (shrunk ? " warn" : ""),
-          title: shrunk ? "smaller than its largest target" : "",
-          text: num(eff) + " ctx" }) : null,
+        el("span", { class: "stl-tag" }, gloss(r.strategy, null, r.strategy
+          + (r.strategy === "spillover" ? "/" + ((r.settings || {}).spillover || 1) : ""))),
+        eff ? el("span", { class: "stl-tag" + (shrunk ? " stl-tag--citron" : "") },
+          gloss("ctx", shrunk
+            ? "A role never promises more than its weakest target, so this is "
+              + "smaller than its largest one: the context is the minimum over "
+              + "the targets and the capabilities are the intersection."
+            : null, num(eff) + " ctx")) : null,
         (cat.activeTargets || []).length
-          ? el("span", { class: "tag on", text: cat.activeTargets.length + "/"
-              + r.targets.length + " loaded" })
-          : el("span", { class: "tag", text: "0/" + r.targets.length + " loaded" }),
+          ? el("span", { class: "stl-tag stl-tag--kelp" },
+              gloss("loaded", "How many of this role's targets are in VRAM right "
+                + "now. A warm role prefers one of those over a cold start.",
+                cat.activeTargets.length + "/" + r.targets.length + " loaded"))
+          : el("span", { class: "stl-tag", text: "0/" + r.targets.length + " loaded" }),
         el("span", { class: "grow" }),
-        w ? el("button", { class: "act", onclick: () => roleForm(n, r) }, "edit") : null,
-        w ? el("button", { class: "act", onclick: () => act(
+        w ? el("button", { class: "stl-btn", onclick: () => roleForm(n, r) }, "edit") : null,
+        w ? el("button", { class: "stl-btn", onclick: () => act(
           "/api/roles/" + encodeURIComponent(n), "DELETE") }, "delete") : null),
-      el("div", { class: "body" },
+      el("div", { class: "stl-card__body body" },
         el("table", {}, el("tbody", {},
           ...r.targets.map((t, i) => el("tr", {},
             el("th", { text: i === 0 ? "targets" : "" }),
@@ -555,23 +933,23 @@ function roles() {
             el("td", { text: r.description })) : null)))));
   }
   if (w) out.push(el("div", { class: "row" },
-    el("button", { class: "act", onclick: () => roleForm("", null) }, "+ new role")));
+    el("button", { class: "stl-btn", onclick: () => roleForm("", null) }, "+ new role")));
   $("#tab-roles").replaceChildren(...out);
 }
 
 function roleForm(name, cur) {
   const d = $("#dlg");
   const chat = S.models.filter(m => m.kind !== "role" && m.role === "chat").map(m => m.id);
-  const nameI = el("input", { value: name, placeholder: "coder" });
-  const stratI = el("select", {}, ...["warm", "pin", "spillover"].map(s =>
+  const nameI = el("input", { class: "stl-input", value: name, placeholder: "coder" });
+  const stratI = el("select", { class: "stl-input" }, ...["warm", "pin", "spillover"].map(s =>
     el("option", { value: s, selected: cur && cur.strategy === s }, s)));
-  const spillI = el("input", { type: "number", min: "1",
+  const spillI = el("input", { class: "stl-input", type: "number", min: "1",
     value: (cur && cur.settings && cur.settings.spillover) || 2 });
-  const descI = el("input", { value: (cur && cur.description) || "" });
+  const descI = el("input", { class: "stl-input", value: (cur && cur.description) || "" });
   const boxes = chat.map(id => {
     const c = el("input", { type: "checkbox", value: id,
       checked: cur && cur.targets.includes(id) });
-    return el("label", { class: "row", style: "padding:2px 0" }, c, " " + id);
+    return el("label", { class: "row row--tight" }, c, " " + id);
   });
   const targets = () => boxes.map(b => b.querySelector("input"))
     .filter(i => i.checked).map(i => i.value);
@@ -589,8 +967,8 @@ function roleForm(name, cur) {
               + "sit in one routing group — pinned models do." })),
     el("div", { class: "row foot" },
       el("span", { class: "err grow", id: "roleErr" }),
-      el("button", { class: "act", onclick: () => d.close() }, "cancel"),
-      el("button", { class: "act", onclick: save }, "save")));
+      el("button", { class: "stl-btn", onclick: () => d.close() }, "cancel"),
+      el("button", { class: "stl-btn", onclick: save }, "save")));
   d.showModal();
   async function save() {
     const body = { strategy: stratI.value, targets: targets(),
@@ -615,69 +993,85 @@ function roleForm(name, cur) {
 //  Cards
 // ==========================================================================
 function cards() {
-  const out = [el("h2", { text: "Cards" }),
-    el("div", { class: "note" },
+  const out = [el("h2", { class: "eyebrow", text: "Cards" }),
+    el("div", { class: "stl-banner stl-banner--info note" },
       "This is the filtered view: integrated graphics are left out and the numbers are "
       + "the logical ones, the N in --device ROCmN. llama-swap's own hardware page shows "
       + "every device the driver exposes, so on a machine with an iGPU it lists one card "
       + "too many.")];
   for (const c of S.gpus) {
     const frac = c.vramTotalBytes ? c.vramUsedBytes / c.vramTotalBytes : 0;
-    out.push(el("div", { class: "card" },
+    out.push(el("div", { class: "stl-card card" },
       el("div", { class: "row" },
         el("span", { class: "name", text: "card " + c.index }),
-        el("span", { class: "tag", text: c.name || "?" }),
-        c.gfx ? el("span", { class: "tag", text: c.gfx }) : null,
+        el("span", { class: "stl-tag", text: c.name || "?" }),
+        c.gfx ? el("span", { class: "stl-tag" }, gloss("gfx", null, c.gfx)) : null,
         c.tempJunctionC !== null && c.tempJunctionC !== undefined
-          ? el("span", { class: "tag", text: c.tempJunctionC + " °C" }) : null,
-        c.smiIndex !== c.index ? el("span", { class: "tag warn",
-          title: "HIP_VISIBLE_DEVICES uses this number, --device ROCmN uses the other",
-          text: "rocm-smi calls it " + c.smiIndex }) : null),
-      el("div", { class: "body" },
-        el("div", { class: "row", style: "padding:0;gap:10px" },
-          el("span", { class: "bar" }, el("i", {
-            class: frac > .95 ? "bad" : frac > .85 ? "warn" : "",
+          ? el("span", { class: "stl-tag" }, gloss("junction",
+              "Junction temperature: the hottest spot on the die, which is what "
+              + "the card throttles on - higher than the edge figure a case fan "
+              + "controller would read.", c.tempJunctionC + " °C")) : null,
+        c.powerW !== null && c.powerW !== undefined
+          ? el("span", { class: "stl-tag" }, gloss("power",
+              "Graphics package power right now - the whole card, not just the "
+              + "die. Idle sits near the low tens of watts; a card actually "
+              + "generating tokens draws most of its board limit.",
+              c.powerW + " W")) : null,
+        c.busyPercent !== null && c.busyPercent !== undefined
+          ? el("span", { class: "stl-tag" + (c.busyPercent >= 90 ? " stl-tag--kelp" : "") },
+              gloss("busy", "The share of time the GPU had work in flight. It says "
+                + "nothing about how much of the chip was used, so a memory-bound "
+                + "decode can read 100 % while most of the card idles.",
+                "busy " + c.busyPercent + " %")) : null,
+        c.smiIndex !== c.index ? el("span", { class: "stl-tag stl-tag--citron" },
+          gloss("smiIndex", "Two numberings exist. HIP_VISIBLE_DEVICES uses this "
+            + "absolute one, the way rocm-smi counts; --device ROCmN and -mg use "
+            + "the logical position among the discrete cards, which is the number "
+            + "on the left.", "rocm-smi calls it " + c.smiIndex)) : null),
+      el("div", { class: "stl-card__body body" },
+        el("div", { class: "row row--flush" },
+          el("span", { class: "stl-progress bar" }, el("i", {
+            class: "stl-progress__indicator "
+          + (frac > .95 ? "bad" : frac > .85 ? "warn" : ""),
             style: "width:" + (frac * 100).toFixed(1) + "%" })),
           el("span", { class: "mono dim",
             text: fmt(c.vramUsedBytes) + " of " + fmt(c.vramTotalBytes, 0) + " in use" })),
         (c.pinnedModels || []).length
-          ? el("div", { class: "dim", style: "margin-top:8px" },
+          ? el("div", { class: "dim stack" },
               "pinned here: " + c.pinnedModels.join(", "))
-          : el("div", { class: "dim", style: "margin-top:8px" }, "nothing pinned here"))));
+          : el("div", { class: "dim stack" }, "nothing pinned here"))));
   }
   const d = S.diff;
   if (d) {
-    out.push(el("h2", { text: "Configuration vs hardware" }));
+    out.push(el("h2", { class: "eyebrow", text: "Configuration vs hardware" }));
     out.push(d.diff
-      ? el("div", { class: "card" }, el("div", { class: "body" },
-          el("div", { class: "note" },
+      ? el("div", { class: "stl-card card" }, el("div", { class: "stl-card__body body" },
+          el("div", { class: "stl-banner stl-banner--info note" },
             "The configuration no longer matches the cards. On the server: llm gpu sync"),
-          el("pre", { text: d.diff })))
-      : el("div", { class: "card" }, el("div", { class: "row ok" },
-          "matches — " + d.cards + " card(s), -ts " + (d.tensorSplit || "none"))));
+          el("pre", {}, glossCmd(d.diff))))
+      : el("div", { class: "stl-card card" }, el("div", { class: "row ok" },
+          "matches — " + d.cards + " card(s), ", gloss("-ts"), " "
+          + (d.tensorSplit || "none"))));
   }
   const cfg = S.config;
   if (cfg) {
-    out.push(el("h2", { text: "Groups" }));
-    for (const [g, v] of Object.entries(cfg.groups || {})) out.push(el("div", { class: "card" },
+    out.push(el("h2", { class: "eyebrow", text: "Groups" }));
+    for (const [g, v] of Object.entries(cfg.groups || {})) out.push(el("div", { class: "stl-card card" },
       el("div", { class: "row" }, el("span", { class: "name", text: g }),
-        el("span", { class: "tag" + (v.swap === false ? " on" : ""),
-          title: "false: members run together instead of replacing each other",
-          text: "swap " + v.swap }),
-        el("span", { class: "tag" + (v.exclusive === false ? " on" : ""),
-          title: "false: starting a member leaves other groups alone",
-          text: "exclusive " + v.exclusive }),
-        el("span", { class: "tag" + (v.persistent ? " on" : " warn"),
-          title: "true: no other group may unload these",
-          text: "persistent " + v.persistent })),
-      el("div", { class: "body dim", text: (v.members || []).join(", ") })));
-    out.push(el("h2", { text: "Macros" }),
-      el("div", { class: "card" }, el("div", { class: "body" },
+        el("span", { class: "stl-tag" + (v.swap === false ? " stl-tag--kelp" : "") },
+          gloss("swap", null, "swap " + v.swap)),
+        el("span", { class: "stl-tag" + (v.exclusive === false ? " stl-tag--kelp" : "") },
+          gloss("exclusive", null, "exclusive " + v.exclusive)),
+        el("span", { class: "stl-tag " + (v.persistent ? "stl-tag--kelp" : "stl-tag--citron") },
+          gloss("persistent", null, "persistent " + v.persistent))),
+      el("div", { class: "stl-card__body body dim", text: (v.members || []).join(", ") })));
+    out.push(el("h2", { class: "eyebrow", text: "Macros" }),
+      el("div", { class: "stl-card card" }, el("div", { class: "stl-card__body body" },
         el("div", { class: "dim" },
           "The long llama-server command lines, written once. A model's cmd references one."),
         ...Object.entries(cfg.macros || {}).map(([k, v]) =>
-          el("div", {}, el("div", { class: "name", style: "margin-top:10px", text: k }),
-            el("pre", { text: v }))))));
+          el("div", {}, el("div", { class: "name stack", text: k }),
+            el("pre", {}, glossCmd(v)))))));
   }
   $("#tab-cards").replaceChildren(...out);
 }
@@ -685,9 +1079,24 @@ function cards() {
 // ==========================================================================
 //  System
 // ==========================================================================
+//  What 'llm update' and 'llm rollback' call each engine. The path parameter is
+//  checked against the same list on the server.
+const COMPONENT = { llamaCpp: "llama", whisperCpp: "whisper", llamaSwap: "swap",
+                    openWebUI: "ui", comfyUI: "comfy" };
+const UPDATE_PROSE = "This happens on the server: fetch, build, smoke test, and "
+  + "only then switch. A llama.cpp or whisper.cpp build takes tens of minutes, and "
+  + "the endpoint is away for a few seconds while the new build is switched in. If "
+  + "the smoke test fails, the version running now keeps running. The log only "
+  + "lives as long as the registry process; the full build output is kept in a file "
+  + "on the server.";
+const ROLLBACK_PROSE = "Back to the previous version. For llama.cpp and whisper.cpp "
+  + "that is a symlink change and takes seconds, for llama-swap the binary that was "
+  + "kept, for Open WebUI the saved dependency set together with its database "
+  + "snapshot. The service restarts.";
+
 function system() {
-  const v = S.versions;
-  const out = [el("h2", { text: "Versions" })];
+  const v = S.versions, w = S.session.canWrite;
+  const out = [el("h2", { class: "eyebrow", text: "Versions" })];
   if (v) {
     const names = { llamaCpp: "llama.cpp", whisperCpp: "whisper.cpp",
                     llamaSwap: "llama-swap", openWebUI: "Open WebUI", comfyUI: "ComfyUI" };
@@ -695,25 +1104,51 @@ function system() {
       el("th", { text: names[k] || k }),
       el("td", { class: "mono", text: e.active || "–" }),
       el("td", {}, e.upToDate === false
-        ? el("span", { class: "tag warn", text: "newer: " + e.latest })
-        : e.upToDate ? el("span", { class: "tag on", text: "up to date" })
+        ? el("span", { class: "stl-tag stl-tag--citron" },
+            gloss("newer", "A newer release exists upstream. It comes from a cache "
+              + "this page never refreshes on its own - “check now” asks the "
+              + "server to.", "newer: " + e.latest))
+        : e.upToDate ? el("span", { class: "stl-tag stl-tag--kelp" }, gloss("up to date"))
         : el("span", { class: "dim", text: "–" })),
       el("td", { class: "dim", text: (e.rollbackTo || []).length
         ? "can go back to " + e.rollbackTo.join(", ")
           + (e.snapshotWithDatabase ? " (with its database)" : "")
         : "" }),
-      el("td", { class: "dim mono", text: (e.rollbackTo || []).length ? e.rollbackCommand : "" })));
-    out.push(el("div", { class: "card" }, el("div", { class: "body" },
+      //  Without a session this stays the command to type on the server, which
+      //  is all a read-only visitor can do with it.
+      w ? el("td", {}, el("span", { class: "row" },
+        e.upToDate === false ? el("button", { class: "stl-btn", onclick: () =>
+          confirmAct("Update " + (names[k] || k), UPDATE_PROSE,
+                     "/api/updates/" + COMPONENT[k], "update") }, "update") : null,
+        (e.rollbackTo || []).length ? el("button", { class: "stl-btn", onclick: () =>
+          confirmAct("Roll " + (names[k] || k) + " back", ROLLBACK_PROSE,
+                     "/api/rollback/" + COMPONENT[k], "roll back") }, "back") : null))
+        : el("td", { class: "dim mono",
+                     text: (e.rollbackTo || []).length ? e.rollbackCommand : "" })));
+    out.push(el("div", { class: "stl-card card" }, el("div", { class: "stl-card__body body" },
       el("table", {}, el("tbody", {}, rows)),
-      el("div", { class: "dim", style: "margin-top:10px" },
-        "“newer” comes from the cache that llm update refreshes"
+      el("div", { class: "dim stack" },
+        "“newer” comes from a cache"
         + (v.cacheAgeSeconds !== null && v.cacheAgeSeconds !== undefined
            ? ", last checked " + Math.round(v.cacheAgeSeconds / 3600) + " h ago" : "")
-        + " — this page never calls GitHub. Updating and rolling back are "
-        + "server-side operations with a smoke test: llm update, llm rollback."))));
+        + " — this page never calls GitHub itself, “check now” asks the "
+        + "server to. Every update builds, smoke-tests and only then switches; if the "
+        + "test fails the running version stays."))));
+    if (w) out.push(el("div", { class: "row" },
+      el("button", { class: "stl-btn", onclick: () =>
+        confirmAct("Check for updates", "Asks upstream for the newest versions and "
+          + "refreshes the cache this table reads. It changes nothing else.",
+          "/api/updates/check", "check now") }, "check now"),
+      el("button", { class: "stl-btn", onclick: () =>
+        confirmAct("Update everything", "Every installed component, one after the "
+          + "other. " + UPDATE_PROSE, "/api/updates/all", "update everything") },
+        "update everything")));
   }
-  out.push(el("h2", { text: "Elsewhere" }));
-  out.push(el("div", { class: "card" }, el("div", { class: "body" },
+  //  Updates and rollbacks run as jobs, next to the versions they change.
+  const running = (S.jobs || []).filter(j => j.kind !== "add");
+  if (running.length) out.push(el("h2", { class: "eyebrow", text: "Updates" }), ...jobCards(running));
+  out.push(el("h2", { class: "eyebrow", text: "Elsewhere" }));
+  out.push(el("div", { class: "stl-card card" }, el("div", { class: "stl-card__body body" },
     el("table", {}, el("tbody", {},
       el("tr", {}, el("th", { text: "Runtime, logs, telemetry" }),
         el("td", {}, el("a", { href: location.protocol + "//" + location.hostname + ":8080/ui",
@@ -735,6 +1170,16 @@ function system() {
   $("#tab-system").replaceChildren(...out);
 }
 
+//  Stellar reads the density off the root element, and there is no <html> tag
+//  in this file to put it on. Dense tables, so: compact.
+if (document.documentElement) document.documentElement.dataset.density = "compact";
+tipInit();
 load();
+//  After the first paint the tabs have a width, so the chip has somewhere to be.
+if (typeof requestAnimationFrame === "function")
+  requestAnimationFrame(() => {
+    const on = document.querySelector('nav button[aria-selected="true"]');
+    if (on) moveTabChip(on);
+  });
 setInterval(() => { if (!$("#dlg").open) load(); }, 15000);
 </script>

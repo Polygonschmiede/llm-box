@@ -43,7 +43,9 @@ cfg_unlock(){ exec 9>&- 2>/dev/null || true; }
 # --- Updates (see 'llm update' / 'llm versions' / 'llm rollback') -----------
 LCPP="$(readlink -f "$LLM_HOME/llama.cpp" 2>/dev/null || echo "$LLM_HOME/llama.cpp")"
 SWAP_BIN="$LLM_HOME/bin/llama-swap"
-WCPP="$(readlink -f "$HOME/whisper.cpp" 2>/dev/null || echo "$HOME/whisper.cpp")"
+#  Overridable like LLM_COMFY_HOME below, so a test can point both at a
+#  sandbox instead of at whatever this machine happens to have installed.
+WCPP="$(readlink -f "${LLM_WHISPER_HOME:-$HOME/whisper.cpp}" 2>/dev/null || echo "${LLM_WHISPER_HOME:-$HOME/whisper.cpp}")"
 #  Two venvs on purpose - see config/requirements-*.txt
 VENV_API="$LLM_HOME/venv-api"
 VENV_UI="$LLM_HOME/venv-webui"
@@ -67,8 +69,14 @@ hw_get(){ # $1=key
   [[ -f "$HW_ENV" ]] && sed -n "s/^$1=\(.*\)$/\1/p" "$HW_ENV" | head -1
 }
 
-# Colours
-c_g=$'\033[0;32m'; c_y=$'\033[0;33m'; c_r=$'\033[0;31m'; c_b=$'\033[0;36m'; c_0=$'\033[0m'
+# Colours. NO_COLOR is honoured because the registry runs this script through a
+# job runner and shows its output in a web page, where escape sequences would
+# appear literally (see job_start in bin/llm-api.py).
+if [[ -z "${NO_COLOR:-}" ]]; then
+  c_g=$'\033[0;32m'; c_y=$'\033[0;33m'; c_r=$'\033[0;31m'; c_b=$'\033[0;36m'; c_0=$'\033[0m'
+else
+  c_g=""; c_y=""; c_r=""; c_b=""; c_0=""
+fi
 info(){ printf "%s\n" "${c_b}$*${c_0}"; }
 ok(){   printf "%s\n" "${c_g}$*${c_0}"; }
 warn(){ printf "%s\n" "${c_y}$*${c_0}"; }
@@ -163,7 +171,8 @@ ${c_y}── ALL ON / ALL OFF ────────────────�
   llm start|stop|restart  short for 'llm llama …' (the LLM API)
 
 ${c_y}── WATCHING ──────────────────────────────────────────────────────${c_0}
-  llm watch               live monitor (every 2s; Ctrl+C to stop)
+  llm watch               live monitor: what is loaded, and temperature, watts,
+                          utilisation and VRAM per card (every 2s; Ctrl+C stops)
   llm logs                live logs of the LLM API   (= llm llama logs)
   llm ps                  which model is loaded right now
 
@@ -302,15 +311,21 @@ cmd_dash(){
   local la lw sa sw wa ww hint=""
   la=$(lcpp_active); lw=$(upd_get llama); sa=$(swap_active); sw=$(upd_get swap)
   wa=$(wcpp_active); ww=$(upd_get whisper)
-  [[ -n "$lw" && -n "$la" && "$la" != "$lw" ]] && hint="llama.cpp $lw (llm update llama)"
+  #  upd_same, not a name comparison: whisper.cpp ships one commit under two
+  #  tag names, and the cache holds whichever GitHub calls the latest release.
+  #  It reads the cache and the local clone only - no network in 'llm status'.
+  [[ -n "$lw" && -n "$la" ]] && ! upd_same llama "$LCPP" "$la" \
+    && hint="llama.cpp $lw (llm update llama)"
   [[ -n "$sw" && -n "$sa" && "$sa" != "$sw" ]] && hint="${hint:+$hint, }llama-swap $sw (llm update swap)"
-  [[ -n "$ww" && -n "$wa" && "$wa" != "$ww" ]] && hint="${hint:+$hint, }whisper.cpp $ww (llm update whisper)"
+  [[ -n "$ww" && -n "$wa" ]] && ! upd_same whisper "$WCPP" "$wa" \
+    && hint="${hint:+$hint, }whisper.cpp $ww (llm update whisper)"
   local ua uu ca cu extra=""
   ua=$(owui_active); uu=$(upd_get ui); ca=$(comfy_active); cu=$(upd_get comfy)
   [[ -n "$ua" ]] && extra="Open WebUI $ua$([[ -n "$uu" && "$ua" != "$uu" ]] && echo " → $uu")"
-  [[ -n "$ca" ]] && extra="${extra:+$extra · }ComfyUI $ca$([[ -n "$cu" && "${ca#v}" != "${cu#v}" ]] && echo " → $cu")"
+  [[ -n "$ca" ]] && extra="${extra:+$extra · }ComfyUI $ca$(upd_same comfy "$COMFY" "$ca" || { [[ -n "$cu" ]] && echo " → $cu"; })"
   [[ -n "$uu" && -n "$ua" && "$ua" != "$uu" ]] && hint="${hint:+$hint, }Open WebUI $uu (llm update ui)"
-  [[ -n "$cu" && -n "$ca" && "${ca#v}" != "${cu#v}" ]] && hint="${hint:+$hint, }ComfyUI $cu (llm update comfy)"
+  [[ -n "$cu" && -n "$ca" ]] && ! upd_same comfy "$COMFY" "$ca" \
+    && hint="${hint:+$hint, }ComfyUI $cu (llm update comfy)"
   printf "%s llama.cpp %s · llama-swap %s" "${c_b}Versions:${c_0}" "${la:-?}" "${sa:-?}"
   [[ -n "$wa" ]] && printf " · whisper.cpp %s" "$wa"
   if [[ -n "$hint" ]]; then printf "  %s\n" "${c_y}→ new: $hint${c_0}"; else printf "  %s\n" "${c_g}up to date${c_0}"; fi
@@ -476,6 +491,28 @@ cmd_doctor(){
   return $((fails > 0))
 }
 
+#  One row of the 'llm update' table. Without a known latest version there is
+#  nothing to offer, so that reads as up to date rather than as a question mark.
+upd_line(){ # $1=label $2=active $3=latest $4=update keyword $5=y when up to date
+  if [[ "$5" == y || -z "$3" ]]; then
+    printf "%-12s %-16s %-16s %s\n" "$1" "${2:-?}" "${3:-?}" "${c_g}up to date${c_0}"
+  else
+    printf "%-12s %-16s %-16s %s\n" "$1" "${2:-?}" "$3" "${c_y}update: llm update $4${c_0}"
+  fi
+}
+
+#  One frame of 'llm watch'. Its own subcommand because watch(1) takes a
+#  command line and not a shell function, and because 'llm watch' used to be a
+#  plain 'watch rocm-smi': every device the driver exposes, the iGPU included,
+#  and nothing at all about what this stack is doing with them.
+cmd_watch_once(){
+  local run
+  run=$(curl -s "$API/running" 2>/dev/null | grep -o '"model":"[^"]*"' \
+        | sed 's/"model":"//;s/"//' | paste -sd', ' -)
+  printf "%s %s\n" "${c_b}Loaded:${c_0}" "${run:-${c_y}(none)${c_0}}"
+  reg gpus --table 2>/dev/null || warn "  no card list (is rocm-smi there?)"
+}
+
 cmd_update(){
   local what="${1:-}" ver="${2:-}"
   case "$what" in
@@ -495,35 +532,24 @@ cmd_update(){
       la=$(lcpp_active); lw=$(upd_get llama); ls_=$(swap_active); sw=$(upd_get swap)
       wa=$(wcpp_active); ww=$(upd_get whisper)
       printf "%-12s %-16s %-16s %s\n" "" "active" "latest" ""
-      if [[ -n "$lw" && "$la" != "$lw" ]]; then
-        printf "%-12s %-16s %-16s %s\n" "llama.cpp" "${la:-?}" "$lw" "${c_y}update: llm update llama${c_0}"
-      else printf "%-12s %-16s %-16s %s\n" "llama.cpp" "${la:-?}" "${lw:-?}" "${c_g}up to date${c_0}"; fi
-      if [[ -n "$sw" && "$ls_" != "$sw" ]]; then
-        printf "%-12s %-16s %-16s %s\n" "llama-swap" "${ls_:-?}" "$sw" "${c_y}update: llm update swap${c_0}"
-      else printf "%-12s %-16s %-16s %s\n" "llama-swap" "${ls_:-?}" "${sw:-?}" "${c_g}up to date${c_0}"; fi
-      if [[ -n "$wa" ]]; then
-        if [[ -n "$ww" && "$wa" != "$ww" ]]; then
-          printf "%-12s %-16s %-16s %s\n" "whisper.cpp" "$wa" "$ww" "${c_y}update: llm update whisper${c_0}"
-        else printf "%-12s %-16s %-16s %s\n" "whisper.cpp" "$wa" "${ww:-?}" "${c_g}up to date${c_0}"; fi
-      fi
+      #  Whether an update exists is decided by upd_same, which falls back to the
+      #  names but knows when two names mean the same commit. llama-swap and Open
+      #  WebUI are not git checkouts, so there the name is all there is.
+      upd_line "llama.cpp"  "$la"  "$lw" llama "$(upd_same llama "$LCPP" "$la" && echo y)"
+      upd_line "llama-swap" "$ls_" "$sw" swap  "$([[ "$ls_" == "$sw" ]] && echo y)"
+      [[ -n "$wa" ]] && upd_line "whisper.cpp" "$wa" "$ww" whisper \
+        "$(upd_same whisper "$WCPP" "$wa" && echo y)"
       local ua uu ca cu
       ua=$(owui_active); uu=$(upd_get ui); ca=$(comfy_active); cu=$(upd_get comfy)
-      if [[ -n "$ua" ]]; then
-        if [[ -n "$uu" && "$ua" != "$uu" ]]; then
-          printf "%-12s %-16s %-16s %s\n" "Open WebUI" "$ua" "$uu" "${c_y}update: llm update ui${c_0}"
-        else printf "%-12s %-16s %-16s %s\n" "Open WebUI" "$ua" "${uu:-?}" "${c_g}up to date${c_0}"; fi
-      fi
-      if [[ -n "$ca" ]]; then
-        if [[ -n "$cu" && "${ca#v}" != "${cu#v}" ]]; then
-          printf "%-12s %-16s %-16s %s\n" "ComfyUI" "$ca" "$cu" "${c_y}update: llm update comfy${c_0}"
-        else printf "%-12s %-16s %-16s %s\n" "ComfyUI" "$ca" "${cu:-?}" "${c_g}up to date${c_0}"; fi
-      fi
+      [[ -n "$ua" ]] && upd_line "Open WebUI" "$ua" "$uu" ui "$([[ "$ua" == "$uu" ]] && echo y)"
+      [[ -n "$ca" ]] && upd_line "ComfyUI" "$ca" "$cu" comfy \
+        "$(upd_same comfy "$COMFY" "$ca" && echo y)"
       echo
       echo "  llm update all        update everything (smoke test before each switch)"
       echo "  llm versions          installed builds and versions"
       echo "  llm rollback llama    back one version"
       ;;
-    *) err "llm update [llama|swap|whisper|ui|comfy|all] [version]";;
+    *) err "llm update [llama|swap|whisper|ui|comfy|all] [version]"; return 1;;
   esac
 }
 
@@ -604,7 +630,7 @@ cmd_rollback(){
       [[ -z "$cand" ]] && { err "no other build available (llm versions)."; return 1; }
       info "rolling llama.cpp back: $act -> $cand"
       lcpp_switch "$cand" || return 1
-      git -C "$LCPP" checkout --quiet "$cand" 2>/dev/null && info "source checked out at $cand as well"
+      rb_source "$LCPP" "$cand"
       ;;
     swap|llama-swap)
       local b; b=$(ls -1t "$LLM_HOME"/bin/llama-swap-* 2>/dev/null | head -1)
@@ -625,11 +651,11 @@ cmd_rollback(){
       [[ -z "$cand" ]] && { err "no other whisper build available (llm versions)."; return 1; }
       info "rolling whisper.cpp back: $act -> $cand"
       wcpp_switch "$cand" || return 1
-      git -C "$WCPP" checkout --quiet "$cand" 2>/dev/null && info "source checked out at $cand as well"
+      rb_source "$WCPP" "$cand" "${WCPP_GENERATED[@]}"
       ;;
     ui|webui|open-webui|openwebui) rollback_owui "$ver";;
     comfy|comfyui)  rollback_comfy "$ver";;
-    *) err "llm rollback <llama|swap|whisper|ui|comfy> [version]   (choices: llm versions)";;
+    *) err "llm rollback <llama|swap|whisper|ui|comfy> [version]   (choices: llm versions)"; return 1;;
   esac
 }
 
@@ -1175,7 +1201,16 @@ case "${1:-}" in
              ""|show) rocm-smi;;
              *)     err "llm gpu [list|sync [--dry-run]]";;
            esac;;
-  watch)   command -v watch >/dev/null && watch -n 2 rocm-smi || { warn "'watch' is missing"; rocm-smi; };;
+  watch)   if command -v watch >/dev/null; then
+             #  -c keeps the colours, --no-title drops watch's own header so the
+             #  two lines that matter sit at the top of the terminal.
+             watch -n 2 -c --no-title "$LLM_HOME/bin/llm watch-once"
+           else
+             warn "'watch' is missing - printing once instead."
+             cmd_watch_once
+           fi;;
+  #  Not in the help: it exists so watch(1) has something to call.
+  watch-once) cmd_watch_once;;
   ps)      curl -s "$API/running" 2>/dev/null || curl -s "$API/v1/models" 2>/dev/null; echo;;
   #  No 'llm web on': the page is served by the registry, so there is no
   #  separate service to start. If port 8081 answers, the page is there.

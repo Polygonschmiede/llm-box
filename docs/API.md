@@ -130,6 +130,13 @@ can differ when a machine has an iGPU. `GET /api/gpus` returns both (`index` and
 `smiIndex`), and the translation happens inside the server so callers never have to
 do it.
 
+Per card it also reports `tempJunctionC`, `powerW` and `busyPercent` — one
+`rocm-smi` query, cached for a second so several callers within one request do
+not each pay for it. A field the driver does not answer is `null`, never `0`.
+`busyPercent` is the share of time the GPU had work in flight and says nothing
+about how much of the chip was busy, so a memory-bound decode can read 100 %
+while most of the card idles.
+
 ## The endpoints the settings page needs
 
 Four reads that nothing exposed before, which is why the configuration had no
@@ -137,7 +144,7 @@ interface but the CLI:
 
 | Endpoint | Answers |
 |---|---|
-| `GET /api/versions` | active version, what is newer, and what you can roll back to, per engine. "Newer" comes from the cache `llm update` refreshes — never a live GitHub call, so this never blocks. |
+| `GET /api/versions` | active version, what is newer, and what you can roll back to, per engine. "Newer" comes from the cache `llm update` refreshes — never a live GitHub call, so this never blocks. `upToDate` compares **commits**, not tag names: whisper.cpp ships one commit as `bNNNN` and as `v1.x.y`. |
 | `GET /api/config` | the parts of the YAML that are not per-model: the macros, and the groups with their `swap`/`exclusive`/`persistent` flags. llama-swap has no `/api/config` at all, so the eviction semantics were visible only by opening the file. |
 | `GET /api/config/diff` | what `llm gpu sync` would change. An empty diff means the configuration matches the cards. |
 | `GET /api/roles` | the roles as configured. |
@@ -162,6 +169,39 @@ collide with a model's, and `spillover` targets have to share one routing group.
 Removing a *model* also prunes it from every role that pointed at it and deletes
 a role left with no targets — llama-swap validates selector targets at startup,
 so leaving one behind would take the endpoint down on the next restart.
+
+### Updating over HTTP
+
+`component` is one of `llama`, `swap`, `whisper`, `ui`, `comfy` — plus `all` for
+an update. It is checked against that list, not against a pattern: the value
+becomes part of a command line. So does `version`, which has to look like a tag.
+
+These return **202** with a `jobId`; the work runs in the background and
+`GET /api/jobs/{id}` carries the log. Only **one** update or rollback runs at a
+time — a second one gets **409**, because they share the repositories, the build
+symlinks and the services. The job log lives in the registry process, so a
+restart of it loses the log but not the update; the full build output is written
+to a file next to the repository either way.
+
+What actually happens is [UPDATES.md](UPDATES.md): fetch, build, smoke test, and
+only then switch. A build can run for tens of minutes and llama-swap is away for
+a few seconds when the symlink moves. If the smoke test fails, the version that
+is running keeps running.
+
+```bash
+curl -X POST http://<server-ip>:8081/api/updates/whisper -H "X-LLM-Token: $T"
+# {"jobId":"9f1c...","argv":["update","whisper"],"hint":"progress: GET /api/jobs/9f1c..."}
+curl -s http://<server-ip>:8081/api/jobs/9f1c... | jq -r '.log[]'
+```
+
+### Serving the page
+
+`GET /ui` is the control page and `GET /ui/{asset}` its stylesheets — currently
+`stellar.css` and `stellar-auto-dark.css`, the vendored design system under
+`web/vendor/stellar`. The name is looked up in a fixed table rather than joined
+onto a directory: this process reads every model file and `config/api-token`, so
+a path parameter that reaches the filesystem is how that becomes someone else's
+shell. An unknown name is a 404, and there is no traversal to attempt.
 
 ## Sessions (so a page need not hold a secret)
 
@@ -196,8 +236,11 @@ The key lives in `config/api-token`, generated on first start, readable only by 
 | `POST /api/models/{id}/load` | pull a model into VRAM |
 | `POST /api/unload` | unload everything (llama-swap only knows all-or-nothing) |
 | `POST /api/models` | fetch a new model from Hugging Face → returns a job |
-| `GET /api/jobs`, `GET /api/jobs/{id}` | progress and log of downloads |
+| `GET /api/jobs`, `GET /api/jobs/{id}` | progress and log of downloads and updates |
 | `DELETE /api/models/{id}?files=true` | remove a model, optionally with its files |
+| `POST /api/updates/check` | ask upstream for the newest versions now → job |
+| `POST /api/updates/{component}` | build/install and switch → job. Body `{"version": "b10545"}` pins a tag |
+| `POST /api/rollback/{component}` | back to the previous version → job |
 
 **Putting a model on one card or on all of them** — exactly the question an agent
 cannot otherwise answer from outside:

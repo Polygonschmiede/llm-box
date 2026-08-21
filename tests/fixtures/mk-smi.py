@@ -45,10 +45,17 @@ def render(cards: list[dict]) -> str:
     out = ["", "==== ROCm System Management Interface ====", "==== Concise Info ===="]
     for i, c in enumerate(cards):
         used = 171778048 if i == 0 else 73072640
+        #  An APU reports its power under a different label than a discrete
+        #  card, and the parser is supposed to accept both - so say it the way
+        #  the hardware says it.
+        socket = c["vram"] < 20 * 1024**3 and "Ryzen" in c["series"]
         out += [
             "GPU[%d]\t\t: Temperature (Sensor edge) (C): 30.0" % i,
             "GPU[%d]\t\t: Temperature (Sensor junction) (C): %.1f" % (i, 29.0 + i),
             "GPU[%d]\t\t: Temperature (Sensor memory) (C): 34.0" % i,
+            "GPU[%d]\t\t: %s Graphics Package Power (W): %.1f" % (
+                i, "Current Socket" if socket else "Average", 17.0 + i),
+            "GPU[%d]\t\t: GPU use (%%): %d" % (i, 0 if i else 42),
             "GPU[%d]\t\t: VRAM Total Memory (B): %d" % (i, c["vram"]),
             "GPU[%d]\t\t: VRAM Total Used Memory (B): %d" % (i, used),
             "GPU[%d]\t\t: Card Series: \t\t%s" % (i, c["series"]),

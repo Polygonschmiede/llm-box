@@ -7,6 +7,123 @@ All notable changes to llm-box. Format follows
 Version numbers describe **llm-box itself**, not the engines it drives —
 `llm versions` reports those, and `llm update` moves them independently.
 
+## [Unreleased]
+
+### Added
+
+- **The control page is built on a design system.**
+  [Stellar DS](https://github.com/Polygonschmiede/stellar-ds)
+  (`@polygonschmied/stellar-tokens`), vendored as two CSS files under
+  `web/vendor/stellar` and served from the same origin — so still no build step
+  and still nothing fetched from anywhere but this server. The page's own style
+  block went from 85 hand-written lines to 45: it had nine colour tokens, five
+  unrelated radii, eight font sizes off no scale, and not one shadow or
+  transition in the whole file. What is left is what the system does not cover —
+  the dense tables, the sticky header, the `hidden` guard, the glossary. Cards,
+  buttons, tags, banners, meters, tabs, fields and the dialog are now the
+  system's own components. Dark mode follows the OS with no switch to find, and
+  `color-scheme` is finally declared, so the checkbox and the `select` popup stop
+  staying light while everything around them turns dark.
+- **Every abbreviation on the page explains itself on hover.** `Q4_K_M`, `-kvu`,
+  `q8_0`, `gfx1201`, `ttl`, `spillover`, `warm`, `persistent`, junction
+  temperature, the two card numberings — and **every flag inside a command line,
+  a macro body or a dry-run diff**, which is the only place those flags are
+  visible at all. The wording is this repository's own (`FLAGS.md`, `MODELS.md`,
+  `API.md`, the docstrings in `lib/llmreg.py`) cut to a sentence each, so the
+  page and the docs cannot drift apart. Quant names are generated rather than
+  listed, so `UD-Q5_K_XL` gets a sentence too, and a term the page does not know
+  renders as plain text instead of an empty tooltip. The eight `title` attributes
+  that existed before are folded into the same mechanism, so the browser cannot
+  draw its own tooltip on top of the styled one. Underlined terms are reachable
+  by keyboard; the flags inside a `<pre>` are hover-only on purpose.
+- `GET /ui/{asset}` serves the page's stylesheets from a fixed table of names —
+  not a directory joined onto a path parameter, in a process that can read every
+  model file and the API token. It answers `If-None-Match` itself, because
+  `FileResponse` sends an ETag but does not act on one, and without that the
+  browser would re-fetch 78 KB of unchanged CSS on every page load.
+- `tests/ui-matrix.sh` now checks that every class and token the page asks for
+  still exists in the vendored CSS. That is the failure a design-system upgrade
+  actually produces: a renamed class, and a page that silently falls back to
+  unstyled.
+- **Power draw and utilisation per card**, next to the junction temperature they
+  arrive with — in `GET /api/gpus` as `powerW` and `busyPercent`, in the Cards
+  tab with an explanation each, and in the card table that `llm status`,
+  `llm gpu list` and `llm watch` all print. One `rocm-smi` query, and a sensor
+  the driver does not answer reads `?` rather than a confident zero. A discrete
+  card calls it "Average Graphics Package Power" and an APU "Current Socket
+  Graphics Package Power", so both labels are accepted.
+- **`llm watch` shows this stack's view instead of raw `rocm-smi`.** It was
+  `watch -n 2 rocm-smi`: every device the driver exposes, the integrated GPU
+  included, and nothing about what the stack was doing with them. Now it is the
+  model that is loaded plus the same filtered card table as `llm status`.
+
+### Fixed
+
+- **An expanded model closed itself again after fifteen seconds.** The refresh
+  re-renders the whole tab and the detail body was built with `hidden` set every
+  time, so the state was thrown away on the next tick — which looked like a
+  stray event handler and was a re-render forgetting what it had. Now recorded,
+  with a test that clicks *details*, triggers the refresh and fails if the body
+  shut itself.
+- `tests/dom-stub.js` read `hidden` as false whenever it had been set the way
+  `el()` sets it (`setAttribute("hidden", "")`), so anything asserting on a
+  collapsed element passed for the wrong reason. It also returned `this` from
+  `closest()` unconditionally, which made every `closest(...)` in the page look
+  like it worked.
+- **`llm update whisper` was blocked for good.** The refusal "the whisper.cpp
+  repository has local changes" was about `whisper.cpp/build` — the symlink this
+  tool creates itself. Upstream's `.gitignore` writes `build/` with a trailing
+  slash, which ignores the directory and not the symlink, so the guard counted
+  the tool's own artifact as a local change. It now looks at **tracked files
+  only**, the way the ComfyUI path already did; if an untracked file really is in
+  the way, git says so with the path. The same guard on llama.cpp had the same
+  hole and only escaped it because upstream happens to write `/build*` there.
+- **The build itself made the repository dirty.** whisper.cpp's top-level
+  `CMakeLists.txt` regenerates `bindings/javascript/package.json` in the source
+  tree on every configure, so one build left a *tracked* modification and the
+  fixed guard would have refused every later update anyway. Files a build writes
+  back are now known, excluded from the guard and dropped before the checkout.
+- **"Up to date" is decided by commit, not by tag name.** whisper.cpp publishes
+  rolling `bNNNN` releases next to hand-cut `v1.x.y` ones, and GitHub's "latest
+  release" answers with whichever came last and is not a prerelease — so
+  `active v1.9.2` against `latest b4938` could be a real update or the same
+  commit under the other name. `.update-cache` now stores the commit each latest
+  tag points at and comparison uses it; when either side cannot be resolved, the
+  name comparison stands and an update is offered. `llm update`, `llm status`,
+  `GET /api/versions` and the control page share this.
+- A successful `llm rollback whisper` reported itself as **failed**: the source
+  checkout that follows the build directory is a courtesy, and its exit status
+  was becoming the command's. It no longer is, and it says so when the source
+  cannot follow.
+- `GET /api/versions` reported ComfyUI with no active version at all, so its row
+  had nothing to compare and no rollback to offer.
+- Job logs no longer carry raw escape sequences. `bin/llm` honours `NO_COLOR`,
+  the registry sets it for every job, and what other tools still emit is
+  stripped. This affected the download log too.
+
+### Added
+
+- **Updates and rollbacks from the control page.** The System tab now has
+  *check now*, *update everything*, and per engine *update* and *back*. Each one
+  says what it is about to do — a build takes tens of minutes, the endpoint is
+  away for a few seconds, a smoke test decides whether the new version becomes
+  active at all — and then runs as a job whose log you can watch. Downloads and
+  updates are listed on their own tabs rather than in one pile.
+- `POST /api/updates/check`, `POST /api/updates/{component}` and
+  `POST /api/rollback/{component}`, through the same job runner the downloads
+  use. Writes, so they need the token or a session; the component is checked
+  against a fixed list because it becomes part of a command line; and only one
+  runs at a time — a second gets 409, since they share the repositories, the
+  build symlinks and the services. Until now the page could show a stale version
+  and do nothing about it, and there was no way at all to refresh the cache
+  without a shell.
+- whisper.cpp got the parts llama.cpp already had: the health check with
+  automatic revert when the endpoint stops answering after a switch, pruning of
+  old builds (they used to accumulate without limit), and the free-disk check.
+- `LLM_WHISPER_HOME` overrides where whisper.cpp lives, the way
+  `LLM_COMFY_HOME` already did — which also lets the page tests run against a
+  sandbox instead of whatever the machine has installed.
+
 ## [1.3.0] — 2026-08-20
 
 ### Added

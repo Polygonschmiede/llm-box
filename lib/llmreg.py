@@ -592,16 +592,16 @@ _SMI_CACHE: tuple[float, dict[int, dict]] | None = None
 def _smi_cards(max_age: float = 1.0) -> dict[int, dict]:
     """EVERY device rocm-smi knows about, iGPU included. Keys are absolute.
 
-    One query yields temperature, VRAM, name and gfx target. Cached briefly
-    because several callers ask within the same request (gpus, gpu_of,
-    check_fit); 1 s is short enough to keep 'llm watch' live.
+    One query yields temperature, power draw, utilisation, VRAM, name and gfx
+    target. Cached briefly because several callers ask within the same request
+    (gpus, gpu_of, check_fit); 1 s is short enough to keep 'llm watch' live.
     """
     global _SMI_CACHE
     if _SMI_CACHE and (time.time() - _SMI_CACHE[0]) < max_age:
         return _SMI_CACHE[1]
     try:
-        raw = subprocess.run([ROCM_SMI, "--showtemp", "--showmeminfo", "vram",
-                              "--showproductname"],
+        raw = subprocess.run([ROCM_SMI, "--showtemp", "--showpower", "--showuse",
+                              "--showmeminfo", "vram", "--showproductname"],
                              capture_output=True, text=True, timeout=15).stdout
     except (OSError, subprocess.SubprocessError):
         raw = ""
@@ -615,6 +615,12 @@ def _smi_cards(max_age: float = 1.0) -> dict[int, dict]:
         c = cards.setdefault(idx, {"smiIndex": idx})
         if "junction" in rest.lower():
             c["tempJunctionC"] = _num(val)
+        #  Discrete cards report "Average Graphics Package Power", an APU
+        #  "Current Socket Graphics Package Power" - match the part they share.
+        elif "Graphics Package Power" in rest:
+            c["powerW"] = _num(val)
+        elif "GPU use (%)" in rest:
+            c["busyPercent"] = _num(val)
         elif "Total Memory" in rest:
             c["vramTotalBytes"] = _num(val)
         elif "Used Memory" in rest:
@@ -1859,6 +1865,18 @@ def _kv_file(path: str) -> dict:
     return out
 
 
+def _git_out(repo: str, *args: str) -> str | None:
+    """One reading git call in a repository, or None. Never fetches."""
+    try:
+        r = subprocess.run(["git", "-C", repo, *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip() or None
+
+
 def engine_versions() -> dict:
     """Active version, installed alternatives and rollback command per engine.
 
@@ -1870,18 +1888,44 @@ def engine_versions() -> dict:
     prev = _kv_file(UPDATE_STATE)
     out = {}
 
-    def entry(active, installed, latest_key, rollback):
+    def same_commit(active, latest_key, repo):
+        """Up to date can also mean: another name for the same commit.
+
+        whisper.cpp publishes one commit as bNNNN and as v1.x.y, and GitHub's
+        releases/latest answers with whichever was published last, so comparing
+        the names alone reports an update that does not exist. lib/update.sh
+        caches the commit each 'latest' tag points at as "<tag> <sha>", so the
+        entry cannot outlive the tag it belongs to. Unknown on either side means
+        we do not know, and the caller keeps the name comparison.
+        """
+        rec = (latest.get(latest_key + "_sha") or "").split(" ")
+        if len(rec) != 2 or rec[0] != latest.get(latest_key):
+            return False
+        return _git_out(repo, "rev-parse", "--verify", "--quiet",
+                        "%s^{commit}" % active) == rec[1]
+
+    def entry(active, installed, latest_key, rollback, repo=None):
+        #  'repo' marks the git checkouts, the only ones where two tag names can
+        #  mean one commit. Without it this stays the strict name comparison the
+        #  CLI uses for llama-swap and Open WebUI.
         others = [v for v in installed if v != active]
-        return {"active": active, "latest": latest.get(latest_key),
-                "upToDate": None if not (active and latest.get(latest_key))
-                else active == latest.get(latest_key),
+        want = latest.get(latest_key)
+        if not (active and want):
+            up = None
+        elif repo is None:
+            up = active == want
+        else:
+            up = (active.removeprefix("v") == want.removeprefix("v")
+                  or same_commit(active, latest_key, repo))
+        return {"active": active, "latest": want, "upToDate": up,
                 "rollbackTo": others, "rollbackCommand": rollback}
 
     #  llama.cpp and whisper.cpp: one build directory per version, 'build' a
     #  symlink to the active one, so switching back is a symlink change.
+    whisper_root = (os.environ.get("LLM_WHISPER_HOME")
+                    or os.path.join(os.path.expanduser("~"), "whisper.cpp"))
     for key, root, cmd in (("llamaCpp", os.path.join(LLM_HOME, "llama.cpp"), "llm rollback llama"),
-                           ("whisperCpp", os.path.join(os.path.expanduser("~"), "whisper.cpp"),
-                            "llm rollback whisper")):
+                           ("whisperCpp", whisper_root, "llm rollback whisper")):
         real = os.path.realpath(root)
         active = os.path.basename(os.path.realpath(os.path.join(real, "build"))) \
             .replace("build-", "") or None
@@ -1889,7 +1933,7 @@ def engine_versions() -> dict:
                         for d in glob.glob(os.path.join(real, "build-*"))
                         if os.path.isdir(d))
         out[key] = entry(active if active and active != "build" else None, builds,
-                         "llama" if key == "llamaCpp" else "whisper", cmd)
+                         "llama" if key == "llamaCpp" else "whisper", cmd, real)
 
     #  llama-swap: prebuilt binaries kept side by side as bin/llama-swap-<ver>.
     swap_active = None
@@ -1920,8 +1964,24 @@ def engine_versions() -> dict:
                              "llm rollback ui")
     out["openWebUI"]["snapshotWithDatabase"] = bool(ui_prev and os.path.isdir(
         os.path.join(LLM_HOME, "openwebui-data.bak-%s" % ui_prev)))
-    out["comfyUI"] = entry(None, [v for v in (prev.get("comfy_prev"),) if v], "comfy",
-                           "llm rollback comfy")
+    #  Same order as comfy_active in lib/update.sh: the exact tag when HEAD sits
+    #  on one, otherwise the version the checkout declares. Reported as None for
+    #  a while, which left the version table with nothing to compare.
+    comfy_root = os.path.realpath(os.environ.get("LLM_COMFY_HOME")
+                                  or os.path.join(os.path.expanduser("~"), "comfyui"))
+    comfy_active = None
+    if os.path.isdir(os.path.join(comfy_root, ".git")):
+        comfy_active = _git_out(comfy_root, "describe", "--tags", "--exact-match", "HEAD")
+        if not comfy_active:
+            try:
+                with open(os.path.join(comfy_root, "comfyui_version.py"), encoding="utf-8") as fh:
+                    m = re.search(r'^__version__ = "(.*)"', fh.read(), re.M)
+                comfy_active = m.group(1) if m else None
+            except OSError:
+                pass
+    out["comfyUI"] = entry(comfy_active,
+                           [v for v in (comfy_active, prev.get("comfy_prev")) if v],
+                           "comfy", "llm rollback comfy", comfy_root)
     return {"llmBox": _read_version(), "engines": out,
             "cacheAgeSeconds": int(time.time() - os.path.getmtime(UPDATE_CACHE))
             if os.path.exists(UPDATE_CACHE) else None}
@@ -2155,14 +2215,21 @@ def _cli(argv: list[str]) -> int:
             cards = gpus()
             if not cards:
                 print("  no compute card detected (is rocm-smi there? groups render/video?)")
+            #  Every field is labelled rather than columnar: this block is
+            #  printed inside 'llm status' and by 'llm gpu list', where a header
+            #  row would be one more thing to scroll past. A missing sensor is
+            #  '?' and not a zero, because zero watts is a claim.
             for c in cards:
                 tot = (c.get("vramTotalBytes") or 0) / 1024**3
                 use = (c.get("vramUsedBytes") or 0) / 1024**3
-                t = c.get("tempJunctionC")
                 pin = ", ".join(c.get("pinnedModels") or [])
-                print("  card %d  junction %s°C  VRAM %.1f/%.0f GB  %s%s" % (
-                    c["index"], "?" if t is None else ("%g" % t), use, tot,
-                    c.get("name") or "", "  [%s]" % pin if pin else ""))
+                def q(key, card=c):
+                    return "?" if card.get(key) is None else ("%g" % card[key])
+                print("  card %d  junction %4s°C  %4s W  busy %3s %%  "
+                      "VRAM %.1f/%.0f GB  %s%s" % (
+                          c["index"], q("tempJunctionC"), q("powerW"),
+                          q("busyPercent"), use, tot,
+                          c.get("name") or "", "  [%s]" % pin if pin else ""))
         else:
             print(json.dumps(gpus(), indent=2))
     elif cmd == "hw":

@@ -6,7 +6,7 @@ contradicts another number.
 
 | Where | Port | Good for | Blind to |
 |---|---|---|---|
-| **The settings page** | `:8081/ui` | what is configured and changing it: models, roles, cards, versions | anything about a request in flight |
+| **The settings page** | `:8081/ui` | what is configured and changing it: models, roles, cards, versions — including updating and rolling back | anything about a request in flight |
 | **llama-swap's own UI** | `:8080/ui` | live state, per-request telemetry, logs, GPU charts, a playground | every setting, and the card list is wrong here (see below) |
 | **Open WebUI** | `:3000` | chatting, RAG, documents | hardware, contexts, load state, provenance |
 | **The registry** | `:8081/docs` | every configured detail, as JSON | it is Swagger, not a dashboard |
@@ -14,8 +14,10 @@ contradicts another number.
 
 ## The settings page
 
-`http://<server-ip>:8081/ui`. One file, no build step, no external requests, same
-origin as the API. Four views:
+`http://<server-ip>:8081/ui`. One file plus a verbatim copy of the design system
+in `web/vendor/stellar` — still no build step, still nothing fetched from
+anywhere but this server, same origin as the API. It follows your system's
+light/dark setting on its own; there is no switch to find. Four views:
 
 - **Models** — the table from `llm ls`, and per model: **VRAM estimated against
   what is free**, per card rather than as a sum (with an even tensor split a
@@ -29,11 +31,40 @@ origin as the API. Four views:
 - **Roles** — create, edit and delete, with the **effective context** in front:
   a role reports the smallest of its targets, so adding one small model shrinks
   the whole role. That trap is the reason this view exists.
-- **Cards** — the filtered card list with what is pinned where, the `llm gpu
-  sync` diff when the configuration has drifted, and the groups with their
-  `swap`/`exclusive`/`persistent` flags spelled out.
+- **Cards** — the filtered card list with junction temperature, power draw and
+  utilisation per card, what is pinned where, the `llm gpu sync` diff when the
+  configuration has drifted, and the groups with their
+  `swap`/`exclusive`/`persistent` flags spelled out. The same three figures are
+  in `llm status`, `llm gpu list` and `llm watch`, from the one `rocm-smi` query
+  in `lib/llmreg.py` — a sensor the driver does not answer reads `?` rather than
+  a confident zero.
 - **System** — versions with what is newer and what you can roll back to, and
-  links to the other interfaces.
+  **the buttons to do it**: *check now* asks upstream for the newest releases,
+  and per engine *update* or *back* starts the same work `llm update` and
+  `llm rollback` do on the server. Each is a job whose log you can follow while
+  it runs; only one runs at a time. What is newer compares **commits**, not tag
+  names — whisper.cpp publishes one commit under two of them, which used to read
+  as a permanent update. See [UPDATES.md](UPDATES.md).
+
+### Everything short explains itself
+
+`Q4_K_M`, `-kvu`, `q8_0`, `gfx1201`, `ttl`, `spillover`, `-ts` — each of those is
+the right word and none of them explains itself, and writing the explanation
+next to every occurrence would drown the numbers the page exists to show. So
+they are marked with a dotted underline and **say what they mean on hover**,
+including every flag inside a command line, a macro body and a dry-run diff —
+which is the only place those flags are visible at all.
+
+The wording is this repository's own: `FLAGS.md` for the flags and the routing
+strategies, `MODELS.md` for the quants, `API.md` for the recorded provenance,
+cut to a sentence each. Quant names are generated rather than listed, so
+`UD-Q5_K_XL` gets a sentence too.
+
+Two limits worth knowing. The underlined terms are reachable with the keyboard
+(Tab to one, Escape to dismiss), but **the flags inside a `<pre>` are hover-only
+on purpose** — thirty extra tab stops in one command line would cost more than
+the missing focus. And a term the page does not know renders as plain text, so a
+missing entry looks like nothing rather than like an empty tooltip.
 
 Reading needs nothing. Writing needs the token once: **sign in** exchanges the
 contents of `config/api-token` for an `HttpOnly` session cookie, so the token
@@ -41,6 +72,19 @@ never sits in a form field. `llm api token` prints it on the server.
 
 Deliberately absent: charts, logs, a playground, per-request telemetry. That is
 llama-swap's UI below, and it does it better.
+
+### Where the look comes from
+
+[Stellar DS](https://github.com/Polygonschmiede/stellar-ds) —
+`@polygonschmied/stellar-tokens`, vendored as two CSS files under
+`web/vendor/stellar` and served from `/ui/stellar.css`. The page's own `<style>`
+block is unlayered and therefore beats the whole `@layer stellar` stack, so it
+holds only what the design system does not cover or covers differently than a
+page of dense tables wants — the tables themselves, the sticky header, the
+`hidden` guard, the glossary. `web/vendor/stellar/README.md` has the version and
+the command that updates it; `tests/ui-matrix.sh` checks that every class and
+token the page asks for still exists afterwards, which is the failure an upgrade
+actually produces.
 
 ## llama-swap's UI — the one nobody mentions
 

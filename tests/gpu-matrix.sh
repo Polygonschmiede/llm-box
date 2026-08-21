@@ -91,4 +91,40 @@ check "igpu-first  logical 1 -> absolute 2" 2 "$(whisper_roundtrip igpu-first 1)
 check "igpu-last   logical 1 -> absolute 1" 1 "$(whisper_roundtrip igpu-last 1)"
 check "2card       logical 1 -> absolute 1" 1 "$(whisper_roundtrip 2card 1)"
 
+# ---------------------------------------------------------------------------
+#  Power and utilisation come from the same single rocm-smi query as the
+#  temperature. The trap is the label: a discrete card reports "Average
+#  Graphics Package Power", an APU "Current Socket Graphics Package Power", so
+#  matching the whole phrase would silently drop the figure on half the
+#  machines this runs on.
+# ---------------------------------------------------------------------------
+section "Power draw and utilisation per card"
+check "2card       watts on card 0"  "17.0" \
+  "$(probe 2card      "llmreg.gpus()[0]['powerW']")"
+check "2card       busy on card 0"   "42" \
+  "$(probe 2card      "llmreg.gpus()[0]['busyPercent']")"
+check "2card       busy on card 1"   "0" \
+  "$(probe 2card      "llmreg.gpus()[1]['busyPercent']")"
+check "apu-16gb    the socket label parses too" "18.0" \
+  "$(probe apu-16gb   "llmreg.gpus()[0]['powerW']")"
+check "igpu-first  the iGPU is still filtered out" "2" \
+  "$(probe igpu-first "len(llmreg.gpus())")"
+#  The table is what 'llm status', 'llm gpu list' and 'llm watch' all print, so
+#  the figures have to survive the rendering and not just the parse.
+check "the table carries both" "True" \
+  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+     python3 "$REPO/lib/llmreg.py" gpus --table \
+     | grep -q '17 W  busy  42 %' && echo True || echo False)"
+#  An older ROCm that does not answer --showpower at all: the field has to come
+#  out as '?' rather than as a confident 0 W.
+NOPOWER="$TMP/rocm-smi-nopower.sh"
+{ printf '#!/bin/sh\ncat <<SMI\n'
+  grep -v 'Power\|GPU use' "$FIXTURES/rocm-smi-1card.sh" | sed -n '4,$p' | head -n -2
+  printf 'SMI\n'; } > "$NOPOWER"
+chmod +x "$NOPOWER"
+check "a sensor the driver does not answer is '?'" "True" \
+  "$(LLM_ROCM_SMI="$NOPOWER" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+     python3 "$REPO/lib/llmreg.py" gpus --table \
+     | grep -q 'junction   29°C     ? W  busy   ? %' && echo True || echo False)"
+
 summary
