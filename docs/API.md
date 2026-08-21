@@ -224,6 +224,11 @@ return every model path, checksum and Hugging Face repo along with live VRAM.
 `/api/health` and `/api/pi-models.json` stay open either way, or nothing could
 check reachability.
 
+That variable covers MCP too. It did not: `list_models`, `get_model`,
+`gpu_status` and `job_status` answered without a token whatever it said, which
+made `LLM_API_REQUIRE_AUTH=1` a half-closed door — the same catalog and the same
+filesystem paths, reachable through `/mcp` instead of `/api`.
+
 ## Changing (header `X-LLM-Token`)
 
 The key lives in `config/api-token`, generated on first start, readable only by you:
@@ -325,6 +330,11 @@ anything that changes state demands one and says exactly what is missing otherwi
 > add it in the unit:
 > `Environment=LLM_API_ALLOWED_HOSTS=myhost:8081,llm.your-tailnet.ts.net:8081` — or
 > `*` to switch the check off. The plain HTTP API (`/api/...`) is unaffected.
+>
+> The `Origin` header is checked against the same list. It used to accept `*`,
+> which left half of that protection open to a browser-driven request while the
+> service answers with a session cookie. An MCP client that is not a browser
+> sends no `Origin` at all and never notices.
 
 pi does not need MCP — it has an extension, see [PI.md](PI.md).
 

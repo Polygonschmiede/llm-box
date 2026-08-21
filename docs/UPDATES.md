@@ -12,6 +12,13 @@ official ROCm releases are Windows-only. So llama.cpp is **built here**. llama-s
 by contrast is a prebuilt Go binary and is simply swapped. Open WebUI and ComfyUI
 are Python, handled by `uv` and git.
 
+Being the one thing here that is not built from source, that binary gets checked:
+its SHA-256 is compared against the checksum list published in the same GitHub
+release **before** the archive is unpacked, and a release without such a list is
+refused rather than installed on trust. What that proves is that the tarball
+matches what the release says it contains — release artefacts are not signed, so
+it does not prove who built it.
+
 ## How the rollback works
 
 Each llama.cpp version gets its **own build directory**, and `build` is only a
@@ -94,6 +101,10 @@ checkout, git says so, with the path.
 During an update llama-swap is **briefly stopped** (a few seconds), because VRAM and
 the binary path change. In-flight requests are cut off.
 
+`llm update swap <version>` used to install the *newest* release whatever version
+you asked for, and then report itself as the version you named — it read
+`releases/latest` regardless of the argument. It asks for the release you named.
+
 Two things a rollback cannot fix, so they are worth knowing:
 
 - Custom ComfyUI nodes may expect a newer ComfyUI API and break on a downgrade.
@@ -112,10 +123,11 @@ that depend on your hardware are detected rather than hardcoded — see
 | `-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON` | every build loads its **own** `.so` files. Without it the RUNPATH is absolute to `…/build/bin`, and a test build would load the libraries of the *active* build — which defeats the whole point of testing before switching. |
 | `-DLLAMA_BUILD_TESTS=OFF` | saves build time; the server does not need the test binaries |
 
-The flags live as `LCPP_CMAKE_FLAGS` and `hip_flags()` in `bin/llm`.
+The flags live as `LCPP_CMAKE_FLAGS` and `hip_flags()` in `lib/update.sh`.
 
-**Tip:** with `ccache` installed, rebuilds of the same version get much faster
-(`GGML_CCACHE=ON` is already set but does nothing without it).
+**Tip:** with `ccache` installed, rebuilds of the same version get much faster.
+Nothing here passes `GGML_CCACHE`; llama.cpp's own `ggml/CMakeLists.txt` defaults
+it to `ON`, and it does nothing until `ccache` is on `PATH`.
 
 ## Versions: release tags, not master
 

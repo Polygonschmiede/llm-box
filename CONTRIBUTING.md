@@ -3,7 +3,8 @@
 ## Running the tests
 
 ```bash
-bash tests/run-all.sh
+bash tests/run-all.sh            # everything that can run here
+bash tests/run-all.sh --strict   # and a skipped check counts as a failure
 ```
 
 That is the whole story — no pytest, no npm, nothing to install. **None of it
@@ -19,10 +20,24 @@ safe to run on a live server.
 | `tests/vram-matrix.sh` | KV cache size for the three layouts, and the per-card fit |
 | `tests/api-matrix.sh` | the registry's HTTP surface, both catalog shapes, auth |
 | `tests/ui-matrix.sh` | that `web/index.html` really renders, and fetches nothing external |
+| `tests/repo-matrix.sh` | the repository itself: no German, no machine paths, no tracked secret, links resolve, one version number |
 
-`tests/api-matrix.sh` needs `venv-api`; without it those checks report as
-**skipped** rather than failing. `bash bin/llm setup` builds it.
-`tests/ui-matrix.sh` additionally needs `node`, and skips the same way — it runs
+The runner finds suites by glob (`tests/*-matrix.sh`), so a new one needs no
+edit anywhere. Suites run in their own process; the totals come back through
+`LLM_TESTS_COUNTS`.
+
+### Skipped is not passed
+
+`tests/api-matrix.sh` needs `venv-api` and `tests/ui-matrix.sh` needs `node`.
+Without them those suites **skip themselves whole** — 130 of the ~300 checks.
+They used to call `skip` and then exit 0, so the runner printed
+*"all 5 suites passed"* on a machine where less than half of them had run. Now
+the summary names the skipped count, and `--strict` turns it into a failure. Use
+`--strict` before opening a pull request; CI runs it that way, and it also has a
+step that asserts `--strict` **fails** without those dependencies, so the old
+behaviour cannot come back quietly.
+
+`bash bin/llm setup` builds `venv-api`. Both suites skip the same way — it runs
 the page's script under a minimal DOM (`tests/dom-stub.js`) against payloads
 generated from a throwaway `LLM_HOME`. Curling `/ui` would not do: it answers
 200 whatever the JavaScript does, and the first version of that check passed
@@ -55,16 +70,49 @@ returned note instead of what was written to the file.
 ## Linting
 
 ```bash
-uvx ruff@latest check .
-uvx --from shellcheck-py shellcheck -x -S warning bin/llm setup-system.sh bin/install-comfyui.sh tests/*.sh
+uvx ruff@0.16.4 check .
+uvx --from shellcheck-py==0.11.0.1 shellcheck -x -S warning $(git ls-files '*.sh' bin/llm)
 ```
 
-Both must be clean; CI runs exactly these. The ruff rule set in
+Both must be clean, and **the versions are the point**. These were `ruff@latest`
+and whatever `shellcheck` the runner image shipped, which is how a tree that was
+green locally went red in CI: the runner had shellcheck 0.9.0 and the author had
+0.11.0, and only one of them saw an SC2120. The pins live in
+`.github/workflows/ci.yml` under `env:` — if you move one, move it here too.
+
+The file list is derived rather than written out for the same reason: the old
+list named four paths and therefore never checked `lib/update.sh`, which is 636
+lines that build engines and restart services. The ruff rule set in
 `pyproject.toml` is deliberately about mistakes and not taste — the pathlib and
 f-string families are off on purpose, because this codebase consistently uses
 `os.path` and `%`-formatting and switching would be a rewrite for no behaviour
 change. If a rule is wrong for a specific line, a `# noqa` **with a reason** next
 to it is preferred over a file-wide ignore.
+
+## What CI checks beyond that
+
+Six jobs in `.github/workflows/ci.yml` plus CodeQL in its own workflow. Two of
+them exist because of mistakes that already happened here, and it is worth
+knowing which:
+
+| job | what it holds down |
+|---|---|
+| `lint` | ruff, shellcheck, and `tests/repo-matrix.sh` |
+| `test` | the suites under `--strict`, after first proving that `--strict` refuses an incomplete run |
+| `docs` | `tests/check-links.py` — every relative markdown link resolves |
+| `secrets` | `gitleaks` over the whole commit history, not just the tree |
+| `deps` | `pip-audit` on `config/requirements-api.txt` only — Open WebUI's ~500 transitive packages are not this project's to pin |
+| `workflows` | `zizmor` on the workflows themselves: unpinned actions, permissions wider than needed, injection through a PR title |
+| `codeql` | Python and JavaScript/TypeScript. There is no extractor for bash, so `bin/llm` and `lib/update.sh` are covered by shellcheck and nothing else |
+
+Everything is version-pinned, actions by commit hash. Dependabot moves those
+pins weekly; that is what makes pinning something other than freezing.
+
+**`gitleaks` runs over the history for a reason.** This repository generates
+`config/api-token` and `config/api-key` per machine, and an agent worktree under
+`.claude/` is a second checkout carrying a real one. `.gitignore` covers that
+directory, and `tests/repo-matrix.sh` asks `git ls-files` — not the filesystem —
+so relaxing an ignore rule cannot quiet the check.
 
 ## Where code belongs
 
@@ -94,6 +142,8 @@ Anything user-visible gets a `CHANGELOG.md` entry in the same commit.
 
 Eight files in `docs/`, each with one job — `FLAGS.md` explains every
 llama.cpp option this stack sets and why, `MODELS.md` covers choosing and
-placing models, `API.md` and `PI.md` the agent surfaces. CI checks that every
-relative link resolves. If a change alters what a flag does, the number in the
-docs is now wrong too.
+placing models, `API.md` and `PI.md` the agent surfaces. `tests/check-links.py`
+checks that every relative link resolves — for real since this was a python
+heredoc in the workflow that read its own program from stdin and therefore
+checked nothing. If a change alters what a flag does, the number in the docs is
+now wrong too.

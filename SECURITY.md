@@ -81,8 +81,16 @@ Three consequences worth knowing before you turn it on:
   network you do not control, put TLS in front (llama-swap takes
   `-tls-cert-file`/`-tls-key-file`) or use the SSH tunnel.
 
-`llm doctor` reports the combination that matters: port 8080 answering on a
-non-loopback address with no key in force.
+**The key is also written into `config/llama-swap.yaml` in clear text**, because
+llama-swap needs it there and rejects an empty `${env.VAR}` expansion. That file
+used to be mode 644, which quietly undid the mode 600 on `config/api-key` beside
+it — any account on the machine could read the key out of the large file. Every
+write now narrows it to 600, and `llm doctor` says so if an older installation is
+still world-readable. It costs nothing: llama-swap runs as the same user.
+
+`llm doctor` reports the two combinations that matter: port 8080 answering on a
+non-loopback address with no key in force, and a configuration that holds a key
+while being readable by everyone.
 
 ## Opening it up on purpose
 
@@ -122,6 +130,39 @@ paths, context sizes, VRAM figures and Hugging Face provenance — nothing secre
 but it does describe your machine. If that matters, keep port 8081 on loopback and
 reach it through SSH, or put it behind the same proxy as everything else.
 
+`LLM_API_REQUIRE_AUTH=1` closes reads instead. Until now it closed them only over
+HTTP: the MCP tools `list_models`, `get_model`, `gpu_status` and `job_status`
+answered without a token whatever that variable said — the same catalog and the
+same filesystem paths, through a different door. They follow the switch now.
+
+Token comparison is `secrets.compare_digest` rather than `==`, so a wrong token
+takes the same time to reject as a nearly-right one.
+
+## What gets downloaded, and what is checked
+
+Everything this project installs it builds from source over HTTPS — llama.cpp,
+whisper.cpp and ComfyUI are git clones, and a requested tag is resolved to its
+commit and compared, so a moved tag does not silently become a different build.
+
+The **one** exception is the `llama-swap` binary, which comes from a GitHub
+release as a tarball. Its only gate used to be that the extracted file answered
+`--version`, which a substituted tarball would also do. It is now verified with
+`sha256sum` against the checksum list published in the same release, before the
+archive is unpacked, and a release that ships no checksum list is refused rather
+than installed unverified.
+
+Not covered, and worth knowing: release artefacts are not signed, so this proves
+the tarball matches what that release says it contains — not who built it.
+Python packages come from PyPI unpinned (`fastapi`, `uvicorn`, `open-webui`) and
+torch from `download.pytorch.org`; `pip-audit` runs against the registry's
+requirements in CI, but the chat UI's ~500 transitive packages are not this
+project's to vouch for.
+
+Model files are checked differently: `llm add` verifies that the revision exists
+at the recorded commit through the Hugging Face API, and records the SHA-256 that
+the download reported. It does **not** recompute the digest from the file on
+disk, so that number is provenance, not an integrity check.
+
 ## What is deliberately not in this repository
 
 - `config/api-token` — generated per machine
@@ -132,5 +173,11 @@ reach it through SSH, or put it behind the same proxy as everything else.
 
 ## Reporting something
 
-Open an issue. If you would rather not do that publicly, say so in a minimal issue
-without details and we will find another channel.
+Privately, through
+[GitHub Security Advisories](https://github.com/Polygonschmiede/llm-box/security/advisories/new)
+— that channel is open on this repository and does not make the report public.
+
+Anything that is only a limitation of the design above (llama-swap being
+default-allow, reads on 8081 being open, ComfyUI having no authentication) is
+documented on purpose and belongs in a normal issue. Anything that gets past a
+door this file claims is shut is worth the private channel.
