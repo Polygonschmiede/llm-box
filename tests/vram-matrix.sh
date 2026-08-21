@@ -116,7 +116,8 @@ section "check_fit counts per card, not the sum"
 fit(){ # $1=fixture  $2=weights GB  $3=card number or "both"  $4=field
   local gpu mode
   if [[ "$3" == both ]]; then gpu="'both'"; mode=both; else gpu="$3"; mode=single; fi
-  LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' pyx "
+  LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" \
+  LLM_DGPUS='' LLM_MIN_VRAM_GB='' pyx "
 m = {'runtime': {'gpu': {'device': $gpu, 'mode': '$mode'},
                  'contextWindow': None, 'kvCacheQuant': None, 'parallel': 1},
      'vram': {'weightsBytes': int($2 * $GB)},
@@ -131,14 +132,14 @@ check "40 GB over two cards"           "True"  "$(fit 2card 40 both ok)"
 check "60 GB over two cards"           "False" "$(fit 2card 60 both ok)"
 check "60 GB over three cards"         "True"  "$(fit 3card 60 both ok)"
 check "the 8% headroom is applied"     "True" \
-  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" pyx "
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" pyx "
 m = {'runtime': {'gpu': {'device': 0, 'mode': 'single'}, 'contextWindow': None,
                  'kvCacheQuant': None, 'parallel': 1},
      'vram': {'weightsBytes': 10 * $GB}, 'files': {}, 'state': 'unloaded'}
 print(llmreg.check_fit(m, gpu=0)['needBytes'] == int(10 * $GB * 1.08))")"
 check "no cards detected -> no refusal" "True" "$(fit none 999 0 ok)"
 check "a loaded model does not block itself" "True" \
-  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" pyx "
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" pyx "
 m = {'runtime': {'gpu': {'device': 0, 'mode': 'single'}, 'contextWindow': None,
                  'kvCacheQuant': None, 'parallel': 1},
      'vram': {'weightsBytes': 30 * $GB}, 'files': {}, 'state': 'ready'}

@@ -61,8 +61,15 @@ $1
   printf '%s' "$out"
 }
 
+#  Every probe runs against ONE throwaway LLM_HOME (see PROBE_HOME below).
+#  Without it these ran against whatever config happened to be in the checkout -
+#  which exists on a machine that uses this stack and does NOT exist in a fresh
+#  clone, where llmreg raises ConfigMissing instead. Fifteen checks in
+#  gpu-matrix and vram-matrix passed locally for exactly that reason and failed
+#  the first time CI ran them.
 probe(){ # $1=fixture  $2=expression -> one line
-  LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+  LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" \
+  LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
     pyx "print($2)"
 }
 
@@ -95,6 +102,10 @@ YAMLEOF
   fi
   printf '%s' "$home"
 }
+
+#  One sandbox for the read-only probes, so they never depend on the checkout.
+#  Cheap: a mkdir and a heredoc.
+PROBE_HOME="$(sandbox)"
 
 #  Append a marker block for one model to a sandbox config. Only blocks with
 #  markers are visible to parse_config, so a hand-added entry is invisible.

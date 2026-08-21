@@ -58,10 +58,10 @@ check "2card     stays quiet"               0 "$(probe 2card "len(llmreg.hw()['w
 
 section "LLM_DGPUS overrides the detection"
 check "igpu-last, only card 1 allowed" "1" \
-  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-igpu-last.sh" LLM_DGPUS=1 \
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-igpu-last.sh" LLM_DGPUS=1 \
      pyx "print(llmreg.hw()['hipVisibleDevices'])")"
 check "igpu-last, iGPU forced"         "2" \
-  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-igpu-last.sh" LLM_DGPUS=2 \
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-igpu-last.sh" LLM_DGPUS=2 \
      pyx "print(llmreg.hw()['hipVisibleDevices'])")"
 
 # ---------------------------------------------------------------------------
@@ -112,8 +112,8 @@ check "igpu-first  the iGPU is still filtered out" "2" \
 #  The table is what 'llm status', 'llm gpu list' and 'llm watch' all print, so
 #  the figures have to survive the rendering and not just the parse.
 check "the table carries both" "True" \
-  "$(LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
-     python3 "$REPO/lib/llmreg.py" gpus --table \
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" \
+     LLM_DGPUS='' LLM_MIN_VRAM_GB='' python3 "$REPO/lib/llmreg.py" gpus --table \
      | grep -q '17 W  busy  42 %' && echo True || echo False)"
 #  An older ROCm that does not answer --showpower at all: the field has to come
 #  out as '?' rather than as a confident 0 W.
@@ -123,8 +123,8 @@ NOPOWER="$TMP/rocm-smi-nopower.sh"
   printf 'SMI\n'; } > "$NOPOWER"
 chmod +x "$NOPOWER"
 check "a sensor the driver does not answer is '?'" "True" \
-  "$(LLM_ROCM_SMI="$NOPOWER" LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
-     python3 "$REPO/lib/llmreg.py" gpus --table \
+  "$(LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$NOPOWER" \
+     LLM_DGPUS='' LLM_MIN_VRAM_GB='' python3 "$REPO/lib/llmreg.py" gpus --table \
      | grep -q 'junction   29°C     ? W  busy   ? %' && echo True || echo False)"
 
 summary

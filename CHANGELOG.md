@@ -65,6 +65,14 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   stray event handler and was a re-render forgetting what it had. Now recorded,
   with a test that clicks *details*, triggers the refresh and fails if the body
   shut itself.
+- **Two test suites had never actually run against a fresh checkout.**
+  `gpu-matrix` and `vram-matrix` probed `llmreg` without setting `LLM_HOME`, so
+  they read whatever `config/llama-swap.yaml` happened to be in the working
+  copy. That file is gitignored — it exists on a machine that uses this stack and
+  does not exist in a clone, where every function touching the config raises
+  `ConfigMissing`. Seventeen and nine checks respectively passed locally for that
+  reason and failed the first time CI ran them. The probes now share one
+  throwaway `LLM_HOME`, which also makes them deterministic.
 - `tests/dom-stub.js` read `hidden` as false whenever it had been set the way
   `el()` sets it (`setAttribute("hidden", "")`), so anything asserting on a
   collapsed element passed for the wrong reason. It also returned `this` from
