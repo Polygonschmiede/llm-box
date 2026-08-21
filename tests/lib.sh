@@ -127,6 +127,26 @@ YAMLEOF
 #  passed by anyone" (SC2120).
 PROBE_HOME="$(sandbox "")"
 
+#  A sandbox that bin/llm can actually run in.
+#
+#  LLM_HOME is the INSTALLATION directory, not just where the configuration
+#  lives: bin/llm finds lib/update.sh, lib/llmreg.py, VERSION and the example
+#  config under it as well. Pointing it at a bare temporary directory therefore
+#  breaks the script at its first `source`, which is why the CLI had no test -
+#  the sandbox every other suite uses is a config directory, not an installation.
+#
+#  Symlinks rather than copies: the code is read-only in a test, and copying
+#  bin/ would copy the llama-swap binaries with it.
+cli_home(){ # [template] -> prints the LLM_HOME path
+  local home
+  home="$(sandbox "${1:-}")"
+  ln -sfn "$REPO/lib" "$home/lib"
+  ln -sfn "$REPO/bin" "$home/bin"
+  ln -sfn "$REPO/VERSION" "$home/VERSION"
+  ln -sfn "$REPO/config/llama-swap.example.yaml" "$home/config/llama-swap.example.yaml"
+  printf '%s' "$home"
+}
+
 #  Append a marker block for one model to a sandbox config. Only blocks with
 #  markers are visible to parse_config, so a hand-added entry is invisible.
 add_block(){ # $1=LLM_HOME  $2=name  $3=cmd  [$4=extra body lines]
