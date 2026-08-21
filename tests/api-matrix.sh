@@ -148,6 +148,15 @@ section "the endpoints the control page needs"
 check "/api/versions"          "200" "$(api "print(c.get('/api/versions').status_code)")"
 check "it names llm-box"       "True" \
   "$(api "print('llmBox' in c.get('/api/versions').json())")"
+#  Which backend the engines were built for. The page reads it from here rather
+#  than making a ninth call, so a payload without it leaves the Cards tab
+#  describing the wrong device names.
+check "and the compute backend" "rocm" \
+  "$(api "print(c.get('/api/versions').json()['backend'])")"
+check "/api/state carries it too" "rocm" \
+  "$(api "print(c.get('/api/state').json()['backend'])")"
+check "and /api/health"           "rocm" \
+  "$(api "print(c.get('/api/health').json()['backend'])")"
 check "/api/config"            "200" "$(api "print(c.get('/api/config').status_code)")"
 check "macros come through"    "True" \
   "$(api "print('server' in c.get('/api/config').json()['macros'])")"

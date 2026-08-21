@@ -144,6 +144,17 @@ let src = fs.readFileSync(process.argv[3], "utf8").replace(/^"use strict";/, "")
         && /busy \d+ %/.test(cards), ""],
       ["and both say what they mean", /:: Graphics package power/.test(cardTips)
         && /:: The share of time/.test(cardTips), ""],
+      //  Which backend answered decides how every number on this tab was read,
+      //  so the tab says it - and the explanation is the one for the backend in
+      //  force, not a generic sentence covering both.
+      ["the cards tab names the backend", /backend rocm/.test(cards), ""],
+      ["and explains what that means here",
+        /^backend rocm :: ROCm: one rocm-smi query/m.test(cardTips), ""],
+      //  The device prefix in the prose follows the backend too. Under Vulkan
+      //  this sentence has to read --device VulkanN, and a hardcoded "ROCmN"
+      //  would still pass a check that only looked for the word "device".
+      ["the logical-number note names the right prefix",
+        /--device ROCmN/.test(cards) && !/--device VulkanN/.test(cards), ""],
     ];
     let bad = 0;
     for (const [name, ok, extra] of checks) {

@@ -29,6 +29,8 @@ checks=0
 mkdir -p "$FIXTURES"
 LLM_FIXTURE_DIR="$FIXTURES" python3 "$REPO/tests/fixtures/mk-smi.py" >/dev/null \
   || { echo "fixtures could not be generated"; exit 1; }
+LLM_FIXTURE_DIR="$FIXTURES" python3 "$REPO/tests/fixtures/mk-vulkan.py" >/dev/null \
+  || { echo "Vulkan fixtures could not be generated"; exit 1; }
 
 check(){ # $1=case  $2=expected  $3=actual
   checks=$((checks + 1))
@@ -68,7 +70,22 @@ $1
 #  gpu-matrix and vram-matrix passed locally for exactly that reason and failed
 #  the first time CI ran them.
 probe(){ # $1=fixture  $2=expression -> one line
-  LLM_HOME="$PROBE_HOME" LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" \
+  LLM_HOME="$PROBE_HOME" LLM_BACKEND=rocm LLM_ROCM_SMI="$FIXTURES/rocm-smi-$1.sh" \
+  LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
+    pyx "print($2)"
+}
+
+#  The same, against the Vulkan backend. Two sources rather than one: identity
+#  and order from a fake vulkaninfo, everything measurable from a fake sysfs
+#  tree - see tests/fixtures/mk-vulkan.py, which permutes the DRM minors so that
+#  pairing the two by position instead of by minor fails here.
+#
+#  LLM_BACKEND is set explicitly on BOTH probes, never left to detection: the
+#  machine running the tests has its own answer, and a suite whose result depends
+#  on that is the class of test this project has already been bitten by twice.
+vprobe(){ # $1=fixture  $2=expression -> one line
+  LLM_HOME="$PROBE_HOME" LLM_BACKEND=vulkan \
+  LLM_VULKANINFO="$FIXTURES/vulkaninfo-$1.sh" LLM_SYSFS_ROOT="$FIXTURES/sysfs-$1" \
   LLM_DGPUS='' LLM_MIN_VRAM_GB='' \
     pyx "print($2)"
 }
