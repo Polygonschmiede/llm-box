@@ -98,6 +98,55 @@ for f in "$gen"/rocm-smi-*.sh; do
 done
 check "the committed rocm-smi fixtures are current" "" "$drift"
 
+section "the documentation says what the code does"
+
+#  Three kinds of drift that review does not catch, because each is a fact in one
+#  file that has to match a fact in another.
+
+#  1. Every command bin/llm dispatches is reachable from 'llm help'. A case arm
+#     with several names counts as covered if ANY of them is in the help - that is
+#     what an alias is. 'watch-once' is the exception: 'llm watch' runs it through
+#     `watch`, and a user has no reason to type it.
+HELP="$(NO_COLOR=1 bash bin/llm help 2>/dev/null)"
+undocumented=""
+while read -r arm; do
+  covered=no
+  for name in ${arm//|/ }; do
+    [[ "$name" == "watch-once" ]] && { covered=yes; break; }
+    #  A whole word anywhere in the help text. Not "llm <name>": the help lists
+    #  aliases on shared lines - `llm start|stop|restart`, `llm role|roles` - and
+    #  a pattern demanding the prefix reported `restart` as undocumented when it
+    #  is on the same line as `start`.
+    grep -qw -- "$name" <<<"$HELP" && { covered=yes; break; }
+  done
+  [[ "$covered" == yes ]] || undocumented="$undocumented $arm"
+done < <(sed -n '/^case "\${1:-}" in/,$p' bin/llm \
+         | sed -n 's/^  \([a-zA-Z|_-]\+\)).*/\1/p')
+check "every command is in 'llm help'" "" "$undocumented"
+
+#  2. Every suite is in CONTRIBUTING's TABLE. Scoped to the table on purpose:
+#     grepping the whole file passes when the name happens to appear in prose
+#     somewhere, which is how the first version of this check stayed green after
+#     the row was removed.
+table="$(sed -n '/^| suite |/,/^$/p' CONTRIBUTING.md)"
+missing=""
+for f in tests/*-matrix.sh; do
+  grep -q "$(basename "$f")" <<<"$table" || missing="$missing $(basename "$f")"
+done
+check "every suite has a row in CONTRIBUTING" "" "$missing"
+
+#  3. The linter versions CONTRIBUTING tells you to run are the ones CI runs.
+#     This is the drift that turned a locally green tree red: the runner image
+#     shipped 0.9.0 and the author had 0.11.0, and only one of them saw an
+#     SC2120. Pinning both only helps while the two numbers stay equal, and
+#     nothing but this check makes them. (Wording note: a comment line starting
+#     with the word "shellcheck" is read as a directive, so it does not.)
+ci_ver(){ grep -E "^  $1:" .github/workflows/ci.yml | head -1 | cut -d'"' -f2; }
+check "CONTRIBUTING quotes CI's ruff"       "ruff@$(ci_ver RUFF_VERSION)" \
+  "$(grep -oE 'ruff@[0-9.]+' CONTRIBUTING.md | head -1)"
+check "and CI's shellcheck"                 "shellcheck-py==$(ci_ver SHELLCHECK_VERSION)" \
+  "$(grep -oE 'shellcheck-py==[0-9.]+' CONTRIBUTING.md | head -1)"
+
 section "one version number"
 
 ver_file=$(cat VERSION 2>/dev/null)

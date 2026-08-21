@@ -68,6 +68,12 @@ what you want while working on one area.
 A crash inside `pyx` reports the exception and prints the traceback, rather than
 presenting as an ordinary mismatch.
 
+Three of those checks are about the documentation rather than the code: every
+command `bin/llm` dispatches is reachable from `llm help`, every suite has a row
+in the table above, and the linter versions quoted under **Linting** are the ones
+`ci.yml` runs. Each is a fact in one file that has to match a fact in another,
+which is exactly what review does not catch.
+
 **The check that matters most: break the thing on purpose and confirm the suite
 goes red.** Every fix in `CHANGELOG.md` 1.2.0 was verified that way. A test that
 cannot fail is worse than no test, because it reads like cover. Two of the first
