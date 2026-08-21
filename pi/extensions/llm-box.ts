@@ -28,6 +28,12 @@ const PROVIDER = "llm-box";
 //  loopback plus a clear message in refreshModels, rather than baking some
 //  network's address in here.
 const DEFAULT_URL = "http://127.0.0.1:8081";
+//  One wording for both places that can hit a 401: the JSON helper and the
+//  event stream. Reads are open by default, so this only shows up on a server
+//  started with LLM_API_REQUIRE_AUTH=1 - or for a write without a token.
+const TOKEN_HINT =
+  "The registry requires a token. Run 'llm api token' on the server and set it " +
+  "as LLM_BOX_TOKEN, or put it in ~/.pi/agent/llm-box.json.";
 
 type Config = { url: string; token: string };
 
@@ -56,12 +62,7 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   });
   const text = await res.text();
   if (!res.ok) {
-    if (res.status === 401) {
-      throw new Error(
-        "The registry requires a token. Run 'llm api token' on the server and set it " +
-          "as LLM_BOX_TOKEN, or put it in ~/.pi/agent/llm-box.json.",
-      );
-    }
+    if (res.status === 401) throw new Error(TOKEN_HINT);
     throw new Error(`${res.status}: ${text.slice(0, 400)}`);
   }
   return text ? (JSON.parse(text) as T) : (null as T);
@@ -122,20 +123,40 @@ function short(m: any): string {
 }
 
 export default async function (pi: ExtensionAPI) {
-  const { url } = config();
-
   // --- models: always live from the registry ------------------------------
+  //  Two values the server owns: the address clients are meant to use, and the
+  //  inference key if 'llm key' is on. Both are resolved once, here - pi takes
+  //  them at registerProvider time - so a rotation on the server needs a new pi
+  //  session. Only the model list is live.
   let publicApi = "http://127.0.0.1:8080/v1";   // replaced from /api/health
+  let apiKey = "sk-local";   // no key set: llama.cpp ignores the value, but pi
+                             // wants to see one
   try {
     publicApi = (await api<any>("/api/health")).publicApi ?? publicApi;
   } catch {
     /* server down - refreshModels reports it again later */
   }
+  //  Deliberately a second request rather than taking baseUrl from here too:
+  //  /api/health needs no token ever, while this payload is token-only once it
+  //  carries a key. Keeping them apart means a client without the token still
+  //  learns the right address instead of talking to its own loopback.
+  try {
+    apiKey =
+      (await api<any>("/api/pi-models.json"))?.providers?.[PROVIDER]?.apiKey ?? apiKey;
+  } catch (err) {
+    //  Unreachable is not worth a word here - refreshModels says it once, and
+    //  repeating it adds nothing. A 401 is a different matter: it means a key IS
+    //  set and we have none, so every completion would come back 401 from the
+    //  inference port with 'sk-local'. That is worth saying out loud.
+    if ((err as Error).message === TOKEN_HINT) {
+      console.error(`[llm-box] the server requires an inference key. ${TOKEN_HINT}`);
+    }
+  }
 
   pi.registerProvider(PROVIDER, {
     name: "LLM Box (local)",
     baseUrl: publicApi,
-    apiKey: "sk-local", // llama.cpp does not check the value, pi wants to see one
+    apiKey,
     api: "openai-completions",
     async refreshModels({ signal }: { signal?: AbortSignal } = {}) {
       try {
@@ -145,7 +166,17 @@ export default async function (pi: ExtensionAPI) {
         // pi does abort refresh runs (several passes at startup) - that is not
         // an error and must not be reported as "server down".
         if (signal?.aborted || (err as Error).name === "AbortError") return [];
-        console.error(`[llm-box] registry ${url} not reachable: ${(err as Error).message}`);
+        //  Read here, not once at load: a URL configured after pi started would
+        //  otherwise be named wrongly in a message about the request that used it.
+        const { url } = config();
+        const msg = (err as Error).message;
+        //  A 401 is not "not reachable" - the server answered, it just wants a
+        //  token. The wrong wording sends people to look at their firewall.
+        if (msg === TOKEN_HINT) {
+          console.error(`[llm-box] ${msg}`);
+          return [];
+        }
+        console.error(`[llm-box] registry ${url} not reachable: ${msg}`);
         if (url === DEFAULT_URL) {
           console.error(
             "[llm-box] No address configured yet. Run 'llm api client' on the server" +
@@ -176,11 +207,26 @@ export default async function (pi: ExtensionAPI) {
   });
 
   async function watchRegistry(ac: AbortController, ctx: any) {
-    const { url } = config();
     let lastMtime: number | undefined;
+    let warnedAuth = false;
     while (!ac.signal.aborted) {
+      //  Per attempt, not once: the token may be configured after pi started.
+      const { url, token } = config();
       try {
-        const res = await fetch(`${url}/api/events`, { signal: ac.signal });
+        //  Not through api() - that parses JSON, and this is a stream. The
+        //  header has to match it though: /api/events counts as a read, and
+        //  reads need a token on a server with LLM_API_REQUIRE_AUTH=1.
+        const res = await fetch(`${url}/api/events`, {
+          signal: ac.signal,
+          headers: token ? { "X-LLM-Token": token } : {},
+        });
+        //  Without this the 401 is invisible: the catch below swallows it, we
+        //  reconnect every 15 s forever, and the catalog silently never
+        //  refreshes again. Once is enough - it would otherwise repeat all day.
+        if (res.status === 401 && !warnedAuth) {
+          warnedAuth = true;
+          console.error(`[llm-box] the event stream needs a token. ${TOKEN_HINT}`);
+        }
         if (!res.ok || !res.body) throw new Error(String(res.status));
         const reader = res.body.getReader();
         const decoder = new TextDecoder();

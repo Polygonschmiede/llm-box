@@ -59,6 +59,35 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 
 ### Fixed
 
+- **The pi extension's event stream sent no token.** `/api/events` counts as a
+  read, and reads need the token once the registry runs with
+  `LLM_API_REQUIRE_AUTH=1` — but the watcher called `fetch` directly instead of
+  going through the helper that sets `X-LLM-Token`. The 401 landed in an empty
+  `catch`, so the client reconnected every fifteen seconds forever and the
+  catalog silently stopped following the server: no message, no failure, just a
+  session working from a state that quietly aged. The header is sent now, the
+  configuration is re-read per attempt so a token added after startup takes
+  effect, and a 401 is reported once instead of never.
+- **The extension never read the inference key, while the documentation said it
+  did.** `apiKey` was the literal `sk-local` and `GET /api/pi-models.json` was
+  never called, so with `llm key` on the provider sent a value the endpoint had
+  stopped accepting and every completion came back 401 — from port 8080, with a
+  model list that looked perfectly healthy. The key now comes from the registry
+  along with everything else. `/api/health` stays a separate request on purpose:
+  it never needs a token, so a client without one still learns the right address
+  instead of falling back to its own loopback. Documented with the limit that
+  actually applies — pi takes the key when the provider is registered, so a
+  rotation on the server needs a new session on the client, not just a refresh.
+- **A 401 was reported as "registry not reachable".** The server had answered —
+  it just wanted a token — and the wording sent people to look at their firewall
+  instead. It now says which of the two it is, and names the address from the
+  configuration as it stands rather than as it stood when pi started.
+- **`llm api client` and the setup guide named only half the leftovers.** A client
+  configured by hand before the extension existed keeps `defaultProvider` and
+  `defaultModel` in `~/.pi/agent/settings.json`, and those two survive the deleted
+  `models.json` — so pi goes on pointing at a provider that no longer exists while
+  the registry's catalogue sits unused right next to it. Both the printout and
+  step 5 of `docs/PI.md` say so now.
 - **An expanded model closed itself again after fifteen seconds.** The refresh
   re-renders the whole tab and the detail body was built with `hidden` set every
   time, so the state was thrown away on the next tick — which looked like a
