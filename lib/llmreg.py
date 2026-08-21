@@ -1522,12 +1522,18 @@ def write_env() -> dict:
     #  empty: lib/update.sh reads them with hw_get, and an absent key and an
     #  empty one mean the same thing there while a MISSING line reads as "this
     #  file predates the backend that needs it".
+    #
+    #  LLM_TENSOR_SPLIT used to be written here and was read by nothing - not by
+    #  bin/llm, not by lib/update.sh, and not by llama.cpp, which knows nothing of
+    #  that name. The units pull this file in with EnvironmentFile=-, so it was a
+    #  dead variable exported into every service. The -ts value lives in the chat
+    #  macros, where sync_tensor_split maintains it; `tensorSplit` is still in the
+    #  hw() payload, which is where the API and 'llm doctor' read it from.
     body = "".join("%s=%s\n" % kv for kv in (
         ("LLM_BACKEND", info["backend"]),
         (info["visibleEnv"], info["hipVisibleDevices"]),
         ("LLM_GFX_TARGETS", info["gfxTargets"] or ""),
         ("LLM_HIP_COMPILER", info["hipCompiler"] or ""),
-        ("LLM_TENSOR_SPLIT", info["tensorSplit"] or ""),
     ))
     #  ComfyUI holds VRAM for as long as it runs, so it only sees one card -
     #  which one is a matter of taste and settable with LLM_COMFY_GPU. Always
@@ -1964,7 +1970,7 @@ def backfill(dirname: str, repo: str | None = None, quant: str | None = None,
                 files.append({"name": f, "sizeBytes": os.path.getsize(p),
                               "sha256": file_digest(p)})
         write_meta(d, {"repo": result["repo"], "revision": sha, "quant": quant,
-                       "files": files, "source": "backfill" if not repo else "manuell",
+                       "files": files, "source": "backfill" if not repo else "manual",
                        "verified": result["verified"],
                        "addedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                 time.gmtime(os.path.getmtime(d)))})
