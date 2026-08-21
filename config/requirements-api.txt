@@ -10,4 +10,4 @@ uvicorn
 # mcp 2.0 renamed 'mcp.server.fastmcp' to 'mcp.server.mcpserver' - bin/llm-api.py
 # imports FastMCP and does not start with 2.x. Until that import is migrated, the
 # 1.x series is required.
-mcp>=1.27,<2
+mcp>=2.0.0,<3
