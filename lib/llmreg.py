@@ -1176,6 +1176,15 @@ def _write_config(text: str) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
     shutil.copymode(CONFIG, tmp)
+    #  An apiKeys entry makes this file a secret, so it stops being world
+    #  readable. 'llm key new' wrote the key to config/api-key with mode 600 and
+    #  then a copy of it into here, which 'llm init' had created 644 - the
+    #  careful mode on the small file was undone by the large one beside it.
+    #  Narrowing costs nothing: llama-swap runs as the same user.
+    #  Done here rather than in sync_api_key because this is the one place every
+    #  config write passes through, so the mode cannot drift back afterwards.
+    if re.search(r"^\s*apiKeys:", text, re.M):
+        os.chmod(tmp, 0o600)
     os.replace(tmp, CONFIG)
 
 
@@ -2115,8 +2124,12 @@ def sync_api_key(text: str | None = None) -> str:
                      "#  the same one in config/api-key.\n"
                      "OPENAI_API_KEY=%s\n" % (key or "sk-local"))
         os.chmod(API_KEY_ENV, 0o600)
-    except OSError:
-        pass
+    except OSError as exc:
+        #  Not swallowed: if this file cannot be written the chat UI keeps
+        #  offering the previous key and every request through it starts failing
+        #  401 after the next restart, with nothing anywhere saying why.
+        sys.stderr.write("warning: could not write %s (%s) - the chat UI will "
+                         "keep using its previous key\n" % (API_KEY_ENV, exc))
     if not key:
         return put_block(text, _APIKEY_MARK, "")
     head = ("# " + "=" * 76 + "\n"

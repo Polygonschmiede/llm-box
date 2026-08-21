@@ -483,6 +483,16 @@ cmd_doctor(){
     _warn "port 8080 answers on $bind with no key - anyone who reaches it can run models, read the logs and empty the VRAM" \
           "llm key new    (or bind to 127.0.0.1 and use an SSH tunnel, see SECURITY.md)"
   fi
+  #  With a key in force the configuration CONTAINS it in clear text. 'llm init'
+  #  creates that file 644, so the mode 600 on config/api-key was undone by the
+  #  copy of the key two lines further up. New writes narrow it themselves; an
+  #  installation from before that change needs one chmod.
+  if [[ -n "$key" && -f "$CONFIG" ]]; then
+    local mode; mode="$(stat -c %a "$CONFIG" 2>/dev/null)"
+    [[ "$mode" == 600 ]] && _ok "the configuration holds the key and is mode $mode" \
+      || _warn "the configuration holds the inference key and is mode $mode - readable by every account on this machine" \
+               "chmod 600 $CONFIG"
+  fi
 
   echo
   if [[ $fails -eq 0 && $warns -eq 0 ]]; then ok "Everything checks out."
@@ -1078,7 +1088,8 @@ ${c_b}Once on the client machine - for the pi agent:${c_0}
   ${c_y}# needed if the agent may also CHANGE things (card, context, load) -
   # and NOT optional once 'llm key' is on, because the model list then
   # carries the inference key and is no longer handed out unauthenticated:${c_0}
-  echo '{"url": "http://$ip:8081", "token": "$tok"}' > ~/.pi/agent/llm-box.json
+  mkdir -p ~/.pi/agent
+  (umask 077; echo '{"url": "http://$ip:8081", "token": "$tok"}' > ~/.pi/agent/llm-box.json)
 
   ${c_y}# leftovers, if the server used to be configured there by hand:${c_0}
   mv ~/.pi/agent/models.json ~/.pi/agent/models.json.old
