@@ -418,6 +418,15 @@ Version numbers describe **llm-box itself**, not the engines it drives —
     `--device VulkanN` means. Verified by breaking four things deliberately and
     watching the suite catch each.
 
+- **Three checks that hold the documentation to the code.** Every command
+  `bin/llm` dispatches has to be reachable from `llm help`, every test suite has
+  to have a row in `CONTRIBUTING.md`'s table, and the linter versions that file
+  tells you to run have to be the ones `ci.yml` runs. Each is a fact in one file
+  that must match a fact in another — the kind of drift review does not catch, and
+  the last one is the drift that turned a locally green tree red in the first
+  place. All three were confirmed by breaking them; the suite-table check had to
+  be scoped to the table itself, because grepping the whole file passed on a name
+  that also appeared in prose.
 - **`tests/unit/` — pytest, 67 checks on `lib/llmreg.py`.** The bash harness
   compares strings, and a lot of what that file does is not a string: a function
   whose answer is a raised exception, a module reimported with different
