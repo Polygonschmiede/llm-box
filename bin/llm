@@ -1287,9 +1287,9 @@ case "${1:-}" in
                       #  config and binaries disagree.
                       if reg backend "$3" >/dev/null; then
                         ok "backend is now $3."
-                        warn "the engines are still built for the other one:  llm update llama"
-                        [[ -d "${LLM_WHISPER_HOME:-$HOME/whisper.cpp}" ]] && \
-                          warn "and whisper.cpp with it:  llm update whisper"
+                        #  Relinks where a build for the new backend already
+                        #  exists, and says what to run where it does not.
+                        backend_relink
                       else
                         exit 1
                       fi

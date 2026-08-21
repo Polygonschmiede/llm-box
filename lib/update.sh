@@ -107,30 +107,53 @@ vulkan_flags(){                             # -> array in BACKEND_FLAGS
 # ============================================================================
 #  One build directory per version - and per backend
 # ============================================================================
-#  build-<tag> carries no backend in its name, so a HIP and a Vulkan build of
-#  the same tag would land in the same place and lcpp_active could not tell them
-#  apart. Rather than change the naming (and with it lcpp_builds, lcpp_prune,
-#  rollback and every recorded version), each build records what it was built
-#  for and a mismatch forces a rebuild.
+#  A HIP and a Vulkan build of the same tag are two different binaries, so they
+#  need two directories. The backend goes in the NAME rather than into a marker
+#  file inside it, which is what the first attempt did: with the name carrying it,
+#  both can exist at once and switching backend is a symlink change - the same
+#  seconds a rollback takes - instead of a rebuild every time.
 #
-#  The cost, and it is real: switching backend means rebuilding, and the
-#  KEEP_BUILDS fallbacks are per backend rather than shared. Holding both at
-#  once for an A/B comparison is not possible without a wait. docs/UPDATES.md
-#  says so.
-build_backend(){                            # $1=build directory -> backend or ''
-  [[ -f "$1/.llm-backend" ]] && cat "$1/.llm-backend" 2>/dev/null && return 0
-  #  No marker: built before backends existed, which can only have been ROCm.
-  [[ -d "$1" ]] && printf 'rocm'
+#      build-b10545              ROCm  (unchanged, so every existing
+#                                       installation keeps working untouched)
+#      build-vulkan-b10545       Vulkan
+#
+#  Only non-default backends are prefixed. That asymmetry is deliberate: renaming
+#  the existing directories would invalidate every recorded rollback target on
+#  every machine that already runs this.
+#
+#  KEEP_BUILDS therefore counts PER BACKEND, and 'llm versions' lists the active
+#  backend's builds. The first build of each backend still costs a build; after
+#  that, back and forth is free.
+bd_name(){ # $1=tag  [$2=backend, default: active]  -> directory name
+  local b="${2:-$(llm_backend)}"
+  if [[ "$b" == rocm ]]; then printf 'build-%s' "$1"; else printf 'build-%s-%s' "$b" "$1"; fi
 }
 
-build_backend_set(){ # $1=build directory
-  printf '%s\n' "$(llm_backend)" > "$1/.llm-backend" 2>/dev/null
+bd_tag(){ # $1=directory name -> the tag inside it
+  local n="${1#build-}"
+  printf '%s' "${n#vulkan-}"
 }
 
-#  Is this existing build usable as-is, or does it belong to the other backend?
-build_backend_ok(){ # $1=build directory
-  local want have; want="$(llm_backend)"; have="$(build_backend "$1")"
-  [[ "$have" == "$want" ]]
+#  Directories of ONE backend, newest first. Scoping this is what keeps
+#  lcpp_prune from deleting the other backend's fallbacks and 'llm versions' from
+#  offering a rollback that would silently change backend.
+bd_list(){ # $1=repository  [$2=backend, default: active]
+  local b="${2:-$(llm_backend)}" glob
+  glob="$(bd_name '*' "$b")"
+  find "$1" -maxdepth 1 -type d -name "$glob" -printf '%T@ %p\n' 2>/dev/null \
+    | { if [[ "$b" == rocm ]]; then grep -v '/build-vulkan-'; else cat; fi; } \
+    | sort -rn | cut -d' ' -f2-
+}
+
+#  Which backend does the CURRENTLY ACTIVE build belong to? Read from the
+#  symlink, so it is the truth about the running binary rather than about the
+#  configured preference - those differ exactly between a backend switch and the
+#  rebuild or re-link that follows it.
+active_backend(){ # $1=repository
+  local t
+  [[ -L "$1/build" ]] || { printf 'rocm'; return; }
+  t="$(basename "$(readlink -f "$1/build")")"
+  case "$t" in build-vulkan-*) printf 'vulkan';; *) printf 'rocm';; esac
 }
 LCPP_CMAKE_FLAGS=(
   -DCMAKE_BUILD_TYPE=Release
@@ -147,12 +170,12 @@ LCPP_CMAKE_FLAGS=(
 #  Before switching, a smoke test runs with a real model.
 
 lcpp_active(){                                  # before the migration: git HEAD
-  if [[ -L "$LCPP/build" ]]; then basename "$(readlink -f "$LCPP/build")" | sed 's/^build-//'
+  if [[ -L "$LCPP/build" ]]; then bd_tag "$(basename "$(readlink -f "$LCPP/build")")"
   elif [[ -d "$LCPP/build" ]]; then git -C "$LCPP" rev-parse --short HEAD 2>/dev/null
   fi
 }
 # directories only, newest first (the repo also contains e.g. build-xcframework.sh)
-lcpp_builds(){ find "$LCPP" -maxdepth 1 -type d -name 'build-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-; }
+lcpp_builds(){ bd_list "$LCPP"; }
 swap_active(){ "$SWAP_BIN" --version 2>/dev/null | sed -n 's/^version: *\(v*[0-9][^ ]*\).*/\1/p'; }
 
 # The latest upstream versions (cached; upd_refresh asks again right now)
@@ -297,11 +320,11 @@ upd_same(){ # $1=cache key  $2=repository  $3=active version
 #  Built the same way as llama.cpp: build-<tag>/ plus a symlink build/, so a
 #  rollback is only a symlink change. Serves /v1/audio/transcriptions.
 wcpp_active(){
-  if [[ -L "$WCPP/build" ]]; then basename "$(readlink -f "$WCPP/build")" | sed 's/^build-//'
+  if [[ -L "$WCPP/build" ]]; then bd_tag "$(basename "$(readlink -f "$WCPP/build")")"
   elif [[ -d "$WCPP/build" ]]; then git -C "$WCPP" rev-parse --short HEAD 2>/dev/null
   fi
 }
-wcpp_builds(){ find "$WCPP" -maxdepth 1 -type d -name 'build-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-; }
+wcpp_builds(){ bd_list "$WCPP"; }
 
 # Tests a whisper build BEFORE it becomes active by transcribing the bundled
 # sample. If that fails, the old build stays active.
@@ -318,7 +341,9 @@ wcpp_smoke(){ # $1=build directory
 }
 
 wcpp_switch(){ # $1=target version
-  local tgt="build-$1" prev; prev=$(wcpp_active)
+  local tgt prev prev_dir
+  tgt="$(bd_name "$1")"; prev=$(wcpp_active)
+  prev_dir="$([[ -L "$WCPP/build" ]] && basename "$(readlink -f "$WCPP/build")")"
   [[ -d "$WCPP/$tgt" ]] || { err "build directory $tgt is missing."; return 1; }
   local was_active=no; svc_active && was_active=yes
   [[ "$was_active" == yes ]] && { info "stopping llama-swap ..."; svc stop; }
@@ -329,7 +354,7 @@ wcpp_switch(){ # $1=target version
     #  build that takes the endpoint down must not stay active.
     if ! curl -sf --max-time 10 "$API/v1/models" >/dev/null; then
       err "the API stopped answering - rolling back to ${prev:-the previous build}."
-      [[ -n "$prev" ]] && ln -sfn "build-$prev" "$WCPP/build"
+      [[ -n "$prev_dir" ]] && ln -sfn "$prev_dir" "$WCPP/build"
       svc restart; return 1
     fi
   fi
@@ -372,14 +397,11 @@ update_whisper(){ # $1=target tag (empty = the latest release)
   [[ ${free:-0} -lt 8 ]] && { err "not enough disk space (${free}G free, ~8G needed)."; return 1; }
   #  Before the fetch, for the same reason as in update_llama.
   backend_flags || return 1
-  if [[ -d "$WCPP/build-$tgt" ]]; then
-    if build_backend_ok "$WCPP/build-$tgt"; then
-      info "build $tgt already exists - testing it, then switching."
-      wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
-      wcpp_switch "$tgt" && wcpp_prune; return $?
-    fi
-    info "build $tgt was made for $(build_backend "$WCPP/build-$tgt"), not $(llm_backend) - rebuilding."
-    rm -rf "$WCPP/build-$tgt"
+  local dir; dir="$WCPP/$(bd_name "$tgt")"
+  if [[ -d "$dir" ]]; then
+    info "build $tgt for $(llm_backend) already exists - testing it, then switching."
+    wcpp_smoke "$dir" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+    wcpp_switch "$tgt" && wcpp_prune; return $?
   fi
   info "fetching whisper.cpp $tgt ..."
   # A shallow clone (--depth 1) does not have the objects of other tags, so a
@@ -394,22 +416,21 @@ update_whisper(){ # $1=target tag (empty = the latest release)
   #  residue, and leaving it would make the checkout fail.
   git -C "$WCPP" checkout --quiet -- "${WCPP_GENERATED[@]}" 2>/dev/null
   git -C "$WCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
-  local log="$LLM_HOME/.build-whisper-$tgt.log" t0=$SECONDS
+  local log="$LLM_HOME/.build-whisper-$(bd_name "$tgt").log" t0=$SECONDS
   info "building whisper.cpp $tgt for $(llm_backend) with $(nproc) threads (log: $log) ..."
   # The same backend flags as llama.cpp - only the project-specific test option
   # differs. whisper.cpp is ggml too, so -DGGML_VULKAN=ON works there unchanged.
-  if ! cmake -S "$WCPP" -B "$WCPP/build-$tgt" -DCMAKE_BUILD_TYPE=Release "${BACKEND_FLAGS[@]}" \
+  if ! cmake -S "$WCPP" -B "$dir" -DCMAKE_BUILD_TYPE=Release "${BACKEND_FLAGS[@]}" \
         -DGGML_NATIVE=ON -DWHISPER_BUILD_TESTS=OFF -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON > "$log" 2>&1; then
-    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$WCPP/build-$tgt"; return 1
+    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$dir"; return 1
   fi
-  if ! cmake --build "$WCPP/build-$tgt" -j "$(nproc)" >> "$log" 2>&1; then
+  if ! cmake --build "$dir" -j "$(nproc)" >> "$log" 2>&1; then
     err "build failed:"; grep -iE "error" "$log" | tail -8 >&2
     warn "the active build (${act:-none}) is untouched - nothing is broken."
-    rm -rf "$WCPP/build-$tgt"; return 1
+    rm -rf "$dir"; return 1
   fi
   ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
-  build_backend_set "$WCPP/build-$tgt"
-  wcpp_smoke "$WCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+  wcpp_smoke "$dir" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
   wcpp_switch "$tgt" && wcpp_prune
 }
 
@@ -481,7 +502,11 @@ smoke_test(){ # $1=build directory
 
 # Move the symlink, restart the service, check that the API answers again
 lcpp_switch(){ # $1=target version
-  local tgt="build-$1" prev; prev=$(lcpp_active)
+  #  prev_dir, not "build-$prev": the way back has to be the directory that was
+  #  actually linked, which under the other backend has a different name.
+  local tgt prev prev_dir
+  tgt="$(bd_name "$1")"; prev=$(lcpp_active)
+  prev_dir="$([[ -L "$LCPP/build" ]] && basename "$(readlink -f "$LCPP/build")")"
   [[ -d "$LCPP/$tgt" ]] || { err "build directory $tgt is missing."; return 1; }
   local was_active=no; svc_active && was_active=yes
   [[ "$was_active" == yes ]] && { info "stopping llama-swap ..."; svc stop; }
@@ -490,10 +515,11 @@ lcpp_switch(){ # $1=target version
     info "starting llama-swap ..."; svc start; sleep 2
     if ! curl -sf --max-time 10 "$API/v1/models" >/dev/null; then
       err "the API stopped answering - rolling back to $prev."
-      ln -sfn "build-$prev" "$LCPP/build"; svc restart; return 1
+      [[ -n "$prev_dir" ]] && ln -sfn "$prev_dir" "$LCPP/build"
+      svc restart; return 1
     fi
   fi
-  ok "active: llama.cpp $1  (was: ${prev:-?})"
+  ok "active: llama.cpp $1 ($(llm_backend))  (was: ${prev:-?})"
 }
 
 # Clean up old builds: the active one plus KEEP_BUILDS-1 fallbacks stay
@@ -506,6 +532,43 @@ lcpp_prune(){
     if [[ $keep -gt 1 ]]; then keep=$((keep-1)); continue; fi
     info "removing the old build: $n ($(du -sh "$d" 2>/dev/null | cut -f1))"; rm -rf "$d"
   done
+}
+
+#  After a backend switch: move the symlinks onto this backend's builds wherever
+#  they already exist. This is what makes "back and forth as you like" true - the
+#  first build of each backend costs a build, everything after that is a relink,
+#  the same seconds a rollback takes.
+#
+#  Only the exact active tag is considered. Silently relinking to some older
+#  version that happens to be built for the new backend would change two things
+#  at once, and "which version am I running" is the question this project answers
+#  most often.
+backend_relink(){
+  local want pending="" act
+  want="$(llm_backend)"
+  act=$(lcpp_active)
+  if [[ "$(active_backend "$LCPP")" != "$want" ]]; then
+    if [[ -n "$act" && -d "$LCPP/$(bd_name "$act" "$want")" ]]; then
+      info "llama.cpp $act is already built for $want - relinking."
+      lcpp_switch "$act" || return 1
+    else
+      pending="llm update llama"
+    fi
+  fi
+  act=$(wcpp_active)
+  if [[ -d "$WCPP/.git" && "$(active_backend "$WCPP")" != "$want" ]]; then
+    if [[ -n "$act" && -d "$WCPP/$(bd_name "$act" "$want")" ]]; then
+      info "whisper.cpp $act is already built for $want - relinking."
+      wcpp_switch "$act" || return 1
+    else
+      pending="${pending:+$pending, }llm update whisper"
+    fi
+  fi
+  if [[ -n "$pending" ]]; then
+    warn "no $want build yet for the active version:  $pending"
+    warn "the endpoint keeps running on the current binaries until then."
+  fi
+  return 0
 }
 
 update_llama(){ # $1=target tag (empty = the latest release)
@@ -544,37 +607,37 @@ update_llama(){ # $1=target tag (empty = the latest release)
   fi
   # Already built? Test it anyway - the directory may be left over from a
   # failed attempt.
-  if [[ -d "$LCPP/build-$tgt" ]]; then
-    if build_backend_ok "$LCPP/build-$tgt"; then
-      info "build $tgt already exists - testing it, then switching."
-      smoke_test "$LCPP/build-$tgt" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
-      lcpp_switch "$tgt" && lcpp_prune; return $?
-    fi
-    info "build $tgt was made for $(build_backend "$LCPP/build-$tgt"), not $(llm_backend) - rebuilding."
-    rm -rf "$LCPP/build-$tgt"
+  #  A build of this tag FOR THIS BACKEND: relink and be done. This is what makes
+  #  switching back and forth a symlink change once each side has been built.
+  local dir; dir="$LCPP/$(bd_name "$tgt")"
+  if [[ -d "$dir" ]]; then
+    info "build $tgt for $(llm_backend) already exists - testing it, then switching."
+    smoke_test "$dir" || { err "smoke test failed - $tgt will NOT be activated."; return 1; }
+    lcpp_switch "$tgt" && lcpp_prune; return $?
   fi
 
   info "fetching llama.cpp $tgt ..."
   git -C "$LCPP" fetch --tags --quiet origin || { err "git fetch failed."; return 1; }
   git -C "$LCPP" checkout --quiet "$tgt" || { err "tag '$tgt' not found."; return 1; }
 
-  local log="$LLM_HOME/.build-$tgt.log" t0=$SECONDS
+  #  The log carries the backend too, so two builds of one tag do not overwrite
+  #  each other's log the way they used to share a directory.
+  local log="$LLM_HOME/.build-$(bd_name "$tgt").log" t0=$SECONDS
   info "building $tgt for $(llm_backend) with $(nproc) threads (takes a while; log: $log) ..."
-  if ! cmake -S "$LCPP" -B "$LCPP/build-$tgt" "${LCPP_CMAKE_FLAGS[@]}" "${BACKEND_FLAGS[@]}" \
+  if ! cmake -S "$LCPP" -B "$dir" "${LCPP_CMAKE_FLAGS[@]}" "${BACKEND_FLAGS[@]}" \
        > "$log" 2>&1; then
-    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$LCPP/build-$tgt"; return 1
+    err "cmake configuration failed:"; tail -8 "$log" >&2; rm -rf "$dir"; return 1
   fi
-  if ! cmake --build "$LCPP/build-$tgt" -j "$(nproc)" >> "$log" 2>&1; then
+  if ! cmake --build "$dir" -j "$(nproc)" >> "$log" 2>&1; then
     err "build failed:"; grep -iE "error" "$log" | tail -8 >&2
     warn "the active build ($act) is untouched - nothing is broken."
-    rm -rf "$LCPP/build-$tgt"; return 1
+    rm -rf "$dir"; return 1
   fi
   ok "build finished in $(( (SECONDS-t0)/60 )) min $(( (SECONDS-t0)%60 ))s."
-  build_backend_set "$LCPP/build-$tgt"
 
-  if ! smoke_test "$LCPP/build-$tgt"; then
+  if ! smoke_test "$dir"; then
     err "smoke test failed - $tgt will NOT be activated."
-    warn "$act stays active. The build directory is kept: $LCPP/build-$tgt"
+    warn "$act stays active. The build directory is kept: $dir"
     return 1
   fi
   lcpp_switch "$tgt" || return 1

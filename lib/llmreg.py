@@ -606,6 +606,9 @@ def _env_file_get(path: str, key: str) -> str | None:
                 if line.startswith(key + "="):
                     return line[len(key) + 1:].strip() or None
     except OSError:
+        #  No file yet (a fresh clone, or 'llm gpu sync' has not run), or it is
+        #  unreadable. Both mean "nothing recorded", which is a valid answer here
+        #  and lets the caller fall through to detection.
         pass
     return None
 
