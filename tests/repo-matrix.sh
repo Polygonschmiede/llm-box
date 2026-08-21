@@ -32,7 +32,12 @@ section "language"
 #  word list is cheap and catches the regression; a general language detector
 #  would only produce false positives. CHANGELOG.md is exempt because it quotes
 #  what the strings used to say.
-GERMAN='[äöüÄÖÜß]|\b(Karte|Grafikkarte|Modelle|Fortschritt|enthaelt|unerlaubte|Dienst|riesige|ueberspringen|Zeichen|neu\))'
+#
+#  The list grows when something slips through, which is what it is for: 'manuell'
+#  was added after it was found in lib/llmreg.py, written into every
+#  .llm-model.json sidecar that 'llm meta backfill --repo' produced, with no
+#  umlaut to give it away.
+GERMAN='[äöüÄÖÜß]|\b(Karte|Grafikkarte|Modelle|Fortschritt|enthaelt|unerlaubte|Dienst|riesige|ueberspringen|Zeichen|manuell|neu\))'
 hits=$(git grep -nIE "$GERMAN" -- ":!CHANGELOG.md" ":!$SELF" | head -5)
 check "no German in a tracked file" "" "$hits"
 
@@ -69,6 +74,29 @@ mapfile -t mds < <(git ls-files '*.md')
 out=$(python3 tests/check-links.py "${mds[@]}" 2>&1)
 check "every relative link resolves" "0 broken" \
   "$(printf '%s' "$out" | sed -n 's/.*, \([0-9]* broken\)$/\1/p')"
+
+section "generated files match their generator"
+
+#  The eight committed rocm-smi fixtures are never READ by the suite - lib.sh
+#  regenerates into a temporary directory so a test run cannot dirty the tree.
+#  That makes them free to rot: change mk-smi.py and the committed copies quietly
+#  become a different machine from the one being tested. They are kept because
+#  they are the only place you can see what rocm-smi actually prints without
+#  running python, which is worth having when debugging - so CI holds them to it.
+gen="$TMP/gen-fixtures"; mkdir -p "$gen"
+LLM_FIXTURE_DIR="$gen" python3 tests/fixtures/mk-smi.py >/dev/null 2>&1
+drift=""
+for f in tests/fixtures/rocm-smi-*.sh; do
+  b="$(basename "$f")"
+  [[ -f "$gen/$b" ]] || { drift="$drift $b(not-generated)"; continue; }
+  cmp -s "$f" "$gen/$b" || drift="$drift $b"
+done
+#  And the other way round: a case added to the generator without committing it.
+for f in "$gen"/rocm-smi-*.sh; do
+  b="$(basename "$f")"
+  [[ -f "tests/fixtures/$b" ]] || drift="$drift $b(not-committed)"
+done
+check "the committed rocm-smi fixtures are current" "" "$drift"
 
 section "one version number"
 

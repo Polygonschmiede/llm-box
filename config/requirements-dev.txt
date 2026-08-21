@@ -1,0 +1,16 @@
+# Only for running the tests, never installed by 'llm setup'.
+#
+# 'bash tests/run-all.sh' needs none of this: the five shell suites run against
+# plain python3. tests/unit/ is pytest, and it SKIPS itself when pytest is not
+# there - which under --strict is a failure, because --strict means "everything
+# was checked". So this file is what --strict costs.
+#
+# Install into the registry environment, which already has the standard library
+# imports the unit tests need:
+#     ./venv-api/bin/pip install -r config/requirements-dev.txt
+#
+# Pinned for the same reason the linters are: CI and a developer should be running
+# the same thing. The numbers here, in .github/workflows/ci.yml and in
+# CONTRIBUTING.md move together.
+pytest==9.1.1
+coverage==7.15.4

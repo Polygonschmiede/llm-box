@@ -35,7 +35,7 @@ os.environ.setdefault("LLM_HOME", ROOT)
 
 import anyio                                                            # noqa: E402
 from fastapi import (                                                     # noqa: E402
-    Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response,
+    Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response,
 )
 from fastapi.responses import (                                          # noqa: E402
     FileResponse, JSONResponse, StreamingResponse,
@@ -500,6 +500,17 @@ app = FastAPI(title="llm-box registry", version=LLM_BOX_VERSION, lifespan=lifesp
               description="Model registry of the local LLM server")
 
 
+#  ConfigMissing is not a server fault, it is the state of every clone before
+#  'llm init'. Five routes converted it to 503 by hand and the rest did not, so
+#  GET /api/gpus - which the control page fetches on every load - answered 500
+#  with a traceback on a fresh checkout while /api/models answered 503 with the
+#  command that fixes it. One handler covers every route, including the ones
+#  nobody thought to wrap.
+@app.exception_handler(llmreg.ConfigMissing)
+def _config_missing(_request: Request, exc: llmreg.ConfigMissing):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 @app.get("/api/health")
 def health():
     st = llmreg.live()
@@ -649,19 +660,13 @@ def api_config():
     llama-swap's own UI has no /api/config at all, so the eviction semantics -
     swap, exclusive, persistent - were visible only by opening the file.
     """
-    try:
-        return llmreg.config_overview()
-    except llmreg.ConfigMissing as exc:
-        raise HTTPException(503, str(exc)) from None
+    return llmreg.config_overview()
 
 
 @app.get("/api/config/diff", dependencies=READ)
 def api_config_diff():
     """What `llm gpu sync` would change. Empty diff = configuration matches."""
-    try:
-        out = llmreg.gpu_sync(dry_run=True)
-    except llmreg.ConfigMissing as exc:
-        raise HTTPException(503, str(exc)) from None
+    out = llmreg.gpu_sync(dry_run=True)
     return {"diff": out.get("diff") or "", "cards": out.get("cards"),
             "tensorSplit": out.get("tensorSplit"),
             "drift": llmreg.tensor_split_drift()}
@@ -673,10 +678,7 @@ def api_config_diff():
 # ---------------------------------------------------------------------------
 @app.get("/api/roles", dependencies=READ)
 def api_roles():
-    try:
-        return llmreg.read_selectors()
-    except llmreg.ConfigMissing as exc:
-        raise HTTPException(503, str(exc)) from None
+    return llmreg.read_selectors()
 
 
 @app.put("/api/roles/{name}", dependencies=WRITE)
@@ -695,8 +697,6 @@ def api_role_put(name: str, body: dict = Body(...),
         out = llmreg.set_selector(name, str(body.get("strategy") or ""), targets,
                                   spillover=spill, description=body.get("description"),
                                   dry_run=dry_run)
-    except llmreg.ConfigMissing as exc:
-        raise HTTPException(503, str(exc)) from None
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     CAT.invalidate()
@@ -709,8 +709,6 @@ def api_role_put(name: str, body: dict = Body(...),
 def api_role_delete(name: str):
     try:
         out = llmreg.del_selector(name)
-    except llmreg.ConfigMissing as exc:
-        raise HTTPException(503, str(exc)) from None
     except KeyError as exc:
         raise HTTPException(404, str(exc).strip("'")) from None
     CAT.invalidate()

@@ -134,15 +134,41 @@ check "extraFlags reject metacharacters" "400" \
   "$(api "print(c.post('/api/models', json={'repo': 'a/b', 'extraFlags': '; rm -rf /'}, headers=TOK).status_code)")"
 
 section "a fresh checkout without a configuration"
-check "GET /api/models says what is missing, not 500" "True" \
-  "$(LLM_HOME="$(mktemp -d "$TMP/empty.XXXXXX")" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" \
-     pyapi "
+#  Every read route, not one - and the exact status, not "anything but 500".
+#  The old check asked only about /api/models, and only that it was not a 500,
+#  which 200, 401, 404 and 422 also satisfy. Under it, /api/gpus and /api/state
+#  WERE 500: ConfigMissing was converted route by route, and those two were not
+#  among the ones anybody had wrapped - so the control page's own card fetch
+#  answered a fresh clone with a traceback. One app-level handler covers all of
+#  them, and this loop is what keeps the next route from being forgotten.
+#
+#  LLM_SWAP_API matters as much as LLM_HOME here. Without it llmreg falls back to
+#  127.0.0.1:8080, so on a machine that runs this stack the check queried the REAL
+#  llama-swap - a different code path from CI's, where nothing listens there.
+FRESH="$(mktemp -d "$TMP/empty.XXXXXX")"
+fresh(){ # $1=path -> "<status> <does the message name llm init>"
+  LLM_HOME="$FRESH" LLM_ROCM_SMI="$FIXTURES/rocm-smi-2card.sh" \
+  LLM_SWAP_API="http://127.0.0.1:9" pyapi "
 import importlib.util
 spec = importlib.util.spec_from_file_location('llmapi', '$REPO/bin/llm-api.py')
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 from fastapi.testclient import TestClient
-r = TestClient(mod.app, raise_server_exceptions=False).get('/api/models')
-print(r.status_code != 500)")"
+r = TestClient(mod.app, raise_server_exceptions=False).get('$1')
+try:
+    says = \"llm init\" in str(r.json().get('detail', ''))
+except Exception:
+    says = False
+print('%d %s' % (r.status_code, says))"
+}
+for path in /api/models /api/gpus /api/state /api/health /api/config \
+            /api/config/diff /api/roles; do
+  check "$path -> 503, naming the fix" "503 True" "$(fresh "$path")"
+done
+#  These two are answerable without a configuration and have to stay that way:
+#  /api/versions is how you find out what is installed before anything is
+#  configured, and /api/jobs is what the page polls while 'llm init' runs.
+check "/api/versions still answers"  "200 False" "$(fresh /api/versions)"
+check "/api/jobs still answers"      "200 False" "$(fresh /api/jobs)"
 
 section "the endpoints the control page needs"
 check "/api/versions"          "200" "$(api "print(c.get('/api/versions').status_code)")"

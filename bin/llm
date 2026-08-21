@@ -285,6 +285,12 @@ svc_ctl(){ # $1=unit  $2=action  $3=plain name
 
 # --- Dashboard: the whole picture -------------------------------------------
 cmd_dash(){
+  #  Before the dashboard, not instead of it: this is the command you run to find
+  #  out where you are, so it still shows the services and versions - but on a
+  #  fresh installation it said nothing at all about the one thing standing
+  #  between you and a working endpoint. The warning existed only in cmd_setup,
+  #  which is not the command anybody runs to look around.
+  [[ -f "$CONFIG" ]] || { warn "no configuration yet: $CONFIG"; echo "  Create it:  llm init"; echo; }
   printf "%s\n" "${c_b}Services:${c_0}"
   local rows=("llama-swap|LLM API |8080" "llm-api|Registry|8081" "open-webui|Chat UI |3000" "comfyui|Images  |8188")
   for r in "${rows[@]}"; do
@@ -1206,6 +1212,15 @@ ${c_b}Finding GGUF models:${c_0}
     'llm add' checks the real numbers from the GGUF header before writing anything.
 EOF
 }
+
+#  Sourced rather than executed, this file defines its functions and dispatches
+#  nothing. lib/update.sh already relies on that seam - bin/llm sources it and
+#  tests/update-matrix.sh calls its functions directly - and this makes the same
+#  thing possible here, for 1200 lines that shellcheck was the only thing looking
+#  at. Executed, nothing changes: BASH_SOURCE[0] is $0 for a script that was run.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0 2>/dev/null || true
+fi
 
 case "${1:-}" in
   # Models

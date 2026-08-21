@@ -7,7 +7,7 @@ bash tests/run-all.sh            # everything that can run here
 bash tests/run-all.sh --strict   # and a skipped check counts as a failure
 ```
 
-That is the whole story — no pytest, no npm, nothing to install. **None of it
+The default run needs nothing installed. **None of it
 needs a GPU and none of it touches your configuration.** The card detection is
 fed fake `rocm-smi` output from `tests/fixtures/`, and everything that reads or
 writes `llama-swap.yaml` runs against a temporary `LLM_HOME` in `/tmp`. It is
@@ -21,7 +21,10 @@ safe to run on a live server.
 | `tests/api-matrix.sh` | the registry's HTTP surface, both catalog shapes, auth |
 | `tests/mcp-matrix.sh` | the registry's MCP surface: the tool list, and the token gate on reads and writes |
 | `tests/ui-matrix.sh` | that `web/index.html` really renders, and fetches nothing external |
-| `tests/repo-matrix.sh` | the repository itself: no German, no machine paths, no tracked secret, links resolve, one version number |
+| `tests/update-matrix.sh` | `lib/update.sh`: build-directory naming per backend, what is active, what prune keeps, the dirty guard |
+| `tests/cli-matrix.sh` | `bin/llm`: the pure helpers, and what each command says and exits with when something is missing |
+| `tests/unit-matrix.sh` | a wrapper around `tests/unit/`, the pytest half |
+| `tests/repo-matrix.sh` | the repository itself: no German, no machine paths, no tracked secret, generated files current, links resolve, one version number |
 
 The runner finds suites by glob (`tests/*-matrix.sh`), so a new one needs no
 edit anywhere. Suites run in their own process; the totals come back through
@@ -39,7 +42,9 @@ the summary names the skipped count, and `--strict` turns it into a failure. Use
 step that asserts `--strict` **fails** without those dependencies, so the old
 behaviour cannot come back quietly.
 
-`bash bin/llm setup` builds `venv-api`. Both suites skip the same way — it runs
+`--strict` costs three things: `node`, `venv-api` (`bash bin/llm setup`) and
+pytest (`uv pip install --python venv-api/bin/python -r config/requirements-dev.txt`).
+Everything skips the same way — it runs
 the page's script under a minimal DOM (`tests/dom-stub.js`) against payloads
 generated from a throwaway `LLM_HOME`. Curling `/ui` would not do: it answers
 200 whatever the JavaScript does, and the first version of that check passed
@@ -91,6 +96,36 @@ f-string families are off on purpose, because this codebase consistently uses
 change. If a rule is wrong for a specific line, a `# noqa` **with a reason** next
 to it is preferred over a file-wide ignore.
 
+## Two harnesses, and which to use
+
+`tests/*-matrix.sh` is bash: `check <name> <expected> <actual>` against a string.
+`tests/unit/` is pytest, for what a string comparison cannot express - a function
+whose answer is a raised exception, a module reimported with different
+environment, a fake HTTP server standing in for llama-swap, a GGUF header written
+byte by byte.
+
+Reach for pytest when the assertion is about a **type or a shape**, and for bash
+when it is about **a command's output or exit status**. Both run under
+`bash tests/run-all.sh`; the totals it prints include the pytest count.
+
+Three traps that have each cost time here, all of them mine:
+
+- **llmreg reads its environment at IMPORT time.** `LLM_HOME`, `LLM_ROCM_SMI`,
+  `LLM_VULKANINFO`, `LLM_SYSFS_ROOT` and `LLM_BACKEND` are module-level. A
+  `monkeypatch.setenv` in the test body is too late, which is why the fixture is
+  `load(**env)` and not a module handed to you. It is also why every bash probe
+  runs a fresh interpreter.
+- **`LLM_HOME` is the installation directory, not just the configuration.**
+  `bin/llm` finds `lib/update.sh`, `lib/llmreg.py`, `VERSION` and the example
+  config under it too, so pointing it at a bare temporary directory breaks the
+  script at its first `source`. Use `cli_home` rather than `sandbox` for anything
+  that runs the CLI.
+- **`set -o pipefail` and `cmd | grep -q`.** The pipeline reports the failure of
+  any member, so testing that a command which *refuses* also *says* something
+  cannot be written that way. `says <pattern> <cmd...>` in `cli-matrix.sh`
+  captures first. Six checks read as "the message is missing" when the message
+  was there.
+
 ## What CI checks beyond that
 
 Six jobs in `.github/workflows/ci.yml` plus CodeQL in its own workflow. Two of
@@ -100,7 +135,7 @@ knowing which:
 | job | what it holds down |
 |---|---|
 | `lint` | ruff, shellcheck, and `tests/repo-matrix.sh` |
-| `test` | the suites under `--strict`, after first proving that `--strict` refuses an incomplete run |
+| `test` | the suites under `--strict`, after first proving that `--strict` refuses an incomplete run; then a coverage figure for `lib/` as a number, not a gate |
 | `docs` | `tests/check-links.py` — every relative markdown link resolves |
 | `secrets` | `gitleaks` over the whole commit history, not just the tree |
 | `deps` | `pip-audit` on `config/requirements-api.txt` only — Open WebUI's ~500 transitive packages are not this project's to pin |
@@ -123,6 +158,12 @@ GGUF headers, detects cards and computes VRAM. `bin/llm` is a front end, and
 `bin/llm-api.py` is a second front end over HTTP and MCP. When bash greps the
 YAML itself, that is a bug waiting — the two parsers drift apart, which has
 already happened once with the `-ts` line.
+
+`bin/llm` and `lib/update.sh` both **dispatch nothing when sourced**, so their
+functions can be called directly from a test. Executed, nothing changes. That is
+the seam `tests/cli-matrix.sh` and `tests/update-matrix.sh` use, and it is worth
+keeping: it is the difference between 1800 lines of bash covered by shellcheck and
+1800 lines with tests.
 
 `lib/gpu_rocm.py` and `lib/gpu_vulkan.py` are the **only** split out of
 `llmreg.py`, and it exists because that code would otherwise be written twice.
