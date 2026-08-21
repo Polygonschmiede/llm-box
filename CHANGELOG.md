@@ -253,6 +253,44 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   start makes every extension look available and the build dies thousands of
   shader lines later.
 
+- **`GET /api/gpus` and `GET /api/state` answered a fresh clone with an HTTP 500.**
+  `ConfigMissing` was converted to a 503 route by route, five of them did it, and
+  those two were not among them — so the control page's own card fetch returned a
+  traceback on every installation that had not run `llm init` yet. One app-level
+  exception handler covers every route now, and the five hand-written copies are
+  gone. The test that should have caught it asked only about `/api/models`, and
+  only that it was *not* a 500, which 200, 401, 404 and 422 also satisfy; it now
+  loops over every read route and asserts 503 plus a message naming `llm init`.
+- **`llm status` never mentioned a missing configuration.** It is the command you
+  run to find out where you are, and on a fresh installation it printed the
+  services and versions and said nothing about the one thing standing between you
+  and a working endpoint. That warning existed only in `llm setup`. It still exits
+  0 — a status command should report, not refuse — but it says it.
+- **`"source": "manuell"` — a German string in every sidecar** that
+  `llm meta backfill --repo` wrote, with no umlaut to give it away, which is why
+  the language guard's word list never saw it. Fixed, and the word is in the list
+  now; that list growing is what it is for.
+- Three checks in the shell suites that could not fail as written:
+  `tests/vram-matrix.sh` ran sixteen KV-cache checks with no `LLM_HOME`, so
+  `llmreg` bound to the real checkout — harmless today because those read no
+  file, and exactly the leak `tests/lib.sh` documents as having burned this
+  project once; `tests/api-matrix.sh` did not set `LLM_SWAP_API` either, so on a
+  machine running this stack it queried the **real** llama-swap; and
+  `tests/ui-matrix.sh` compared a stylesheet check against the empty string,
+  which also passes when the extraction finds nothing at all.
+- **The eight committed `rocm-smi` fixtures were free to rot.** The harness
+  regenerates into a temporary directory, so nothing ever read the copies in the
+  tree — change the generator and they quietly become a different machine from
+  the one under test. `tests/repo-matrix.sh` now holds them to their generator in
+  both directions. The one fixture that was carved out of another with
+  `sed -n '4,$p' | head -n -2`, tied to the exact header and footer line count,
+  is a case in the generator instead.
+- `LLM_TENSOR_SPLIT` was written into `config/hardware.env` and read by nothing —
+  not `bin/llm`, not `lib/update.sh`, and not llama.cpp, which knows no such
+  name. The units export that file into every service, so a dead variable is not
+  free. Removed; `tensorSplit` is still in the `hw()` payload, where the API and
+  `llm doctor` read it from.
+
 ### Added
 
 - **Updates and rollbacks from the control page.** The System tab now has
@@ -379,6 +417,30 @@ Version numbers describe **llm-box itself**, not the engines it drives —
     devices and counting them would shift every index against what
     `--device VulkanN` means. Verified by breaking four things deliberately and
     watching the suite catch each.
+
+- **`tests/unit/` — pytest, 67 checks on `lib/llmreg.py`.** The bash harness
+  compares strings, and a lot of what that file does is not a string: a function
+  whose answer is a raised exception, a module reimported with different
+  environment, a GGUF header written byte by byte, a fake HTTP server standing in
+  for llama-swap. Twenty-two of its functions were reached by no test at all -
+  `gpu_sync`, `write_env`, `record_add`, `backfill`, `load_model`, `unload_all`,
+  `file_digest` among them - and the provenance path is what `.gitignore` calls
+  the only thing in the tree that cannot simply be downloaded again.
+
+  `bash tests/run-all.sh` still needs nothing installed; the pytest suite skips
+  itself, which `--strict` then counts as a failure. `config/requirements-dev.txt`
+  is what `--strict` costs. CI prints a coverage figure for `lib/` as a **number
+  and not a gate** — a threshold invites tests that move it rather than tests that
+  would catch something. It stands at 61 % from the unit tests alone, and says out
+  loud that `bin/` and `web/` are bash and inline JavaScript that coverage.py
+  cannot see.
+- **`tests/cli-matrix.sh` — 37 checks on `bin/llm`,** which had none. Two halves:
+  the pure helpers called directly, and the command surface run as a real
+  subprocess against a throwaway installation. Service control is deliberately
+  left out; starting systemd units is not something a test should do to a machine.
+- **`bin/llm` dispatches nothing when sourced**, the seam `lib/update.sh` already
+  had. Executed, nothing changes. It is the difference between 1200 lines covered
+  by shellcheck and 1200 lines with tests.
 
 ## [1.3.0] — 2026-08-20
 

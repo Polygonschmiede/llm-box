@@ -101,15 +101,38 @@ jobs:
         with:
           node-version: "22"
 
-      # tests/api-matrix.sh and tests/mcp-matrix.sh skip themselves without
-      # this; building it means the registry's checks actually run.
+      # tests/api-matrix.sh, tests/mcp-matrix.sh and tests/unit-matrix.sh all
+      # skip themselves without this, and --strict turns a skip into a failure -
+      # so building it is what makes those checks actually run.
       - name: registry environment
         run: |
           python -m venv venv-api
           ./venv-api/bin/pip install --quiet -r config/requirements-api.txt httpx
+          ./venv-api/bin/pip install --quiet -r config/requirements-dev.txt
 
       - name: suites
         run: bash tests/run-all.sh --strict
+
+      #  A number, not a gate. A threshold invites writing tests that move it
+      #  rather than tests that would catch something, and the interesting figure
+      #  here is which way it is going. lib/ only: bin/ and web/ are bash and
+      #  inline JavaScript, which coverage.py cannot see - said out loud because
+      #  a percentage that silently means "of the python half" is worse than none.
+      - name: coverage of lib/
+        if: always()
+        run: |
+          ./venv-api/bin/python -m coverage run --source=lib -m pytest -q tests/unit
+          ./venv-api/bin/python -m coverage report --precision=1 | tee coverage.txt
+          {
+            echo "### Coverage of lib/ (python only)"
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+            echo
+            echo "bin/llm and lib/update.sh are bash: shellcheck plus"
+            echo "tests/cli-matrix.sh and tests/update-matrix.sh, not measured here."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   docs:
     runs-on: ubuntu-latest

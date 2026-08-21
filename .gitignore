@@ -42,6 +42,8 @@ tests/fixtures/vulkaninfo-*.sh
 tests/fixtures/sysfs-*/
 
 # Caches and compiled files
+.coverage
+.pytest_cache/
 __pycache__/
 *.pyc
 .cache/
