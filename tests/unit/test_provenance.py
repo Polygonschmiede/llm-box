@@ -60,7 +60,12 @@ def test_write_meta_is_atomic(reg, home):
     d = str(home / "models" / "m")
     reg.write_meta(d, {"repo": "unsloth/X-GGUF"})
     assert not os.path.exists(reg.meta_path(d) + ".tmp")
-    assert json.loads(open(reg.meta_path(d), encoding="utf-8").read())["repo"]
+    #  Read outside the assert: an expression with a side effect inside one
+    #  vanishes under `python -O`, and the file handle has to be closed either
+    #  way. CodeQL flagged both, correctly.
+    with open(reg.meta_path(d), encoding="utf-8") as fh:
+        written = json.load(fh)
+    assert written["repo"] == "unsloth/X-GGUF"
 
 
 def test_record_add_records_files_and_the_revision(reg, home, gguf):
@@ -86,7 +91,8 @@ def test_record_add_skips_the_cache_directory(reg, home, gguf):
     d = os.path.dirname(path)
     blobs = os.path.join(d, ".cache", "huggingface", "blobs")
     os.makedirs(blobs)
-    open(os.path.join(blobs, "abc123.gguf"), "wb").write(b"\0" * 10)
+    with open(os.path.join(blobs, "abc123.gguf"), "wb") as fh:
+        fh.write(b"\0" * 10)
     _cache(d, SHA)
     reg.record_add("big", "unsloth/Big-GGUF", "Q4_K_M")
     assert [f["name"] for f in reg.read_meta(d)["files"]] == ["big.gguf"]
