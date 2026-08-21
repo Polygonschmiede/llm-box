@@ -71,7 +71,7 @@ them normally; only changing configuration is refused.
 
 ### 5. Remove leftovers
 
-If you previously configured the server by hand, two remnants keep making themselves
+If you previously configured the server by hand, its remnants keep making themselves
 felt:
 
 ```bash
@@ -87,6 +87,16 @@ instead of individual names, because a pattern does not go stale:
 ```json
 { "enabledModels": ["llm-box/*"] }
 ```
+
+The same file may also pin the old provider by name, and those two keys survive the
+deleted `models.json`:
+
+```json
+{ "defaultProvider": "local-router", "defaultModel": "…" }
+```
+
+Point them at `llm-box` and a model the registry actually reports, or delete both and
+pick once in `/model`.
 
 ### 6. Verify
 
@@ -115,6 +125,7 @@ pi update --extensions
 | `Warning: No models match pattern …`, `[unavailable]` in `/model` | stale entries in `enabledModels` (step 5). |
 | Models appear twice, or long-deleted ones show up | the old `models.json` is still there (step 5). |
 | Changes are refused, asking for a token | step 4; get it with `llm api token` on the server. |
+| The catalog stops following the server, `the event stream needs a token` | the server runs with `LLM_API_REQUIRE_AUTH=1`, so even reads need the token — step 4. |
 | `Too many authentication failures` when SSHing to the server | the agent offers too many keys. Use `ssh -o IdentitiesOnly=yes -i ~/.ssh/<key> …` or a host entry in `~/.ssh/config`. |
 
 **The session stays current:** the extension listens on the registry's event stream
@@ -226,9 +237,15 @@ echo '{"url": "http://<server-ip>:8081", "token": "<llm api token>"}' \
   > ~/.pi/agent/llm-box.json
 ```
 
-The extension then reads the key from the registry along with everything else,
-so a rotation on the server needs nothing on the client but a refresh. `llm api
-client` on the server prints the exact lines.
+The extension then reads the key from the registry along with everything else —
+but only at **startup**, because pi takes the key when the provider is
+registered. A rotation on the server therefore needs a new pi session on the
+client; the model list refreshes by itself, the key does not. `llm api client`
+on the server prints the exact lines.
+
+Without the token the extension falls back to `sk-local` and says so once. The
+symptom otherwise looks unrelated: the model list is there, and every completion
+comes back 401 from port 8080.
 
 ## Giving subagents a different model
 

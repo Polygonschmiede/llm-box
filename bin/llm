@@ -1082,8 +1082,9 @@ ${c_b}Once on the client machine - for the pi agent:${c_0}
 
   ${c_y}# leftovers, if the server used to be configured there by hand:${c_0}
   mv ~/.pi/agent/models.json ~/.pi/agent/models.json.old
-  # and delete the key "enabledModels" in ~/.pi/agent/settings.json -
-  # old model names in there otherwise show up as "unavailable".
+  # and in ~/.pi/agent/settings.json: delete "enabledModels" (old model names
+  # in there show up as "unavailable") and repoint "defaultProvider" /
+  # "defaultModel" at llm-box - those two survive the deleted models.json.
 
 ${c_b}Only if you also use Claude Code there:${c_0}
 
