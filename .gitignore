@@ -65,5 +65,8 @@ config/comfyui.env
 # npm leftovers, in case someone builds the pi extension here
 node_modules/
 
-# Local editor/agent settings (contain paths and addresses of this machine)
-.claude/settings.local.json
+# Local editor/agent settings, and any agent worktree underneath. The whole
+# directory, not just settings.local.json: an agent worktree is a second
+# checkout of this repository WITH its own config/api-token in it, and only that
+# nested checkout's own .gitignore keeps the token out of a 'git add -A' here.
+.claude/

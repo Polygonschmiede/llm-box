@@ -134,6 +134,12 @@ check_err(){ # $1=case  $2=expected exception name  $3=actual output
 
 #  Skipped, not failed: the registry suite needs venv-api, and a checkout that
 #  has not run 'llm setup' should report that rather than go red.
+#
+#  Under LLM_TESTS_STRICT a skip IS a failure. That mode exists because the
+#  lenient one was being read as a pass: api-matrix and ui-matrix call skip()
+#  and then `summary; exit $?`, and summary returned 0, so run-all.sh printed
+#  "all 5 suites passed" on a machine with neither node nor venv-api - with 130
+#  of 300 assertions never executed. CI and 'run-all.sh --strict' set it.
 skips=0
 skip(){ # $1=case  $2=why
   skips=$((skips + 1))
@@ -167,13 +173,21 @@ $1
 section(){ printf '\n\033[0;36m%s\033[0m\n' "$1"; }
 
 summary(){
-  local tail=""
+  local tail="" strict="${LLM_TESTS_STRICT:-0}"
   (( skips > 0 )) && tail="$(printf ', \033[0;33m%d skipped\033[0m' "$skips")"
   printf '\n'
   if (( fails == 0 )); then
     printf '\033[0;32m%d checks passed\033[0m%s.\n' "$checks" "$tail"
   else
     printf '\033[0;31m%d of %d checks failed\033[0m%s.\n' "$fails" "$checks" "$tail"
+  fi
+  #  So run-all.sh can add up what really ran across suites, each of which is a
+  #  separate bash process.
+  [[ -n "${LLM_TESTS_COUNTS:-}" ]] && printf '%d %d %d\n' "$checks" "$fails" "$skips" \
+    >> "$LLM_TESTS_COUNTS"
+  if (( strict != 0 && skips > 0 )); then
+    printf '\033[0;31m%d skipped, and --strict was asked for.\033[0m\n' "$skips"
+    return 1
   fi
   return $(( fails > 0 ))
 }
