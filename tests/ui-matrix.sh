@@ -99,18 +99,22 @@ check "the script is inline" "1" \
 #  same origin - so the page still needs nothing but this server. Two things can
 #  break that: a link to a file that is not there, and a vendored sheet that
 #  fetches something itself.
-check "every stylesheet it links exists" "" \
+#  Counted, not compared against the empty string. Expecting "" means the check
+#  also passes when the sed finds nothing at all - a rewritten <link> tag, a
+#  renamed route - and then it is asserting about zero stylesheets. The count of
+#  RESOLVED files has to equal the count of links, and both have to be two.
+check "there are two stylesheet links" "2" \
+  "$(grep -c '<link rel="stylesheet"' "$REPO/web/index.html")"
+check "and both resolve to a vendored file" "2" \
   "$(sed -n 's|.*<link rel="stylesheet" href="/ui/\([^"]*\)".*|\1|p' \
        "$REPO/web/index.html" | while read -r a; do
        case "$a" in
          stellar.css)           f=index.css;;
          stellar-auto-dark.css) f=auto-dark.css;;
-         *)                     echo "unmapped:$a"; continue;;
+         *)                     continue;;          # unmapped: not resolved
        esac
-       [ -f "$REPO/web/vendor/stellar/$f" ] || echo "missing:$a"
-     done)"
-check "and there are two of them" "2" \
-  "$(grep -c '<link rel="stylesheet"' "$REPO/web/index.html")"
+       [ -f "$REPO/web/vendor/stellar/$f" ] && echo "$a"
+     done | wc -l | tr -d ' ')"
 #  Not a plain search for "http": Stellar's checkbox tick is an inline data: SVG
 #  and carries an xmlns, which is a namespace and not a fetch.
 check "the vendored CSS fetches nothing" "0" \

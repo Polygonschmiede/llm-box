@@ -58,7 +58,13 @@ SWA = {
 kv = lambda m, c, q="f16", n=1: llmreg.kv_cache_bytes("", c, q, n, meta=m)
 PYEOF
 
-v(){ pyx "$HEADERS
+#  LLM_HOME, even though these read no file. kv_cache_bytes(meta=...) computes
+#  from the dict it is handed, so today this passes either way - but without it
+#  llmreg binds to the real checkout, and the next check added to this section
+#  that DOES touch the configuration would silently read the live machine. That
+#  is the class of leak tests/lib.sh documents as having already burned this
+#  project once.
+v(){ LLM_HOME="$PROBE_HOME" pyx "$HEADERS
 $1"; }
 
 section "classic layout: linear in context, and in the quant"
