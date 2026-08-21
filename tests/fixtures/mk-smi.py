@@ -5,14 +5,19 @@ Why: the numbering logic in lib/llmreg.py has to be right with 1, 2 or 3+ cards
 and with an iGPU at any position. Those cases cannot be produced on a single
 machine, so we feed the detection output that CAN occur and check the result.
 
-Usage:  python3 tests/fixtures/mk-smi.py       (writes the *.sh files next to it)
+Usage:  python3 tests/fixtures/mk-smi.py            (writes next to this file)
+        LLM_FIXTURE_DIR=/tmp/x python3 .../mk-smi.py   (writes there instead)
 Used as: LLM_ROCM_SMI=tests/fixtures/rocm-smi-3card.sh python3 lib/llmreg.py gpus
+
+The test harness passes LLM_FIXTURE_DIR so that a test run never rewrites the
+committed copies. They regenerate byte-identically today, but the first change
+to this file would otherwise dirty the working tree on every run.
 """
 
 import os
 import stat
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.environ.get("LLM_FIXTURE_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 R9700 = {"series": "AMD Radeon AI PRO R9700", "gfx": "gfx1201", "vram": 34208743424}
 W7900 = {"series": "AMD Radeon PRO W7900", "gfx": "gfx1100", "vram": 51539607552}
@@ -40,10 +45,17 @@ def render(cards: list[dict]) -> str:
     out = ["", "==== ROCm System Management Interface ====", "==== Concise Info ===="]
     for i, c in enumerate(cards):
         used = 171778048 if i == 0 else 73072640
+        #  An APU reports its power under a different label than a discrete
+        #  card, and the parser is supposed to accept both - so say it the way
+        #  the hardware says it.
+        socket = c["vram"] < 20 * 1024**3 and "Ryzen" in c["series"]
         out += [
             "GPU[%d]\t\t: Temperature (Sensor edge) (C): 30.0" % i,
             "GPU[%d]\t\t: Temperature (Sensor junction) (C): %.1f" % (i, 29.0 + i),
             "GPU[%d]\t\t: Temperature (Sensor memory) (C): 34.0" % i,
+            "GPU[%d]\t\t: %s Graphics Package Power (W): %.1f" % (
+                i, "Current Socket" if socket else "Average", 17.0 + i),
+            "GPU[%d]\t\t: GPU use (%%): %d" % (i, 0 if i else 42),
             "GPU[%d]\t\t: VRAM Total Memory (B): %d" % (i, c["vram"]),
             "GPU[%d]\t\t: VRAM Total Used Memory (B): %d" % (i, used),
             "GPU[%d]\t\t: Card Series: \t\t%s" % (i, c["series"]),

@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -32,11 +33,22 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 #  so setting it afterwards would have no effect.
 os.environ.setdefault("LLM_HOME", ROOT)
 
-import anyio
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+import anyio                                                            # noqa: E402
+from fastapi import (                                                     # noqa: E402
+    Body, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response,
+)
+from fastapi.responses import (                                          # noqa: E402
+    FileResponse, JSONResponse, StreamingResponse,
+)
 
-import llmreg
+import llmreg                                                            # noqa: E402
+
+#  Same source as bin/llm, so the CLI and the API can never disagree.
+try:
+    with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as _fh:
+        LLM_BOX_VERSION = _fh.read().strip() or "unknown"
+except OSError:
+    LLM_BOX_VERSION = "unknown"
 
 #  Loopback by default: started by hand, the service is not accidentally on the
 #  network. The unit sets LLM_API_HOST explicitly, so the decision lives in one
@@ -66,7 +78,12 @@ class Catalog:
         mt = self._config_mtime()
         with self._lock:
             if mt != self._mtime or not self._static:
-                self._static = llmreg.catalog(with_live=False)
+                try:
+                    self._static = llmreg.catalog(with_live=False)
+                except llmreg.ConfigMissing as exc:
+                    #  A fresh checkout, not a server fault - say which command
+                    #  fixes it instead of returning a traceback.
+                    raise HTTPException(503, str(exc)) from None
                 self._mtime = mt
             base = [json.loads(json.dumps(m)) for m in self._static]
         state = llmreg.live()
@@ -114,6 +131,13 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 
+#  bin/llm colours its output, and cmake/git/uv do too when they think they are
+#  on a terminal. Those escapes would show up literally in the web page, so the
+#  child is asked to keep quiet (NO_COLOR) and whatever still slips through is
+#  stripped here.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "kind": kind, "argv": argv, "state": "running",
@@ -122,12 +146,12 @@ def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
         JOBS[job_id] = job
 
     def run():
-        e = dict(os.environ, HF_HUB_DISABLE_XET="1", **(env or {}))
+        e = dict(os.environ, HF_HUB_DISABLE_XET="1", NO_COLOR="1", **(env or {}))
         try:
             p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, env=e)
             for line in p.stdout:                      # type: ignore[union-attr]
-                line = line.rstrip("\n")
+                line = ANSI.sub("", line.rstrip("\n"))
                 with JOBS_LOCK:
                     job["log"].append(line)
                     del job["log"][:-400]              # keep only the last lines
@@ -143,19 +167,87 @@ def job_start(kind: str, argv: list[str], env: dict | None = None) -> str:
     return job_id
 
 
+def job_running(*kinds: str) -> dict | None:
+    """A running job of one of these kinds, or None.
+
+    Updates need this: two of them would fetch into the same repository, move
+    the same symlink and restart the same unit at the same time.
+    """
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job["state"] == "running" and job["kind"] in kinds:
+                return {k: v for k, v in job.items() if k != "log"}
+    return None
+
+
 # ---------------------------------------------------------------------------
 #  Auth
 # ---------------------------------------------------------------------------
-def require_token(x_llm_token: str | None = Header(default=None)):
-    want = llmreg.api_token(create=False)
-    if not want:
-        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
-    if x_llm_token != want:
-        raise HTTPException(401, "wrong or missing X-LLM-Token")
+#  Writes need the token from config/api-token, as a header or - so the web page
+#  does not have to keep it in every form - as a session cookie obtained once
+#  from POST /api/session. Sessions live in memory only: they are gone after a
+#  restart, which is the right trade for something that guards one machine's
+#  configuration and saves writing a session store.
+SESSION_COOKIE = "llm_session"
+SESSION_TTL = 12 * 3600
+_sessions: dict[str, float] = {}
+_sessions_lock = threading.Lock()
+
+
+def _session_new() -> tuple[str, int]:
+    sid = secrets.token_urlsafe(32)
+    with _sessions_lock:
+        now = time.time()
+        for k, exp in list(_sessions.items()):        # opportunistic cleanup
+            if exp < now:
+                del _sessions[k]
+        _sessions[sid] = now + SESSION_TTL
+    return sid, SESSION_TTL
+
+
+def _session_valid(sid: str | None) -> bool:
+    if not sid:
+        return False
+    with _sessions_lock:
+        exp = _sessions.get(sid)
+        if exp is None:
+            return False
+        if exp < time.time():
+            del _sessions[sid]
+            return False
     return True
 
 
+def require_token(x_llm_token: str | None = Header(default=None),
+                  llm_session: str | None = Cookie(default=None)):
+    want = llmreg.api_token(create=False)
+    if not want:
+        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
+    if x_llm_token == want or _session_valid(llm_session):
+        return True
+    raise HTTPException(401, "wrong or missing X-LLM-Token (or expired session)")
+
+
 WRITE = [Depends(require_token)]
+
+#  Reads are open by default, and that is deliberate rather than an oversight:
+#  the pi extension fetches /api/models, /api/gpus, /api/health and /api/jobs
+#  without a token, and docs/PI.md tells people the token is only for changes.
+#  Requiring auth for reads would break every existing client, so it is opt-in.
+#  Worth turning on if 8081 is reachable beyond your own machine: reads expose
+#  every model path, checksum and Hugging Face repo, plus live VRAM per card.
+READ_NEEDS_AUTH = os.environ.get("LLM_API_REQUIRE_AUTH", "").strip().lower() \
+    in ("1", "true", "yes")
+
+
+def require_read(x_llm_token: str | None = Header(default=None),
+                 llm_session: str | None = Cookie(default=None)):
+    if not READ_NEEDS_AUTH:
+        return True
+    return require_token(x_llm_token, llm_session)
+
+
+READ = [Depends(require_read)]
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +439,7 @@ async def lifespan(_app: FastAPI):
         yield
 
 
-app = FastAPI(title="llm-box registry", version="1.0", lifespan=lifespan,
+app = FastAPI(title="llm-box registry", version=LLM_BOX_VERSION, lifespan=lifespan,
               description="Model registry of the local LLM server")
 
 
@@ -371,28 +463,29 @@ def versions() -> dict:
             return None
     swap = out(os.path.join(llmreg.LLM_HOME, "bin", "llama-swap"), "--version")
     lcpp = os.path.realpath(os.path.join(llmreg.LLM_HOME, "llama.cpp", "build"))
-    return {"llamaSwap": (swap or "").replace("version: ", "").split("\n")[0] or None,
+    return {"llmBox": LLM_BOX_VERSION,
+            "llamaSwap": (swap or "").replace("version: ", "").split("\n")[0] or None,
             "llamaCpp": os.path.basename(lcpp).replace("build-", "") if lcpp else None}
 
 
-@app.get("/api/models")
+@app.get("/api/models", dependencies=READ)
 def api_models(role: str | None = Query(default=None),
                slim: bool = Query(default=False)):
     models = [m for m in CAT.all() if not role or m["role"] == role]
     return [_slim(m) for m in models] if slim else models
 
 
-@app.get("/api/models/{model_id}")
+@app.get("/api/models/{model_id}", dependencies=READ)
 def api_model(model_id: str):
     return CAT.one(model_id)
 
 
-@app.get("/api/gpus")
+@app.get("/api/gpus", dependencies=READ)
 def api_gpus():
     return llmreg.gpus()
 
 
-@app.get("/api/state")
+@app.get("/api/state", dependencies=READ)
 def api_state():
     st = llmreg.live()
     return {"swapUp": st["up"], "running": st["running"],
@@ -400,11 +493,25 @@ def api_state():
 
 
 @app.get("/api/pi-models.json")
-def api_pi_models():
+def api_pi_models(x_llm_token: str | None = Header(default=None),
+                  llm_session: str | None = Cookie(default=None)):
+    """The provider block pi consumes. Open, EXCEPT when it carries a secret.
+
+    This one endpoint stays reachable without a token so a client can bootstrap
+    itself - but once an inference key is set (llm key new) the payload contains
+    it, and handing that to anyone who can reach the port would undo the whole
+    point of setting it. So the rule follows the content: no key, no
+    authentication; key, token or session required.
+    """
+    if llmreg.api_key():
+        want = llmreg.api_token(create=False)
+        if not (want and (x_llm_token == want or _session_valid(llm_session))):
+            raise HTTPException(401, "an inference key is set, so this payload carries a "
+                                     "secret - send X-LLM-Token (llm api token)")
     return llmreg.pi_models_json(CAT.all())
 
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=READ)
 async def api_events():
     """SSE: announces every change to the configuration or the load state."""
     async def gen():
@@ -422,10 +529,138 @@ async def api_events():
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+@app.post("/api/session")
+def api_session(response: Response, body: dict = Body(default={})):
+    """Exchange the token for a session cookie, so the web page holds no secret.
+
+    The cookie is HttpOnly and SameSite=Strict. It is NOT marked Secure: this
+    project serves plain HTTP, and setting the flag would make the cookie
+    unusable rather than the connection safe. Over an untrusted network the
+    answer is an SSH tunnel or a TLS proxy, not a flag - see SECURITY.md.
+    """
+    want = llmreg.api_token(create=False)
+    if not want:
+        raise HTTPException(503, "no token configured - run 'llm api token' on the server")
+    if str(body.get("token") or "") != want:
+        raise HTTPException(401, "wrong token")
+    sid, ttl = _session_new()
+    response.set_cookie(SESSION_COOKIE, sid, max_age=ttl, httponly=True,
+                        samesite="strict", path="/")
+    return {"ok": True, "expiresInSeconds": ttl}
+
+
+@app.delete("/api/session")
+def api_session_end(response: Response, llm_session: str | None = Cookie(default=None)):
+    if llm_session:
+        with _sessions_lock:
+            _sessions.pop(llm_session, None)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/session")
+def api_session_state(llm_session: str | None = Cookie(default=None),
+                      x_llm_token: str | None = Header(default=None)):
+    """Whether this caller may write. The page asks before showing any button."""
+    want = llmreg.api_token(create=False)
+    return {"canWrite": bool(want) and (x_llm_token == want or _session_valid(llm_session)),
+            "tokenConfigured": bool(want), "readNeedsAuth": READ_NEEDS_AUTH}
+
+
+@app.get("/api/versions", dependencies=READ)
+def api_versions():
+    """Engine versions, what is installed alongside and how to roll back.
+
+    Only `llm versions` and `llm status` knew any of this, so nothing outside
+    the machine could tell whether an update was pending or what there was to
+    fall back to. 'latest' comes from .update-cache and never from a live
+    GitHub call - the same rule the CLI follows, so neither blocks on the
+    network.
+    """
+    return llmreg.engine_versions()
+
+
+@app.get("/api/config", dependencies=READ)
+def api_config():
+    """The parts of llama-swap.yaml that are not per-model: macros and groups.
+
+    llama-swap's own UI has no /api/config at all, so the eviction semantics -
+    swap, exclusive, persistent - were visible only by opening the file.
+    """
+    try:
+        return llmreg.config_overview()
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@app.get("/api/config/diff", dependencies=READ)
+def api_config_diff():
+    """What `llm gpu sync` would change. Empty diff = configuration matches."""
+    try:
+        out = llmreg.gpu_sync(dry_run=True)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    return {"diff": out.get("diff") or "", "cards": out.get("cards"),
+            "tensorSplit": out.get("tensorSplit"),
+            "drift": llmreg.tensor_split_drift()}
+
+
+# ---------------------------------------------------------------------------
+#  Roles. Until now these could only be created from the CLI, which meant a UI
+#  or a remote agent could see them and not change them.
+# ---------------------------------------------------------------------------
+@app.get("/api/roles", dependencies=READ)
+def api_roles():
+    try:
+        return llmreg.read_selectors()
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+
+
+@app.put("/api/roles/{name}", dependencies=WRITE)
+def api_role_put(name: str, body: dict = Body(...),
+                 dry_run: bool = Query(default=False, alias="dryRun")):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        raise HTTPException(400, "a role name may hold letters, digits, dot, dash "
+                                 "and underscore, and must start with one of the first two")
+    targets = body.get("targets")
+    if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+        raise HTTPException(400, "targets must be a list of model names")
+    spill = body.get("spillover")
+    if spill is not None and not (isinstance(spill, int) and 1 <= spill <= 64):
+        raise HTTPException(400, "spillover must be a whole number 1..64")
+    try:
+        out = llmreg.set_selector(name, str(body.get("strategy") or ""), targets,
+                                  spillover=spill, description=body.get("description"),
+                                  dry_run=dry_run)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    CAT.invalidate()
+    if not dry_run:
+        out["reloaded"] = llmreg.reload_swap()
+    return out
+
+
+@app.delete("/api/roles/{name}", dependencies=WRITE)
+def api_role_delete(name: str):
+    try:
+        out = llmreg.del_selector(name)
+    except llmreg.ConfigMissing as exc:
+        raise HTTPException(503, str(exc)) from None
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from None
+    CAT.invalidate()
+    out["reloaded"] = llmreg.reload_swap()
+    return out
+
+
 @app.patch("/api/models/{model_id}", dependencies=WRITE)
 def api_patch(model_id: str, body: dict = Body(default={}),
               dry_run: bool = Query(default=False, alias="dryRun")):
     CAT.one(model_id)                                  # 404 if it does not exist
+    _check_patch(body)
     try:
         out = llmreg.patch_model(model_id, body, dry_run=dry_run)
     except MemoryError as exc:
@@ -467,6 +702,34 @@ def api_delete(model_id: str, files: bool = Query(default=False)):
     return out
 
 
+def _check_gpu(gpu) -> None:
+    """A card number that exists, or 'both'. Used by POST *and* PATCH.
+
+    PATCH used to skip this entirely, so a model could be pinned to a card the
+    machine does not have - llama-server then failed at load time with nothing
+    pointing back at the request that caused it.
+    """
+    if gpu is None or str(gpu) in ("both", "all"):
+        return
+    n = llmreg.gpu_count()
+    if not re.fullmatch(r"\d+", str(gpu)) or (n and int(gpu) >= n):
+        raise HTTPException(400, "gpu must be 'both' or a card number 0..%d "
+                                 "(detected: %d card(s), see GET /api/gpus)"
+                                 % (max(n - 1, 0), n))
+
+
+def _check_patch(body: dict) -> None:
+    """What PATCH accepts. Mirrors the checks POST /api/models already had."""
+    _check_gpu(body.get("gpu"))
+    for key in ("ttl", "contextWindow"):
+        v = body.get(key)
+        if v is not None and not (isinstance(v, int) and 0 <= v <= 10_000_000):
+            raise HTTPException(400, "%s must be a whole number" % key)
+    np_ = body.get("parallel")
+    if np_ is not None and not (isinstance(np_, int) and 1 <= np_ <= 64):
+        raise HTTPException(400, "parallel must be a whole number 1..64")
+
+
 def _check_add(body: dict) -> tuple[str, str]:
     """Validate input: these flags end up in the cmd line llama-swap executes."""
     repo = str(body.get("repo") or "")
@@ -474,17 +737,12 @@ def _check_add(body: dict) -> tuple[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
         raise HTTPException(400, "repo must be 'publisher/name' (e.g. 'unsloth/Qwen3-8B-GGUF')")
     if not re.fullmatch(r"[A-Za-z0-9_.]+", quant):
-        raise HTTPException(400, "quant enthaelt unerlaubte Zeichen (z.B. 'Q4_K_M')")
+        raise HTTPException(400, "quant contains characters that are not allowed "
+                                 "(it looks like 'Q4_K_M')")
     extra = str(body.get("extraFlags") or "")
     if re.search(r"[;&|<>`$\n\r\"']", extra):
         raise HTTPException(400, "extraFlags contains metacharacters - plain flags only")
-    gpu = body.get("gpu")
-    if gpu is not None and str(gpu) not in ("both", "all"):
-        n = llmreg.gpu_count()
-        if not re.fullmatch(r"\d+", str(gpu)) or (n and int(gpu) >= n):
-            raise HTTPException(400, "gpu must be 'both' or a card number 0..%d "
-                                     "(detected: %d card(s), see GET /api/gpus)"
-                                     % (max(n - 1, 0), n))
+    _check_gpu(body.get("gpu"))
     for key in ("ttl", "contextWindow"):
         v = body.get(key)
         if v is not None and not (isinstance(v, int) and 0 <= v <= 10_000_000):
@@ -518,19 +776,19 @@ def api_add(body: dict = Body(...)):
         argv += ["-c", str(body["contextWindow"])]
     argv += [repo, quant]
     if body.get("extraFlags"):
-        argv += ["--"] + str(body["extraFlags"]).split()
+        argv += ["--", *str(body["extraFlags"]).split()]
     job_id = job_start("add", argv)
     return {"jobId": job_id, "argv": argv,
-            "hint": "Fortschritt: GET /api/jobs/%s" % job_id}
+            "hint": "progress: GET /api/jobs/%s" % job_id}
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=READ)
 def api_jobs():
     with JOBS_LOCK:
         return [{k: v for k, v in j.items() if k != "log"} for j in JOBS.values()]
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=READ)
 def api_job(job_id: str):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -539,18 +797,164 @@ def api_job(job_id: str):
     return job
 
 
+# ---------------------------------------------------------------------------
+#  Updates and rollbacks
+# ---------------------------------------------------------------------------
+#  The machinery stays in lib/update.sh - this only starts 'llm update' /
+#  'llm rollback' through the same job runner the downloads use, so the control
+#  page can follow along instead of telling people to open a shell.
+#
+#  An allowlist rather than a pattern: these strings become a command line, and
+#  a path parameter must never be able to contribute a word of its own.
+UPDATE_COMPONENTS = ("llama", "swap", "whisper", "ui", "comfy")
+
+
+def _check_component(component: str, allow_all: bool) -> str:
+    known = UPDATE_COMPONENTS + (("all",) if allow_all else ())
+    if component not in known:
+        raise HTTPException(400, "component must be one of: %s" % ", ".join(known))
+    return component
+
+
+def _check_version(body: dict | None) -> str | None:
+    """An explicit target tag, as 'llm update llama b10516' takes one."""
+    version = (body or {}).get("version")
+    if version in (None, ""):
+        return None
+    version = str(version)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", version):
+        raise HTTPException(400, "version must be a tag such as 'b10545' or 'v1.9.3'")
+    return version
+
+
+def _start_update(kind: str, argv: list[str]) -> dict:
+    #  One at a time: two of these would fetch into the same repository, move the
+    #  same symlink and restart the same unit at once.
+    busy = job_running("update", "rollback", "check")
+    if busy:
+        raise HTTPException(409, "'%s' is still running (job %s) - these have to "
+                                 "take turns, they share the repositories and the "
+                                 "services" % (" ".join(busy["argv"][1:]), busy["id"]))
+    job_id = job_start(kind, argv)
+    return {"jobId": job_id, "argv": argv[1:],
+            "hint": "progress: GET /api/jobs/%s" % job_id}
+
+
+@app.post("/api/updates/check", dependencies=WRITE, status_code=202)
+def api_update_check():
+    """Ask upstream for the newest versions, now.
+
+    Registered before /api/updates/{component} on purpose - the other route
+    would swallow this path. .update-cache is up to a day old (UPD_MAXAGE in
+    lib/update.sh) and until now only the CLI could refresh it, so the version
+    table could show a stale 'latest' with no way to correct it from here.
+    'llm update status' does the querying and prints what it found.
+    """
+    return _start_update("check", [LLM_CLI, "update", "status"])
+
+
+@app.post("/api/updates/{component}", dependencies=WRITE, status_code=202)
+def api_update(component: str, body: dict | None = Body(default=None)):
+    """Build or install a component and switch to it. 'all' does every one.
+
+    This takes a while - a llama.cpp build is tens of minutes - and llama-swap
+    is down for a few seconds while the symlink moves. A smoke test decides
+    whether the new version becomes active at all; when it fails, the running
+    one stays. The full build output goes to a log file on the server, the job
+    log carries the progress lines.
+    """
+    component = _check_component(component, allow_all=True)
+    version = _check_version(body)
+    argv = [LLM_CLI, "update", component] + ([version] if version else [])
+    return _start_update("update", argv)
+
+
+@app.post("/api/rollback/{component}", dependencies=WRITE, status_code=202)
+def api_rollback(component: str):
+    """Back to the previous version. /api/versions says whether there is one."""
+    component = _check_component(component, allow_all=False)
+    return _start_update("rollback", [LLM_CLI, "rollback", component])
+
+
+WEB_PAGE = os.path.join(ROOT, "web", "index.html")
+
+
+@app.get("/ui")
+@app.get("/ui/")
+def api_ui():
+    """The control page. One file, no build step, served from the same origin as
+    the API so there is nothing to configure for CORS.
+
+    Registered before the MCP mount on "/" deliberately; a route added after it
+    would never be reached.
+    """
+    if not os.path.exists(WEB_PAGE):
+        raise HTTPException(404, "web/index.html is missing from this checkout")
+    #  no-store: the page is small and always reflects a live configuration.
+    return FileResponse(WEB_PAGE, media_type="text/html; charset=utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+
+#  The page's stylesheets. A table rather than a static mount: this process reads
+#  every model file and config/api-token, and a path parameter that reaches the
+#  filesystem is how that turns into someone else's shell. The names are what the
+#  page asks for; the paths are ours.
+UI_ASSETS = {
+    "stellar.css": os.path.join(ROOT, "web", "vendor", "stellar", "index.css"),
+    "stellar-auto-dark.css": os.path.join(ROOT, "web", "vendor", "stellar", "auto-dark.css"),
+}
+
+
+@app.get("/ui/{asset}")
+def api_ui_asset(asset: str, if_none_match: str | None = Header(default=None)):
+    """One of the page's stylesheets, by name.
+
+    Registered before the MCP mount for the same reason /ui is.
+
+    'no-cache' rather than 'no-store', plus the conditional check by hand:
+    FileResponse sends an ETag but does not answer If-None-Match itself (that
+    lives in StaticFiles, which this deliberately is not), so without these four
+    lines the browser would re-fetch 78 KB of unchanged CSS on every page load.
+    A long max-age is not the answer either - the URL stays the same across
+    versions, so it would serve the old design system after an upgrade.
+    """
+    path = UI_ASSETS.get(asset)
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "no such asset - the page asks for %s"
+                                 % ", ".join(sorted(UI_ASSETS)))
+    #  stat_result eagerly: without it FileResponse only computes the ETag while
+    #  it is being sent, and there would be nothing here to compare against.
+    r = FileResponse(path, media_type="text/css; charset=utf-8",
+                     stat_result=os.stat(path),
+                     headers={"Cache-Control": "no-cache"})
+    #  Its own ETag, so the two can never be computed differently.
+    tag = r.headers.get("etag")
+    if tag and if_none_match and tag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers={"ETag": tag,
+                                                 "Cache-Control": "no-cache"})
+    return r
+
+
 @app.get("/")
 def root():
     return JSONResponse({
         "service": "llm-box registry",
+        "version": LLM_BOX_VERSION,
+        "ui": "/ui",
         "read": ["/api/health", "/api/models", "/api/models/{id}", "/api/gpus",
-                 "/api/state", "/api/pi-models.json", "/api/events"],
+                 "/api/state", "/api/versions", "/api/config", "/api/config/diff",
+                 "/api/roles", "/api/jobs", "/api/pi-models.json", "/api/events",
+                 "/ui/{asset}"],
         "write": ["PATCH /api/models/{id}", "POST /api/models",
                   "POST /api/models/{id}/load", "POST /api/unload",
-                  "DELETE /api/models/{id}"],
+                  "DELETE /api/models/{id}", "PUT /api/roles/{name}",
+                  "DELETE /api/roles/{name}", "POST /api/updates/check",
+                  "POST /api/updates/{component}", "POST /api/rollback/{component}"],
         "mcp": "/mcp",
         "docs": "/docs",
-        "hint": "writing needs the X-LLM-Token header",
+        "hint": "writing needs the X-LLM-Token header, or a session cookie from "
+                "POST /api/session",
+        "readNeedsAuth": READ_NEEDS_AUTH,
     })
 
 

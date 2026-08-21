@@ -1,0 +1,119 @@
+/* =========================================================
+   Stellar Design System — opt-in OS dark detection
+   Opt-in via `import "@polygonschmied/stellar-tokens/auto-dark.css"`.
+
+   Applies the dark overrides under `prefers-color-scheme: dark`, but ONLY when
+   the app has NOT set an explicit `data-theme` on :root — so an explicit
+   attribute always wins over the OS preference. Use this when you want
+   automatic OS-driven dark with no manual toggle; use `dark.css` +
+   `data-theme="dark"` when you control the theme yourself.
+
+   The declarations MIRROR `dark.css` — a parity test
+   (`__tests__/auto-dark-parity.test.ts`) fails if the two drift, so keep them
+   in sync. (Plain CSS can't share a block between an attribute selector and a
+   media query.)
+
+   Lives in `@layer stellar-theme` (after base `@layer stellar`), mirroring
+   `dark.css`, so the OS-driven overrides win over a late-injected base `:root`.
+   ========================================================= */
+
+@layer stellar, stellar-theme;
+
+@layer stellar-theme {
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      /* ---------- PAPER (inverted: dark surfaces) ---------- */
+      --paper-0: oklch(13.5% 0.006 270);
+      --paper-1: oklch(19% 0.008 268);
+      --paper-2: oklch(23.5% 0.009 266);
+      --paper-3: oklch(28% 0.01 264);
+      --paper-rule: oklch(33% 0.012 262);
+      --paper-rule-strong: oklch(46% 0.014 260);
+
+      /* ---------- Ink (light text for dark surfaces) ---------- */
+      --ink-1: oklch(96% 0.005 250);
+      --ink-2: oklch(82% 0.006 250);
+      --ink-3: oklch(66% 0.007 248);
+      --ink-4: oklch(50% 0.007 246);
+      --ink-inv: oklch(16% 0.005 270);
+
+      /* ---------- CLAY (raised controls on dark) ---------- */
+      --clay-0: oklch(24% 0.01 270);
+      --clay-1: oklch(28% 0.012 268);
+      --clay-2: oklch(32% 0.013 266);
+      --clay-3: oklch(36% 0.014 264);
+      --clay-rim: oklch(44% 0.016 262);
+      --clay-rim-strong: oklch(54% 0.018 260);
+
+      --clay-shadow-warm: 0 0 0;
+      --clay-highlight: 255 255 255;
+
+      /* ---------- Bevel (see motion.css / dark.css) ---------- */
+      --bevel-highlight-strength: 0.13;
+      --bevel-shade-strength: 2.5;
+      --bevel-rim: var(--clay-rim);
+
+      /* ---------- Overlay surfaces (lightest layers, above cards) ---------- */
+      --surface-overlay: oklch(25% 0.009 266);
+      --surface-popover: oklch(25% 0.009 266);
+      --seg-active-bg: oklch(30% 0.011 266);
+
+      /* ---------- Accent ramp (brightened for dark) ---------- */
+      --accent: oklch(70% 0.18 38);
+      --accent-soft: oklch(35% 0.1 40);
+      --accent-ink: oklch(82% 0.14 38);
+
+      --citron: oklch(82% 0.14 95);
+      --citron-soft: oklch(34% 0.08 95);
+      --citron-ink: oklch(86% 0.11 92);
+
+      --kelp: oklch(68% 0.13 155);
+      --kelp-soft: oklch(28% 0.08 155);
+      --kelp-ink: oklch(82% 0.1 155);
+
+      --sky: oklch(70% 0.13 230);
+      --sky-soft: oklch(30% 0.09 230);
+      --sky-ink: oklch(84% 0.11 230);
+
+      --plum: oklch(62% 0.16 320);
+      --plum-soft: oklch(30% 0.1 320);
+      --plum-ink: oklch(82% 0.13 320);
+
+      --crimson: oklch(66% 0.2 22);
+      --crimson-soft: oklch(32% 0.11 22);
+      --crimson-ink: oklch(84% 0.14 22);
+
+      --selection: color-mix(in oklch, var(--citron) 35%, var(--paper-2));
+      --focus-ring: var(--sky);
+
+      --btn-primary-bg: var(--ember);
+
+      /* Button state fills — see dark.css for rationale. */
+      --btn-primary-bg-hover: color-mix(in oklch, var(--btn-primary-bg) 88%, white);
+      --btn-danger-bg: oklch(56% 0.19 25);
+      --on-danger: var(--ink-1);
+      --btn-ghost-fg: var(--ink-1);
+      --btn-ghost-hover-bg: var(--paper-3);
+
+      --disabled-opacity: 0.6;
+
+      /* ---------- THEATER (dark inset panels) ---------- */
+      --theater-0: var(--theater-dark-0);
+      --theater-1: var(--theater-dark-1);
+      --theater-2: var(--theater-dark-2);
+      --theater-3: var(--theater-dark-3);
+      --theater-rim: var(--theater-dark-rim);
+
+      --theater-fg-1: var(--theater-dark-fg-1);
+      --theater-fg-2: var(--theater-dark-fg-2);
+      --theater-fg-3: var(--theater-dark-fg-3);
+
+      --glass-shadow: var(--glass-dark-shadow);
+
+      /* Paper shadows on dark — softer, more diffuse */
+      --shadow-paper-1: 0 1px 0 rgb(0 0 0 / 0.35), 0 1px 2px rgb(0 0 0 / 0.25);
+      --shadow-paper-2: 0 1px 0 rgb(0 0 0 / 0.4), 0 4px 12px -2px rgb(0 0 0 / 0.3);
+      --shadow-paper-3: 0 2px 0 rgb(0 0 0 / 0.45), 0 12px 28px -8px rgb(0 0 0 / 0.5);
+    }
+  }
+} /* end @layer stellar-theme */

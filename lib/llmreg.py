@@ -20,6 +20,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import struct
 import subprocess
@@ -115,9 +116,34 @@ def has_flag_any(cmd: str, *names) -> bool:
     return any(has_flag(cmd, n) for n in names)
 
 
+def slots_of(cmd: str, role: str = "chat") -> tuple[int | None, bool | None]:
+    """(slots, kv_unified) as llama-server will really run, not as written.
+
+    llama.cpp treats a missing '-np'/'--parallel' as auto = 4 slots with a
+    unified KV cache (tools/server/server.cpp), so reporting the literal flag
+    would claim one slot where there are four. whisper-server has neither
+    flag, hence the None for role "stt".
+    """
+    n = _num(flag_any(cmd, "-np", "--parallel"), None)
+    auto = n is None or n < 0
+    parallel = 4 if auto else n
+    unified = auto or has_flag_any(cmd, "-kvu", "--kv-unified")
+    if has_flag_any(cmd, "-no-kvu", "--no-kv-unified"):
+        unified = False
+    if role == "stt":
+        return None, None
+    return parallel, unified
+
+
 def set_flag(cmd: str, name: str, value) -> str:
-    """Set a flag (replace or append). value=None -> a bare switch."""
-    cmd = del_flag(cmd, name)
+    """Set a flag (replace or append). value=None -> a bare switch.
+
+    The with_value hand-off matters: del_flag() removes the flag AND the token
+    after it by default, so setting a valueless switch used to eat whatever
+    followed it. On '-np 3 -kvu' plus set_flag('-kvu', None) that produced
+    '3 -kvu' - a command line llama-server refuses to start.
+    """
+    cmd = del_flag(cmd, name, with_value=value is not None)
     return _tidy(cmd + (" %s %s" % (name, value) if value is not None else " " + name))
 
 
@@ -154,7 +180,8 @@ def config_lock(timeout: float = 30.0):
                 break
             except OSError:
                 if time.time() > deadline:
-                    raise TimeoutError("configuration is locked right now (another llm command is running)")
+                    raise TimeoutError("configuration is locked right now "
+                                       "(another llm command is running)") from None
                 time.sleep(0.2)
         yield
     finally:
@@ -164,9 +191,24 @@ def config_lock(timeout: float = 30.0):
             fh.close()
 
 
+class ConfigMissing(FileNotFoundError):
+    """There is no llama-swap.yaml yet. Named so callers can answer usefully.
+
+    config_text() is the entrance to parse_config, find_block, read_selectors,
+    sync_groups, sync_tensor_split, gpu_sync, patch_model, remove_model and
+    therefore catalog(). On a fresh checkout - the state of every clone before
+    'llm init' - a bare FileNotFoundError travelled all the way out as an
+    HTTP 500 with a traceback, which tells the caller nothing.
+    """
+
+
 def config_text() -> str:
-    with open(CONFIG, encoding="utf-8") as fh:
-        return fh.read()
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        raise ConfigMissing(
+            "no configuration at %s - create it with 'llm init'" % CONFIG) from None
 
 
 def parse_config(text: str | None = None) -> list[dict]:
@@ -258,7 +300,7 @@ def gguf_meta(path: str) -> dict:
                         return vals if n <= 64 else n
                     if et not in _GT:
                         raise ValueError("array type %s" % et)
-                    if n > 4096:                      # riesige Zahlen-Arrays ueberspringen
+                    if n > 4096:                      # skip huge numeric arrays
                         fh.seek(_GS[et] * n, os.SEEK_CUR)
                         return n
                     return list(struct.unpack("<%d%s" % (n, _GT[et]), fh.read(_GS[et] * n)))
@@ -273,7 +315,7 @@ def gguf_meta(path: str) -> dict:
                 if key.startswith("tokenizer.") and key != "tokenizer.chat_template":
                     continue
                 out[key] = val
-    except Exception:
+    except Exception:      # noqa: BLE001 - a malformed header is "no metadata"
         out = {}
     _GGUF_CACHE[path] = out
     return out
@@ -284,8 +326,47 @@ def _arch_get(meta: dict, suffix: str, default=None):
     return meta.get("%s.%s" % (arch, suffix), default)
 
 
+#  Weights plus KV cache is not the whole story: llama-server also allocates
+#  compute buffers, the CUDA/HIP graph and (with -np) one batch per slot. 8 % on
+#  top has matched the measurements on this hardware - 32.0 GB estimated against
+#  32.17 GB observed for a 27B at 131k context with four slots.
+VRAM_HEADROOM = 1.08
+
+
+def vram_needed(weights: int | None, kv: int | None) -> int | None:
+    """What to reserve for a model. None when the weights are unknown."""
+    if not weights:
+        return None
+    return int((weights + (kv or 0)) * VRAM_HEADROOM)
+
+
+def reasoning_efforts(meta: dict | None) -> dict | None:
+    """Which reasoning_effort values the chat template accepts, and its default.
+
+    llama.cpp reports `supports_reasoning_effort: true` and nothing about the
+    allowed set, so a client offering the usual OpenAI low/medium/high picker
+    gets an HTTP 500 from Jinja on two of the three. Qwen3.8 for instance takes
+    only xhigh, medium and low - 'high' raises. The template is in the GGUF
+    header, so the set can be read instead of guessed.
+
+    Returns None when the template does not gate the value, which is most of
+    them - then anything goes and there is nothing to report.
+    """
+    tmpl = (meta or {}).get("tokenizer.chat_template") or ""
+    if "reasoning_effort" not in tmpl:
+        return None
+    m = re.search(r"reasoning_effort\s+not\s+in\s*\(([^)]*)\)", tmpl)
+    if not m:
+        return None
+    values = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+    if not values:
+        return None
+    d = re.search(r"reasoning_effort\s*\|\s*default\(\s*['\"]([^'\"]+)", tmpl)
+    return {"values": values, "default": d.group(1) if d else None}
+
+
 def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
-                   parallel: int = 1) -> int | None:
+                   parallel: int = 1, meta: dict | None = None) -> int | None:
     """Size of the KV cache in bytes, from the real GGUF header.
 
     NOTE on `parallel`: the attention KV cache does NOT scale with the slot
@@ -299,9 +380,12 @@ def kv_cache_bytes(model_path: str, ctx: int, kv_quant: str | None,
       * hybrid (Qwen3.x, 'full_attention_interval'): only every Nth layer has a
         KV cache, the rest are SSM layers with constant state
       * sliding window (Gemma 4): SWA layers only store the window and
-        haben eigene Key-/Value-Laengen
+        have their own key/value lengths
     """
-    meta = gguf_meta(model_path)
+    #  meta is injectable so the three layout branches below can be checked
+    #  against synthetic headers - the arithmetic decides whether a load OOMs,
+    #  and a real GGUF fixture would mean committing gigabytes.
+    meta = gguf_meta(model_path) if meta is None else meta
     if not meta or not ctx:
         return None
     layers = _arch_get(meta, "block_count")
@@ -416,7 +500,7 @@ def hf_verify(repo: str, sha: str) -> str | None:
         d = _http_json("https://huggingface.co/api/models/%s/revision/%s" % (repo, sha),
                        timeout=15)
         return (d or {}).get("id") or repo
-    except Exception:
+    except Exception:      # noqa: BLE001 - no Hugging Face, no revision
         return None
 
 
@@ -427,7 +511,7 @@ def hf_search(query: str, limit: int = 20, gguf_only: bool = True) -> list[str]:
             % (urllib.parse.quote(query), limit, "&filter=gguf" if gguf_only else ""),
             timeout=15)
         return [d.get("id", "") for d in (data or []) if d.get("id")]
-    except Exception:
+    except Exception:      # noqa: BLE001 - a failed search is an empty search
         return []
 
 
@@ -466,12 +550,12 @@ def live() -> dict:
         out["up"] = True
         for m in (data or {}).get("data", []):
             out["states"][m.get("id")] = (m.get("status") or {}).get("value", "unknown")
-    except Exception:
+    except Exception:      # noqa: BLE001 - llama-swap down is a state, not an error
         return out
     try:
         run = _http_json(SWAP_API + "/running") or {}
         out["running"] = run.get("running", [])
-    except Exception:
+    except Exception:      # noqa: BLE001 - as above: report what we know
         pass
     return out
 
@@ -508,16 +592,16 @@ _SMI_CACHE: tuple[float, dict[int, dict]] | None = None
 def _smi_cards(max_age: float = 1.0) -> dict[int, dict]:
     """EVERY device rocm-smi knows about, iGPU included. Keys are absolute.
 
-    One query yields temperature, VRAM, name and gfx target. Cached briefly
-    because several callers ask within the same request (gpus, gpu_of,
-    check_fit); 1 s is short enough to keep 'llm watch' live.
+    One query yields temperature, power draw, utilisation, VRAM, name and gfx
+    target. Cached briefly because several callers ask within the same request
+    (gpus, gpu_of, check_fit); 1 s is short enough to keep 'llm watch' live.
     """
     global _SMI_CACHE
     if _SMI_CACHE and (time.time() - _SMI_CACHE[0]) < max_age:
         return _SMI_CACHE[1]
     try:
-        raw = subprocess.run([ROCM_SMI, "--showtemp", "--showmeminfo", "vram",
-                              "--showproductname"],
+        raw = subprocess.run([ROCM_SMI, "--showtemp", "--showpower", "--showuse",
+                              "--showmeminfo", "vram", "--showproductname"],
                              capture_output=True, text=True, timeout=15).stdout
     except (OSError, subprocess.SubprocessError):
         raw = ""
@@ -531,6 +615,12 @@ def _smi_cards(max_age: float = 1.0) -> dict[int, dict]:
         c = cards.setdefault(idx, {"smiIndex": idx})
         if "junction" in rest.lower():
             c["tempJunctionC"] = _num(val)
+        #  Discrete cards report "Average Graphics Package Power", an APU
+        #  "Current Socket Graphics Package Power" - match the part they share.
+        elif "Graphics Package Power" in rest:
+            c["powerW"] = _num(val)
+        elif "GPU use (%)" in rest:
+            c["busyPercent"] = _num(val)
         elif "Total Memory" in rest:
             c["vramTotalBytes"] = _num(val)
         elif "Used Memory" in rest:
@@ -762,27 +852,33 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
     if model_dir and os.path.basename(os.path.dirname(model_dir)) == "models":
         pass                                        # model file sits directly in the folder
     elif model_dir:
-        while model_dir and os.path.dirname(model_dir) != MODELS and model_dir != MODELS:
-            model_dir = os.path.dirname(model_dir)
+        #  Walk up to the directory sitting directly under MODELS. The root
+        #  check is not cosmetic: for a -m path OUTSIDE models/ - another disk,
+        #  a hand-edited config - this used to spin forever, because
+        #  os.path.dirname("/") == "/". A single such entry hung every caller of
+        #  catalog(), i.e. GET /api/models never answered.
+        while model_dir != MODELS and os.path.dirname(model_dir) != MODELS:
+            parent = os.path.dirname(model_dir)
+            if parent == model_dir:                 # filesystem root, not under MODELS
+                model_dir = None
+                break
+            model_dir = parent
     src = read_meta(model_dir) if model_dir else None
     if src and src.get("repo"):
         src = dict(src, url="https://huggingface.co/" + src["repo"])
     else:
         issues.append("provenance unknown (on the server: llm meta backfill)")
 
-    gguf = gguf_meta(model_file) if (want_gguf and model_file and os.path.exists(model_file)) else {}
-    # llama.cpp: '-np'/'--parallel' unset means auto = 4 slots + unified KV
-    # (server.cpp:151-154). Report what the server will actually do, not the
-    # literal flag, otherwise the catalog claims one slot where there are four.
-    _np = _num(flag_any(cmd, "-np", "--parallel"), None)
-    parallel = 4 if (_np is None or _np < 0) else _np
-    kv_unified = has_flag_any(cmd, "-kvu", "--kv-unified") or _np is None or _np < 0
-    if has_flag_any(cmd, "-no-kvu", "--no-kv-unified"):
-        kv_unified = False
-    if role == "stt":
-        # whisper-server, not llama-server: neither flag exists there.
-        parallel = kv_unified = None
-    kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel) \
+    gguf = gguf_meta(model_file) \
+        if (want_gguf and model_file and os.path.exists(model_file)) else {}
+    parallel, kv_unified = slots_of(cmd, role)
+    #  What the template accepts, and the floor this entry sets on the command
+    #  line. A client that sends nothing gets the floor; one that sends a value
+    #  overrides it (server-common.cpp merges CLI kwargs first, request second).
+    efforts = reasoning_efforts(gguf)
+    effort_default = flag(cmd, "--reasoning-effort")
+    preserve = not has_flag_any(cmd, "--no-reasoning-preserve", "-no-rp")
+    kv_bytes = kv_cache_bytes(model_file, ctx, kv_quant, parallel or 1) \
         if (model_file and ctx) else None
 
     endpoint = {"chat": "/chat/completions", "embed": "/embeddings",
@@ -801,6 +897,13 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
             "kvCacheQuant": kv_quant,
             "parallel": parallel,
             "kvUnified": kv_unified,
+            "reasoningEffort": {
+                #  None = the template does not gate the value, so anything goes.
+                "accepts": (efforts or {}).get("values"),
+                "templateDefault": (efforts or {}).get("default"),
+                "serverDefault": effort_default,
+                "preserveThinking": preserve,
+            } if role == "chat" else None,
             "mmproj": mmproj,
             "cmd": cmd,
         },
@@ -822,7 +925,7 @@ def derive(entry: dict, want_gguf: bool = True) -> dict:
             "kvCacheBytes": kv_bytes,
             # Headroom for compute context and fragmentation: measured ~8 percent.
             # Without a KV figure (Whisper) only the weights plus headroom remain.
-            "estimatedBytes": int((weights + (kv_bytes or 0)) * 1.08) if weights else None,
+            "estimatedBytes": vram_needed(weights, kv_bytes),
         },
         "source": src,
         "architecture": {
@@ -848,7 +951,9 @@ def pi_entry(model: dict) -> dict | None:
     over = model.get("_pi_over", {})
     # '# pi: skip' (no value) and '# pi: skip=true' (how the API writes it)
     skip = over.get("skip")
-    if skip is True or str(skip).strip().lower() in ("1", "true", "ja", "yes"):
+    #  "ja" is accepted for backwards compatibility with configurations written
+    #  before this file was translated; documented in docs/PI.md.
+    if skip is True or str(skip).strip().lower() in ("1", "true", "yes", "ja"):
         return None
     ctx = model["runtime"]["contextWindow"] or 8192
     entry = {"id": model["id"]}
@@ -872,6 +977,14 @@ def pi_entry(model: dict) -> dict | None:
     #  it provider-wide. This sits before the '# pi-json:' block so an explicit
     #  override still wins.
     entry.setdefault("compat", {})["supportsReasoningEffort"] = entry["reasoning"]
+    #  And WHICH values, when the template gates them. Without this a client
+    #  offering the usual low/medium/high gets a Jinja exception on 'high'.
+    re_info = (model["runtime"].get("reasoningEffort") or {})
+    if entry["reasoning"] and re_info.get("accepts"):
+        entry["compat"]["reasoningEfforts"] = re_info["accepts"]
+        if re_info.get("serverDefault") or re_info.get("templateDefault"):
+            entry["compat"]["reasoningEffortDefault"] = (
+                re_info.get("serverDefault") or re_info.get("templateDefault"))
     for k, v in (model.get("_pi_json") or {}).items():
         if k == "compat":
             entry.setdefault("compat", {}).update(v)
@@ -890,7 +1003,11 @@ def pi_models_json(models: list[dict] | None = None) -> dict:
     return {"providers": {"llm-box": {
         "baseUrl": PUBLIC_API,
         "api": "openai-completions",
-        "apiKey": "sk-local",
+        #  The real key when the endpoint is authenticated, otherwise the
+        #  placeholder - pi wants to see something, and llama-swap does not
+        #  check the value when no apiKeys block is present. A client that
+        #  refreshes from the registry therefore picks up a rotation by itself.
+        "apiKey": api_key() or "sk-local",
         #  llama-server can handle the developer role: it maps it to 'system'
         #  internally (llama.cpp/common/chat.cpp, map_developer_role_to_system),
         #  so it holds for every model and belongs here.
@@ -924,7 +1041,7 @@ def recheck_files(m: dict) -> dict:
     vram = m.get("vram") or {}
     vram["weightsBytes"] = weights or None
     kv = vram.get("kvCacheBytes")
-    vram["estimatedBytes"] = int((weights + (kv or 0)) * 1.08) if weights else None
+    vram["estimatedBytes"] = vram_needed(weights, kv)
     m["vram"] = vram
     return m
 
@@ -1017,6 +1134,43 @@ def get_model(name: str, **kw) -> dict | None:
 # ---------------------------------------------------------------------------
 #  Writing the configuration
 # ---------------------------------------------------------------------------
+def put_block(text: str, mark: str, body: str, head: str = "") -> str:
+    """Replace the '# >>> llm:<mark>' block, or CREATE it before 'models:'.
+
+    Creating rather than silently doing nothing matters: sync_groups() used to
+    return the text unchanged when its marker was missing, and all four callers
+    reported success - while every card-pinned model quietly stayed in
+    llama-swap's default group, which swaps and is exclusive.
+
+    New blocks go BEFORE 'models:'. Appending at the end of the file would put
+    them after it, and the next 'llm add' - which appends its two-space model
+    block at the bottom - would hang that model under the wrong key.
+    """
+    block = "# >>> llm:%s\n%s# <<< llm:%s" % (mark, body, mark)
+    pat = r"# >>> llm:%s\n.*?# <<< llm:%s" % (re.escape(mark), re.escape(mark))
+    if re.search(pat, text, re.S):
+        return re.sub(pat, lambda _m: block, text, flags=re.S)
+    m = re.search(r"^models:", text, re.M)
+    if not m:
+        raise ValueError("the configuration has no 'models:' section - "
+                         "is this a llama-swap config? (llm init)")
+    #  Walk back over the comment header that belongs to 'models:' so it stays
+    #  attached to it instead of ending up above the new block. Stop at a marker
+    #  line: those start with '#' too, and walking past one would insert the new
+    #  block INSIDE the previous one, splitting it from its closing marker.
+    lines = text[:m.start()].split("\n")
+    while lines and (not lines[-1].strip()
+                     or (lines[-1].startswith("#")
+                         and not lines[-1].startswith("# <<< llm:")
+                         and not lines[-1].startswith("# >>> llm:"))):
+        lines.pop()
+    cut = len("\n".join(lines))
+    if cut:
+        cut += 1
+    sep = "\n" if cut and not text[:cut].endswith("\n\n") else ""
+    return text[:cut] + sep + head + block + "\n\n" + text[cut:]
+
+
 def _write_config(text: str) -> None:
     tmp = CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -1053,9 +1207,20 @@ def sync_groups(text: str | None = None) -> str:
                  "    persistent: true\n    members:\n" % PINNED_GROUP)
         width = max(len(n) for n, _ in members) + 2
         for name, card in members:
-            block += '      - %-*s # Karte %d\n' % (width, '"%s"' % name, card)
-    new = "# >>> llm:groups\n" + block + "# <<< llm:groups"
-    return re.sub(r"# >>> llm:groups\n.*?# <<< llm:groups", lambda _m: new, text, flags=re.S)
+            block += '      - %-*s # card %d\n' % (width, '"%s"' % name, card)
+    head = ("# " + "=" * 76 + "\n"
+            "#  CARD GROUPS  —  maintained by 'llm add --gpu N' / 'llm gpu sync'\n"
+            "# " + "=" * 76 + "\n"
+            "#  Every model pinned to a card goes into ONE group called '%s' -\n"
+            "#  whether it was pinned with --device ROCmN or with\n"
+            "#  env: HIP_VISIBLE_DEVICES=N (whisper has no --device flag).\n"
+            "#   swap: false      -> members do not evict each other\n"
+            "#   exclusive: false -> and do not evict anything from other groups\n"
+            "#   persistent: true -> and NO other group may evict them either\n"
+            "#  One group and not one per card, because a 'spillover' role needs\n"
+            "#  all of its targets in a single group.  DO NOT edit by hand:\n"
+            % PINNED_GROUP)
+    return put_block(text, "groups", block, head)
 
 
 # ---------------------------------------------------------------------------
@@ -1130,12 +1295,8 @@ def render_selectors(sel: dict) -> str:
 
 
 def write_selectors(sel: dict, text: str | None = None) -> str:
-    """Replace the marker block. Creates it above the MODELLE header if absent."""
+    """Replace the roles block, creating it above 'models:' if it is absent."""
     text = config_text() if text is None else text
-    block = "# >>> llm:%s\n%s# <<< llm:%s" % (_SEL_MARK, render_selectors(sel), _SEL_MARK)
-    pat = r"# >>> llm:%s\n.*?# <<< llm:%s" % (_SEL_MARK, _SEL_MARK)
-    if re.search(pat, text, re.S):
-        return re.sub(pat, lambda _m: block, text, flags=re.S)
     head = ("# " + "=" * 76 + "\n"
             "#  ROLES (selectors)  —  virtual model names, maintained by 'llm role'\n"
             "# " + "=" * 76 + "\n"
@@ -1147,22 +1308,7 @@ def write_selectors(sel: dict, text: str | None = None) -> str:
             "#                          then target 2 starts (= the second card)\n"
             "#  A role reports the SMALLEST context and the INTERSECTION of the\n"
             "#  capabilities of its targets.  DO NOT edit by hand:\n")
-    #  Must go BEFORE 'models:'. Appending at the end of the file would put the
-    #  block after it, and then the next 'llm add' - which appends its two-space
-    #  model block at the bottom - would hang that model under 'selectors:'.
-    m = re.search(r"^models:", text, re.M)
-    if not m:
-        raise ValueError("the configuration has no 'models:' section")
-    start = m.start()
-    #  Walk back over the comment header that belongs to 'models:' so it stays
-    #  attached to it instead of ending up above our block.
-    lines = text[:start].split("\n")
-    while lines and (lines[-1].startswith("#") or not lines[-1].strip()):
-        lines.pop()
-    cut = len("\n".join(lines))
-    if cut:
-        cut += 1
-    return text[:cut] + head + block + "\n\n" + text[cut:]
+    return put_block(text, _SEL_MARK, render_selectors(sel), head)
 
 
 def set_selector(name: str, strategy: str, targets: list[str],
@@ -1213,6 +1359,26 @@ _TS_LINE_RE = re.compile(r"^\s*-ts\s+[\d.,]+\s*$")
 _MACRO_KEY_RE = re.compile(r'^(\s+)"?([\w.-]+)"?:\s*>\s*$')
 
 
+def tensor_split_drift() -> dict:
+    """What the config says about -ts versus what the hardware wants.
+
+    One implementation on purpose. bin/llm used to carry this twice as the same
+    sed one-liner, with a third regex here that additionally accepts decimal
+    points - so a hand-written '-ts 1.5,1' was visible to Python and invisible
+    to bash, and `llm doctor` reported a match that was not one.
+    """
+    try:
+        lines = config_text().split("\n")
+    except ConfigMissing:
+        return {"configured": None, "expected": tensor_split(), "drifted": False,
+                "reason": "no configuration yet"}
+    have = next((m.group(1) for m in
+                 (re.match(r"^\s*-ts\s+([\d.,]+)\s*$", ln) for ln in lines) if m), None)
+    want = tensor_split()
+    return {"configured": have, "expected": want,
+            "drifted": bool((have or want) and have != want), "reason": None}
+
+
 def sync_tensor_split(text: str | None = None, value: str = "auto") -> str:
     """Adjust -ts in the chat macros to the detected card count.
 
@@ -1231,7 +1397,8 @@ def sync_tensor_split(text: str | None = None, value: str = "auto") -> str:
     while i < n:
         line = lines[i]
         if re.match(r"^macros:\s*$", line):
-            in_macros, _ = True, out.append(line)
+            in_macros = True
+            out.append(line)
             i += 1
             continue
         if in_macros and line.strip() and not line[:1].isspace():
@@ -1314,7 +1481,7 @@ def gpu_sync(dry_run: bool = False) -> dict:
         import difflib
         out["diff"] = "\n".join(difflib.unified_diff(
             old.splitlines(), new.splitlines(),
-            fromfile="llama-swap.yaml", tofile="llama-swap.yaml (neu)", lineterm=""))
+            fromfile="llama-swap.yaml", tofile="llama-swap.yaml (new)", lineterm=""))
         return out
     if changed:
         with config_lock():
@@ -1350,7 +1517,7 @@ def check_fit(model: dict, ctx: int | None = None, gpu=None) -> dict:
     kv = kv_cache_bytes(model["files"].get("model", {}).get("path", ""), ctx,
                         model["runtime"]["kvCacheQuant"],
                         model["runtime"].get("parallel") or 1) or 0
-    need = int((weights + kv) * 1.08)
+    need = vram_needed(weights, kv) or 0
     #  If the model is already running, it occupies the space we are computing.
     loaded = model.get("state") in ("ready", "loaded")
     all_cards = gpus()
@@ -1425,7 +1592,7 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
         for f in ("--parallel", "-np"):
             cmd = del_flag(cmd, f)
         for f in ("-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"):
-            cmd = del_flag(cmd, f)
+            cmd = del_flag(cmd, f, with_value=False)   # bare switches
         cmd = set_flag(cmd, "-np", np_)
         # Shared KV pool: one long request may still use the whole -c.
         cmd = set_flag(cmd, "-kvu", None)
@@ -1435,11 +1602,18 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
         gpu = changes["gpu"]
         gpu = "both" if str(gpu) == "both" else int(gpu)
         if before["role"] == "stt":
-            # Whisper gets its card through the environment, not through flags
+            # Whisper gets its card through the environment, not through flags -
+            # and HIP_VISIBLE_DEVICES counts ABSOLUTE cards the way rocm-smi
+            # does, while `gpu` here is the logical index. Writing the logical
+            # one addresses the wrong card on any machine whose iGPU does not
+            # sort last. gpu_of() reads this back through to_logical().
             if gpu == "both":
                 raise ValueError("whisper always runs on exactly one card")
-            body_new = re.sub(r'(HIP_VISIBLE_DEVICES=)\d+', r"\g<1>%d" % gpu, body_new)
-            notes.append("env HIP_VISIBLE_DEVICES=%d" % gpu)
+            smi = to_smi(gpu)
+            if smi is None:
+                raise ValueError("card %d is not a compute card (llm gpu list)" % gpu)
+            body_new = re.sub(r'(HIP_VISIBLE_DEVICES=)\d+', r"\g<1>%d" % smi, body_new)
+            notes.append("env HIP_VISIBLE_DEVICES=%d (logical card %d)" % (smi, gpu))
         else:
             cmd = set_gpu(cmd, gpu, is_mtp=before["runtime"]["specDecoding"] == "mtp")
 
@@ -1467,13 +1641,20 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
             body_new = pat.sub("" if val is None else line, body_new)
         elif val is not None:
             body_new = body_new.rstrip("\n") + "\n" + line
-        notes.append("pi-Override %s" % key)
+        notes.append("pi override %s" % key)
 
-    # Does it still fit on the card?
+    # Does it still fit on the card? Evaluate the PATCHED command, not `before`:
+    # -ctk halves the KV cache and -np changes the slot count, so checking the
+    # old values could refuse a change that in fact frees room.
     target_gpu = changes.get("gpu", before["runtime"]["gpu"]["device"]
                              if before["runtime"]["gpu"]["mode"] == "single" else "both")
-    fit = check_fit(before, ctx=_num(changes.get("contextWindow"),
-                                     before["runtime"]["contextWindow"]),
+    np_new, _ = slots_of(cmd, before["role"])
+    candidate = dict(before, runtime=dict(before["runtime"],
+                                          kvCacheQuant=flag(cmd, "-ctk"),
+                                          parallel=np_new))
+    fit = check_fit(candidate, ctx=_num(changes.get("contextWindow"),
+                                        _num(flag(cmd, "-c"),
+                                             before["runtime"]["contextWindow"])),
                     gpu=target_gpu)
     if not fit["ok"] and not changes.get("force"):
         raise MemoryError(fit["reason"])
@@ -1492,6 +1673,8 @@ def _patch_model(name: str, changes: dict, dry_run: bool) -> dict:
 
 
 def remove_model(name: str, delete_files: bool = False) -> dict:
+    """Remove a model, its group membership and any role that pointed at it."""
+    dropped_roles = []
     with config_lock():
         text = config_text()
         if not find_block(name, text):
@@ -1499,16 +1682,33 @@ def remove_model(name: str, delete_files: bool = False) -> dict:
         model = get_model(name)
         text = re.sub(r"\n*# >>> llm:%s\n.*?# <<< llm:%s\n" % (re.escape(name), re.escape(name)),
                       "\n", text, flags=re.S)
+        #  A role whose target no longer exists is an invalid configuration -
+        #  llama-swap validates the targets at startup, so leaving one behind
+        #  would take the whole endpoint down on the next restart.
+        sel = read_selectors(text)
+        touched = False
+        for role, spec in list(sel.items()):
+            if name not in spec["targets"]:
+                continue
+            spec["targets"] = [t for t in spec["targets"] if t != name]
+            touched = True
+            if not spec["targets"]:
+                del sel[role]
+                dropped_roles.append(role)
+        if touched:
+            text = write_selectors(sel, text)
         text = sync_groups(text)
         _write_config(text)
     removed = []
     if delete_files:
         path = (model or {}).get("files", {}).get("model", {}).get("path")
         d = os.path.dirname(path) if path else os.path.join(MODELS, name)
-        if d and os.path.isdir(d) and os.path.realpath(d).startswith(os.path.realpath(MODELS) + os.sep):
+        inside = os.path.realpath(d).startswith(os.path.realpath(MODELS) + os.sep)
+        if d and os.path.isdir(d) and inside:
             shutil.rmtree(d)
             removed.append(d)
-    return {"model": name, "filesRemoved": removed, "reloaded": reload_swap()}
+    return {"model": name, "filesRemoved": removed, "rolesRemoved": dropped_roles,
+            "reloaded": reload_swap()}
 
 
 def reload_swap() -> bool:
@@ -1548,7 +1748,7 @@ def unload_all() -> dict:
     try:
         urllib.request.urlopen(SWAP_API + "/unload", timeout=30).read()
         return {"unloaded": True}
-    except Exception as exc:
+    except Exception as exc:      # noqa: BLE001 - the caller wants the reason, not a raise
         return {"unloaded": False, "error": str(exc)}
 
 
@@ -1642,8 +1842,295 @@ def record_add(dirname: str, repo: str, quant: str, extra: dict | None = None) -
 
 
 # ---------------------------------------------------------------------------
+#  Engine versions and what there is to roll back to
+# ---------------------------------------------------------------------------
+#  Read here rather than in bash so the CLI and the HTTP API cannot disagree -
+#  the same reason the card list moved. The update MACHINERY stays in
+#  lib/update.sh; this is only the reporting side of it.
+UPDATE_CACHE = os.path.join(LLM_HOME, ".update-cache")
+UPDATE_STATE = os.path.join(LLM_HOME, ".update-state")
+
+
+def _kv_file(path: str) -> dict:
+    """A 'key=value' file, or {} when it is missing."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                k, _, v = line.partition("=")
+                if v:
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def _git_out(repo: str, *args: str) -> str | None:
+    """One reading git call in a repository, or None. Never fetches."""
+    try:
+        r = subprocess.run(["git", "-C", repo, *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip() or None
+
+
+def engine_versions() -> dict:
+    """Active version, installed alternatives and rollback command per engine.
+
+    'latest' comes from .update-cache, which 'llm update' refreshes in the
+    background - never from a live GitHub call, because this is also what
+    `llm status` prints and it must not block on the network.
+    """
+    latest = _kv_file(UPDATE_CACHE)
+    prev = _kv_file(UPDATE_STATE)
+    out = {}
+
+    def same_commit(active, latest_key, repo):
+        """Up to date can also mean: another name for the same commit.
+
+        whisper.cpp publishes one commit as bNNNN and as v1.x.y, and GitHub's
+        releases/latest answers with whichever was published last, so comparing
+        the names alone reports an update that does not exist. lib/update.sh
+        caches the commit each 'latest' tag points at as "<tag> <sha>", so the
+        entry cannot outlive the tag it belongs to. Unknown on either side means
+        we do not know, and the caller keeps the name comparison.
+        """
+        rec = (latest.get(latest_key + "_sha") or "").split(" ")
+        if len(rec) != 2 or rec[0] != latest.get(latest_key):
+            return False
+        return _git_out(repo, "rev-parse", "--verify", "--quiet",
+                        "%s^{commit}" % active) == rec[1]
+
+    def entry(active, installed, latest_key, rollback, repo=None):
+        #  'repo' marks the git checkouts, the only ones where two tag names can
+        #  mean one commit. Without it this stays the strict name comparison the
+        #  CLI uses for llama-swap and Open WebUI.
+        others = [v for v in installed if v != active]
+        want = latest.get(latest_key)
+        if not (active and want):
+            up = None
+        elif repo is None:
+            up = active == want
+        else:
+            up = (active.removeprefix("v") == want.removeprefix("v")
+                  or same_commit(active, latest_key, repo))
+        return {"active": active, "latest": want, "upToDate": up,
+                "rollbackTo": others, "rollbackCommand": rollback}
+
+    #  llama.cpp and whisper.cpp: one build directory per version, 'build' a
+    #  symlink to the active one, so switching back is a symlink change.
+    whisper_root = (os.environ.get("LLM_WHISPER_HOME")
+                    or os.path.join(os.path.expanduser("~"), "whisper.cpp"))
+    for key, root, cmd in (("llamaCpp", os.path.join(LLM_HOME, "llama.cpp"), "llm rollback llama"),
+                           ("whisperCpp", whisper_root, "llm rollback whisper")):
+        real = os.path.realpath(root)
+        active = os.path.basename(os.path.realpath(os.path.join(real, "build"))) \
+            .replace("build-", "") or None
+        builds = sorted(os.path.basename(d).replace("build-", "")
+                        for d in glob.glob(os.path.join(real, "build-*"))
+                        if os.path.isdir(d))
+        out[key] = entry(active if active and active != "build" else None, builds,
+                         "llama" if key == "llamaCpp" else "whisper", cmd, real)
+
+    #  llama-swap: prebuilt binaries kept side by side as bin/llama-swap-<ver>.
+    swap_active = None
+    try:
+        r = subprocess.run([os.path.join(LLM_HOME, "bin", "llama-swap"), "--version"],
+                           capture_output=True, text=True, timeout=10)
+        swap_active = (r.stdout or "").split("\n")[0].replace("version: ", "").strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if swap_active:
+        swap_active = swap_active.split(" ")[0]
+    swaps = sorted(os.path.basename(f).replace("llama-swap-", "")
+                   for f in glob.glob(os.path.join(LLM_HOME, "bin", "llama-swap-*")))
+    out["llamaSwap"] = entry(swap_active, swaps, "swap", "llm rollback swap")
+
+    #  Open WebUI and ComfyUI: the previous version is remembered in
+    #  .update-state, and a matching data snapshot may sit next to it.
+    ui_active = None
+    try:
+        r = subprocess.run([os.path.join(LLM_HOME, "venv-webui", "bin", "python"), "-c",
+                            "import importlib.metadata as m; print(m.version('open-webui'))"],
+                           capture_output=True, text=True, timeout=20)
+        ui_active = (r.stdout or "").strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    ui_prev = prev.get("owui_prev")
+    out["openWebUI"] = entry(ui_active, [v for v in (ui_active, ui_prev) if v], "ui",
+                             "llm rollback ui")
+    out["openWebUI"]["snapshotWithDatabase"] = bool(ui_prev and os.path.isdir(
+        os.path.join(LLM_HOME, "openwebui-data.bak-%s" % ui_prev)))
+    #  Same order as comfy_active in lib/update.sh: the exact tag when HEAD sits
+    #  on one, otherwise the version the checkout declares. Reported as None for
+    #  a while, which left the version table with nothing to compare.
+    comfy_root = os.path.realpath(os.environ.get("LLM_COMFY_HOME")
+                                  or os.path.join(os.path.expanduser("~"), "comfyui"))
+    comfy_active = None
+    if os.path.isdir(os.path.join(comfy_root, ".git")):
+        comfy_active = _git_out(comfy_root, "describe", "--tags", "--exact-match", "HEAD")
+        if not comfy_active:
+            try:
+                with open(os.path.join(comfy_root, "comfyui_version.py"), encoding="utf-8") as fh:
+                    m = re.search(r'^__version__ = "(.*)"', fh.read(), re.M)
+                comfy_active = m.group(1) if m else None
+            except OSError:
+                pass
+    out["comfyUI"] = entry(comfy_active,
+                           [v for v in (comfy_active, prev.get("comfy_prev")) if v],
+                           "comfy", "llm rollback comfy", comfy_root)
+    return {"llmBox": _read_version(), "engines": out,
+            "cacheAgeSeconds": int(time.time() - os.path.getmtime(UPDATE_CACHE))
+            if os.path.exists(UPDATE_CACHE) else None}
+
+
+def _read_version() -> str:
+    try:
+        with open(os.path.join(LLM_HOME, "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def config_overview() -> dict:
+    """The parts of llama-swap.yaml that are NOT per-model: macros and groups.
+
+    The eviction semantics live there - swap, exclusive, persistent - and the
+    config comments spend ten lines explaining them, which is no help to anyone
+    who is not looking at the file. llama-swap has no /api/config at all.
+    """
+    text = config_text()
+    macros, cur = {}, None
+    in_macros = False
+    for line in text.split("\n"):
+        if re.match(r"^macros:\s*$", line):
+            in_macros = True
+            continue
+        if in_macros and line.strip() and not line[:1].isspace():
+            break
+        if not in_macros:
+            continue
+        m = re.match(r'^  "?([\w.-]+)"?:\s*>\s*$', line)
+        if m:
+            cur = m.group(1)
+            macros[cur] = []
+        elif cur and line.startswith("    "):
+            macros[cur].append(line.strip())
+    groups = {}
+    m = re.search(r"# >>> llm:groups\n(.*?)# <<< llm:groups", text, re.S)
+    if m:
+        name = None
+        for line in m.group(1).split("\n"):
+            g = re.match(r"^  ([\w-]+):\s*$", line)
+            if g:
+                name = g.group(1)
+                groups[name] = {"swap": None, "exclusive": None, "persistent": None,
+                                "members": []}
+                continue
+            if not name:
+                continue
+            kv = re.match(r"^    (swap|exclusive|persistent):\s*(true|false)\s*$", line)
+            if kv:
+                groups[name][kv.group(1)] = kv.group(2) == "true"
+            mem = re.match(r'^      - "([^"]+)"', line)
+            if mem:
+                groups[name]["members"].append(mem.group(1))
+    return {"path": CONFIG, "macros": {k: " ".join(v) for k, v in macros.items()},
+            "groups": groups, "healthCheckTimeout":
+            _num((re.search(r"^healthCheckTimeout:\s*(\d+)", text, re.M) or [None, None])[1], None)}
+
+
+# ---------------------------------------------------------------------------
 #  The token for write access
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  The API key for the inference endpoint (port 8080)
+# ---------------------------------------------------------------------------
+#  Separate from the registry token on purpose: this one is handed to every
+#  client that wants inference, the other one guards changing the configuration.
+#
+#  Why it exists at all: llama-swap is default-allow, so on a machine whose 8080
+#  is reachable, GET /unload empties the VRAM with no authentication and no
+#  confirmation. Being a GET it does not even take a person - a browser prefetch
+#  or a link checker is enough, which is how it was found here. An apiKeys entry
+#  closes that, and /ui, /logs and /metrics with it, while leaving /health open
+#  so reachability checks still work.
+API_KEY_FILE = os.path.join(LLM_HOME, "config", "api-key")
+_APIKEY_MARK = "apikeys"
+
+
+def api_key(create: bool = False) -> str | None:
+    """The inference key, or None when the endpoint is left open.
+
+    Unlike api_token this does NOT create one on demand: switching the endpoint
+    to authenticated breaks every client that does not know the key yet, so it
+    has to be a deliberate act ('llm key new').
+    """
+    if os.path.exists(API_KEY_FILE):
+        with open(API_KEY_FILE, encoding="utf-8") as fh:
+            key = fh.read().strip()
+        if key:
+            return key
+    if not create:
+        return None
+    key = "sk-" + secrets.token_urlsafe(36)
+    os.makedirs(os.path.dirname(API_KEY_FILE), exist_ok=True)
+    with open(API_KEY_FILE, "w", encoding="utf-8") as fh:
+        fh.write(key + "\n")
+    os.chmod(API_KEY_FILE, 0o600)
+    return key
+
+
+def drop_api_key() -> bool:
+    """Remove the key file. Returns whether there was one."""
+    if not os.path.exists(API_KEY_FILE):
+        return False
+    os.remove(API_KEY_FILE)
+    return True
+
+
+API_KEY_ENV = os.path.join(LLM_HOME, "config", "api-key.env")
+
+
+def sync_api_key(text: str | None = None) -> str:
+    """Write or remove the apiKeys block, following the key file.
+
+    A marker block rather than a '${env.VAR}' reference, so what is in force is
+    visible in the file - and because llama-swap rejects an empty key, which is
+    what an unset variable would expand to.
+
+    Also refreshes config/api-key.env, which the Open WebUI unit reads through
+    EnvironmentFile - so rotating the key is 'llm key new' plus a restart, and
+    never a re-render of the unit.
+    """
+    text = config_text() if text is None else text
+    key = api_key()
+    try:
+        os.makedirs(os.path.dirname(API_KEY_ENV), exist_ok=True)
+        with open(API_KEY_ENV, "w", encoding="utf-8") as fh:
+            fh.write("#  Generated by 'llm key'. The chat UI reads this; the value is\n"
+                     "#  the same one in config/api-key.\n"
+                     "OPENAI_API_KEY=%s\n" % (key or "sk-local"))
+        os.chmod(API_KEY_ENV, 0o600)
+    except OSError:
+        pass
+    if not key:
+        return put_block(text, _APIKEY_MARK, "")
+    head = ("# " + "=" * 76 + "\n"
+            "#  API KEY  —  maintained by 'llm key'\n"
+            "# " + "=" * 76 + "\n"
+            "#  With this present, every path except /health needs\n"
+            "#    Authorization: Bearer <key>\n"
+            "#  including /unload, /ui, /logs and /metrics. Without it llama-swap\n"
+            "#  is default-allow and a plain GET /unload frees the VRAM.\n"
+            "#  The key lives in config/api-key (mode 600, not in the repo).\n"
+            "#  DO NOT edit by hand - 'llm key new' rotates, 'llm key off' removes:\n")
+    return put_block(text, _APIKEY_MARK, 'apiKeys:\n  - "%s"\n' % key, head)
+
+
 def api_token(create: bool = True) -> str | None:
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, encoding="utf-8") as fh:
@@ -1652,7 +2139,6 @@ def api_token(create: bool = True) -> str | None:
             return tok
     if not create:
         return None
-    import secrets
     tok = secrets.token_urlsafe(24)
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
     with open(TOKEN_FILE, "w", encoding="utf-8") as fh:
@@ -1670,6 +2156,40 @@ def _cli(argv: list[str]) -> int:
         print(json.dumps(catalog(), indent=2, ensure_ascii=False))
     elif cmd == "pi-json":
         print(json.dumps(pi_models_json(), indent=2, ensure_ascii=False))
+    elif cmd == "api-key":                          # api-key [new|off]
+        sub = argv[1] if len(argv) > 1 else "show"
+        if sub == "new":
+            drop_api_key()
+            key = api_key(create=True)
+            with config_lock():
+                _write_config(sync_api_key(config_text()))
+            print(key)
+        elif sub == "off":
+            had = drop_api_key()
+            with config_lock():
+                _write_config(sync_api_key(config_text()))
+            print("removed" if had else "there was none")
+        else:
+            key = api_key()
+            print(key if key else "")
+    elif cmd == "remove-model":                     # remove-model <name> [true]
+        name = argv[1]
+        want_files = len(argv) > 2 and argv[2].lower() in ("1", "true", "yes")
+        try:
+            out = remove_model(name, delete_files=want_files)
+        except KeyError:
+            sys.exit("model '%s' not found. (llm ls)" % name)
+        print("removed from the configuration: %s" % name)
+        for d in out["filesRemoved"]:
+            print("  files deleted: %s" % d)
+        if out["rolesRemoved"]:
+            print("  roles removed with it: %s" % ", ".join(out["rolesRemoved"]))
+        if not out["reloaded"]:
+            print("  llama-swap was not reachable - restart it with: llm restart")
+    elif cmd == "ts-drift":
+        d = tensor_split_drift()
+        print("%s\t%s\t%s" % (d["configured"] or "", d["expected"] or "",
+                               "drift" if d["drifted"] else "ok"))
     elif cmd == "sync-groups":
         _write_config(sync_groups())
     elif cmd == "selectors":                        # selectors
@@ -1695,14 +2215,21 @@ def _cli(argv: list[str]) -> int:
             cards = gpus()
             if not cards:
                 print("  no compute card detected (is rocm-smi there? groups render/video?)")
+            #  Every field is labelled rather than columnar: this block is
+            #  printed inside 'llm status' and by 'llm gpu list', where a header
+            #  row would be one more thing to scroll past. A missing sensor is
+            #  '?' and not a zero, because zero watts is a claim.
             for c in cards:
                 tot = (c.get("vramTotalBytes") or 0) / 1024**3
                 use = (c.get("vramUsedBytes") or 0) / 1024**3
-                t = c.get("tempJunctionC")
                 pin = ", ".join(c.get("pinnedModels") or [])
-                print("  card %d  junction %s°C  VRAM %.1f/%.0f GB  %s%s" % (
-                    c["index"], "?" if t is None else ("%g" % t), use, tot,
-                    c.get("name") or "", "  [%s]" % pin if pin else ""))
+                def q(key, card=c):
+                    return "?" if card.get(key) is None else ("%g" % card[key])
+                print("  card %d  junction %4s°C  %4s W  busy %3s %%  "
+                      "VRAM %.1f/%.0f GB  %s%s" % (
+                          c["index"], q("tempJunctionC"), q("powerW"),
+                          q("busyPercent"), use, tot,
+                          c.get("name") or "", "  [%s]" % pin if pin else ""))
         else:
             print(json.dumps(gpus(), indent=2))
     elif cmd == "hw":

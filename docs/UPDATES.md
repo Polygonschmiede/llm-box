@@ -1,7 +1,9 @@
 # Staying current — with a way back
 
 Short version: **`llm update`** shows what is new, **`llm update all`** updates
-everything installed here, and **`llm rollback <what>`** undoes it.
+everything installed here, and **`llm rollback <what>`** undoes it. The same three
+things are on the **System tab** of the control page, for anyone who would rather
+click than open a shell.
 
 ## Why this is not just "apt upgrade"
 
@@ -58,6 +60,11 @@ llm rollback ui             # Open WebUI, including its database
 llm rollback comfy          # ComfyUI back to the recorded ref
 ```
 
+The control page reaches the same three through the registry, as jobs whose log you
+can follow: `POST /api/updates/check`, `POST /api/updates/<component>` and
+`POST /api/rollback/<component>` — see [API.md](API.md). Only one runs at a time;
+they share the repositories and the services.
+
 `llm status` shows the active versions at the bottom and points out updates. The
 GitHub and PyPI queries are refreshed **once a day** in the background
 (`.update-cache`), so `llm status` never waits on the network.
@@ -75,7 +82,14 @@ GitHub and PyPI queries are refreshed **once a day** in the background
    puts the symlink back and starts again. If an Open WebUI upgrade fails, the freeze
    snapshot is reinstalled automatically.
 4. **Refusal before building** when: less than 8 GB of disk is free, the source repo
-   has local changes, or the requested tag does not exist.
+   has **changes to tracked files**, or the requested tag does not exist.
+
+On that third point: untracked files do **not** count. They cannot, because `build`
+is a symlink this tool creates itself, and an upstream `.gitignore` that writes
+`build/` with a trailing slash ignores the *directory* and not the *symlink*. Counting
+untracked files meant whisper.cpp reported "local changes" about its own build link
+and refused every update forever. If an untracked file really is in the way of the
+checkout, git says so, with the path.
 
 During an update llama-swap is **briefly stopped** (a few seconds), because VRAM and
 the binary path change. In-flight requests are cut off.
@@ -108,6 +122,20 @@ The flags live as `LCPP_CMAKE_FLAGS` and `hip_flags()` in `bin/llm`.
 Updates go to **release tags** (`bXXXXX`), not to the master HEAD. That is
 reproducible and lets you name a version. llama.cpp publishes several times a day —
 you do not have to follow every tag. Update when you need a new model or feature.
+
+### Two names for one commit
+
+whisper.cpp publishes rolling bot releases (`bNNNN`) *and* hand-cut releases
+(`v1.x.y`), and GitHub's "latest release" is whichever was published last and not
+flagged as a prerelease. So `active v1.9.2` against `latest b4938` can mean a real
+update — or the very same commit under the other name.
+
+Comparing the two *names* therefore reports an update that does not exist, forever.
+Instead `.update-cache` stores the commit each latest tag points at, as
+`<tag> <sha>`, and "up to date" means **the same commit**. When either side cannot be
+resolved, the name comparison is used and an update is offered — offering one too
+often is the harmless direction. `llm update` and the control page share this, so
+they cannot contradict each other.
 
 ## When something does go wrong
 

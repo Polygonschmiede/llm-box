@@ -22,6 +22,68 @@ the examples is a placeholder, not a secret. Anyone who can reach port 8080 can
 run any configured model and read any file the server process can read via a
 model path. Treat reachability as full access.
 
+Three specifics on port 8080 that are easy to miss:
+
+- **`GET /unload` unloads every model**, with no token and no confirmation. It is
+  a *mutating GET*, so it does not take a person: a browser prefetch, a link
+  checker, a chat client that unfurls URLs, anything that follows links will
+  empty your VRAM. Observed, not theoretical — one automated fetch of that path
+  dropped two models that were pinned resident with `ttl: 0`.
+- **The web interface at `/ui`** (llama-swap's own, see [docs/UI.md](docs/UI.md))
+  comes with a playground and a full log viewer. Whoever reaches the port gets
+  free inference and your upstream logs.
+- **Reads on the registry, port 8081, need no token** and return every model's
+  filesystem path, SHA-256 and Hugging Face repo, plus live VRAM per card.
+
+One specific on port 8081 for the same reason: a write there can now **start a
+build and restart a service**. `POST /api/updates/<component>` and
+`POST /api/rollback/<component>` run the same `llm update` / `llm rollback` the
+CLI does — minutes of CPU, a few seconds of downtime, and a different binary
+afterwards. They need the token or a session, like every other write, and the
+component is checked against a fixed list rather than a pattern because it
+becomes part of a command line. Nothing new is reachable without the token; what
+is new is how much one leaked token can do with it.
+
+None of that matters on the shipped `127.0.0.1` default. All of it matters the
+moment you set `LLM_BIND=0.0.0.0`. If you need remote access, prefer the SSH
+tunnel in [docs/REMOTE.md](docs/REMOTE.md) over opening the ports.
+
+### If you do open port 8080: `llm key`
+
+llama-swap is default-allow, but it can require a key. `llm key new` generates
+one, writes it into the configuration and tells you which clients need a nudge:
+
+```bash
+llm key new        # generate and wire it in
+llm restart        # llama-swap starts enforcing it
+llm ui restart     # the chat UI picks it up from config/api-key.env
+llm key            # print it
+llm key off        # back to open
+```
+
+With a key in force, **every path except `/health`** needs
+`Authorization: Bearer <key>` — measured: `/v1/models`, `/unload`, `/ui`,
+`/logs`, `/metrics` and `/running` all answer 401 without it. That closes the
+mutating GET, the open playground and the log viewer in one move, and it does so
+without moving the port to loopback, so remote inference keeps working.
+
+Three consequences worth knowing before you turn it on:
+
+- **Every client needs the key.** The registry hands it to pi, so pi picks it up
+  on its next refresh; Open WebUI reads it from `config/api-key.env` on restart.
+  Anything else you have pointed at `:8080/v1` with a hardcoded key has to be
+  updated by hand.
+- **`GET /api/pi-models.json` stops being open.** That payload carries the key,
+  so once one is set the endpoint requires the registry token — otherwise the
+  key would be readable by anyone who can reach port 8081, which would undo the
+  whole exercise. `llm api client` prints the line pi needs.
+- **The key travels in plain HTTP.** It is a door, not a secret channel. On a
+  network you do not control, put TLS in front (llama-swap takes
+  `-tls-cert-file`/`-tls-key-file`) or use the SSH tunnel.
+
+`llm doctor` reports the combination that matters: port 8080 answering on a
+non-loopback address with no key in force.
+
 ## Opening it up on purpose
 
 Everything binds to loopback until you say otherwise:

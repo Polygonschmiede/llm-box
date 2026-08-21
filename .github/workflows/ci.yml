@@ -1,0 +1,105 @@
+# ============================================================================
+#  CI — lint, tests, docs
+# ============================================================================
+#  Nothing here needs a GPU. The card detection is fed by the fake rocm-smi
+#  fixtures in tests/fixtures, and the configuration by a temporary LLM_HOME,
+#  so the whole suite runs on a plain runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ruff
+        run: |
+          pip install --quiet ruff
+          ruff check .
+
+      # shellcheck is preinstalled on the Ubuntu runners.
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x -S warning bin/llm setup-system.sh bin/install-comfyui.sh tests/*.sh
+
+      # The tree was translated once and the residue kept turning up in
+      # user-facing strings - an HTTP 400 body, a diff label, two pi menu items.
+      # A short explicit word list is cheap and catches the regression; a
+      # general language detector would only produce false positives.
+      - name: english only
+        run: |
+          if git grep -nIE '[äöüÄÖÜß]|\b(Karte|Grafikkarte|Modelle|Fortschritt|enthaelt|unerlaubte|Dienst|riesige|ueberspringen|Zeichen|neu\))' \
+               -- ':!CHANGELOG.md' ':!.github/workflows/ci.yml'; then
+            echo "::error::German text in a tracked file - this project is English throughout"
+            exit 1
+          fi
+
+      - name: no leaked machine paths or addresses
+        run: |
+          # The repo must stay portable: no /home/<someone>, no LAN address.
+          if git grep -nE '/home/[a-z][a-z0-9_-]+/|192\.168\.[0-9]+\.[0-9]+' -- \
+               ':!*.md' ':!.github/**'; then
+            echo "::error::a machine-specific path or address is committed"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # tests/ui-matrix.sh runs the control page's script under node against a
+      # generated configuration. Without node it skips, which would mean the
+      # page is never checked at all in CI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # tests/api-matrix.sh skips itself without this; building it means the
+      # registry's checks actually run.
+      - name: registry environment
+        run: |
+          python -m venv venv-api
+          ./venv-api/bin/pip install --quiet -r config/requirements-api.txt httpx
+
+      - name: suites
+        run: bash tests/run-all.sh
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: relative links resolve
+        run: |
+          # Tracked files only: the venvs and models/ are gitignored and full of
+          # third-party markdown whose links are none of our business.
+          git ls-files '*.md' | python - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for line in sys.stdin:
+              md = pathlib.Path(line.strip())
+              for text, target in re.findall(r"\[([^\]]*)\]\(([^)]+)\)", md.read_text()):
+                  if re.match(r"^(https?:|mailto:|#)", target):
+                      continue
+                  if not (md.parent / target.split("#")[0]).exists():
+                      bad.append("%s: [%s](%s)" % (md, text, target))
+          for b in bad:
+              print("::error::broken link %s" % b)
+          sys.exit(1 if bad else 0)
+          PY

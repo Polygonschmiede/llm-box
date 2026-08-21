@@ -1,0 +1,26 @@
+# Keep diffs about content. See pyproject.toml for the lint rules.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.{sh,bash}]
+indent_size = 2
+
+[*.{yaml,yml,json,ts}]
+indent_size = 2
+
+[*.md]
+# Markdown uses trailing spaces for hard line breaks.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab

@@ -8,10 +8,24 @@ Description=Open WebUI — chat interface for the local LLMs
 After=network-online.target llama-swap.service
 Wants=network-online.target
 
+# The rate limiter counts MANUAL starts too, and its default is five per ten
+# seconds - so 'llm off && llm on' plus a restart trips it, and from then on
+# every start is refused with "start request repeated too quickly", leaving the
+# service dead until someone knows about 'systemctl --user reset-failed'.
+# Observed repeatedly. Without the limiter a rejected configuration crash-loops
+# visibly and, more usefully, recovers by itself once the configuration is fixed.
+# NOTE: this is a [Unit] directive. In [Service] systemd ignores it silently.
+StartLimitIntervalSec=0
+
 [Service]
 # Backend = llama-swap (ONE endpoint for every model)
 Environment=OPENAI_API_BASE_URL=http://127.0.0.1:8080/v1
+#  A placeholder first, then the generated file if there is one: systemd applies
+#  these in order, so 'llm key new' takes effect on the next restart without the
+#  unit having to be re-rendered. llama.cpp ignores the value while no apiKeys
+#  block is in force.
 Environment=OPENAI_API_KEY=sk-local
+EnvironmentFile=-@LLM_HOME@/config/api-key.env
 #  Shipped WITH authentication: the database under DATA_DIR holds every chat and
 #  every API key anyone pastes into one. To open it deliberately, set False here -
 #  see SECURITY.md.

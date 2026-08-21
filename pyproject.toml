@@ -1,0 +1,27 @@
+# ============================================================================
+#  Lint configuration. NOT a packaging manifest.
+# ============================================================================
+#  llm-box installs nothing of itself: bin/llm is a shell script, lib/llmreg.py
+#  needs only the standard library, and the two venvs exist for Open WebUI and
+#  the registry. This file is here so `ruff` and CI agree on one rule set.
+#
+#  The selection is deliberately about mistakes, not taste. Turning on the
+#  pathlib (PTH) and f-string (UP) families produced 197 findings across code
+#  that consistently uses os.path and %-formatting - a rewrite of everything for
+#  no behaviour change. What is enabled catches undefined names, unused imports,
+#  bugbear footguns, and swallowed exceptions.
+[tool.ruff]
+line-length = 100
+target-version = "py311"          # the oldest Python the registry venv accepts
+extend-exclude = ["venv-api", "venv-webui", "llama.cpp", "models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "BLE", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+#  B008: FastAPI's whole idiom is Body(...)/Query(...)/Depends(...) in the
+#        signature, on every route. Following this rule would mean not using
+#        FastAPI, and a per-line noqa on each route would be pure noise.
+#        E402 is NOT ignored here: the imports that have to run late carry an
+#        inline noqa each, so the reason sits next to the line.
+"bin/llm-api.py" = ["B008"]

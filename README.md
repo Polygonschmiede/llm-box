@@ -18,8 +18,8 @@ Services:
 
 Loaded model: qwen3.8-27b-q6_k
 Cards:
-  card 0  junction 30°C  VRAM 28.6/32 GB  AMD Radeon AI PRO R9700  [qwen3.8-27b-q6_k]
-  card 1  junction 27°C  VRAM 0.1/32 GB   AMD Radeon AI PRO R9700
+  card 0  junction   30°C   243 W  busy  98 %  VRAM 28.6/32 GB  AMD Radeon AI PRO R9700  [qwen3.8-27b-q6_k]
+  card 1  junction   27°C    16 W  busy   0 %  VRAM 0.1/32 GB  AMD Radeon AI PRO R9700
 Versions: llama.cpp b10453 · llama-swap v250 · whisper.cpp v1.9.2  up to date
 ```
 
@@ -95,6 +95,7 @@ llm ls  /  llm rm <name>       # list / remove models
 llm add … --gpu 1              # pin a model to one card
 llm add … --slots 4            # serve four requests at once instead of queueing
 llm role                       # roles: one name, several models behind it
+llm key                        # the API key for port 8080 (off by default)
 llm gpu list  /  llm gpu sync  # cards; re-match the config after a hardware change
 llm speed                      # what token prediction is and when it helps
 
@@ -112,6 +113,7 @@ llm api client                 # ready-made setup line for a client machine
 ## How it fits together
 
 ```
+Settings ──►  page       :8081/ui
 Browser  ──►  Open WebUI :3000  ─┐
 Code     ──►  API        :8080  ─┼─►  llama-swap  ──►  loads and swaps the
 Images   ──►  ComfyUI    :8188  ─┘                     right model onto the cards
@@ -122,6 +124,17 @@ llama-swap is the switchboard: clients talk to **one** endpoint, it starts the
 requested model and frees the VRAM again when the model goes unused. Open WebUI
 loads nothing itself — it is just another client of port 8080.
 
+There is a **settings page** at `http://<server>:8081/ui`, served by the
+registry: models with their VRAM budget and provenance, roles, cards, versions —
+and the buttons to change them. It is one file with no build step, and writing
+needs the registry token once.
+
+llama-swap also ships its **own** web interface at `http://<server>:8080/ui`:
+live state, per-request tok/s, logs, GPU charts and a playground. It knows
+nothing about the configuration, though, and its hardware page does not apply
+`HIP_VISIBLE_DEVICES` — see [docs/UI.md](docs/UI.md) for which interface to
+trust for what.
+
 ## ⚠ Security
 
 The shipped defaults bind every service to `127.0.0.1`. That is deliberate:
@@ -131,8 +144,10 @@ only writes need a token.
 
 Open it up on purpose with `sudo env LLM_BIND=0.0.0.0 bash setup-system.sh`, which also
 adds firewall rules for your own subnet — or forward the ports over SSH and leave
-the services on loopback. Read **[SECURITY.md](SECURITY.md)** before you expose
-anything.
+the services on loopback. If you do open port 8080, `llm key new` puts an API key
+in front of it: without one, a plain `GET /unload` frees the VRAM, and being a GET
+it does not take a person — a browser prefetch will do it. `llm doctor` says so.
+Read **[SECURITY.md](SECURITY.md)** before you expose anything.
 
 ## Using it from other tools
 
@@ -155,6 +170,7 @@ its subagents at another, and you never touch the client again when models chang
 | [docs/MODELS.md](docs/MODELS.md) | choosing, adding and removing models; quants; per-model settings |
 | [docs/FLAGS.md](docs/FLAGS.md) | every llama.cpp option this stack sets, and why |
 | [docs/UPDATES.md](docs/UPDATES.md) | staying current, with rollback |
+| [docs/UI.md](docs/UI.md) | the four interfaces and which one knows what |
 | [docs/API.md](docs/API.md) | the registry: HTTP catalog and MCP |
 | [docs/PI.md](docs/PI.md) | connecting the pi agent |
 | [docs/COMFYUI.md](docs/COMFYUI.md) | image generation alongside the LLMs |
@@ -168,12 +184,20 @@ bin/llm                 the CLI (everything goes through here)
 bin/llm-api.py          registry: HTTP catalog + MCP server
 lib/llmreg.py           the library both use: GGUF headers, VRAM estimates,
                         card detection, llama-swap config read/write
+lib/update.sh           updating and rolling back the engines (sourced by bin/llm)
 config/                 configuration template and requirements
 systemd/                user service templates
 pi/extensions/          pi agent integration
-tests/                  card-detection matrix with fake rocm-smi fixtures
+tests/                  four suites, no GPU needed — see CONTRIBUTING.md
 docs/                   the documentation above
 ```
+
+## Contributing
+
+`bash tests/run-all.sh` — no GPU needed, and it does not touch your
+configuration. Details, the lint commands and where code belongs:
+[CONTRIBUTING.md](CONTRIBUTING.md). What changed when:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Credits
 

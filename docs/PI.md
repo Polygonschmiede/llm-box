@@ -153,6 +153,14 @@ Questions that now simply work:
 
 **Deleting and downloading are not done by the agent** — those stay with you.
 
+## What the extension deliberately does not automate
+
+Six tools, against nine over plain MCP: `add_model`, `remove_model` and
+`job_status` are missing. Fetching 22 GB from Hugging Face and deleting a model
+live in the interactive `/llm` command instead, behind a confirmation. An agent
+that can delete a model inside its own turn is a worse trade than one that has
+to ask, and the registry keeps both doors so the choice is the client's.
+
 ## `/llm` — the things you decide yourself
 
 ```
@@ -187,6 +195,40 @@ Two capability flags are reported rather than guessed:
 
 Embedders, rerankers and Whisper are not reported to pi: they hang off the same
 endpoint but are not chat models.
+
+## Steering how long the model thinks
+
+The registry reports, per model, whether the template takes a `reasoning_effort`
+and **which values** — `compat.reasoningEfforts` plus
+`compat.reasoningEffortDefault`. That matters because llama.cpp only says "yes,
+supported": Qwen3.8 accepts `xhigh`, `medium` and `low` and answers `high` with an
+HTTP 500 from Jinja, so a client offering the usual low/medium/high picker fails
+on a third of it. With the list in hand a client can offer only what works.
+
+The server sets the floor (`--reasoning-effort` on the model entry, see
+[FLAGS.md](FLAGS.md)); a request that carries the field overrides it. So the
+sensible split is: the server keeps the default sane for everything that sends
+nothing, and pi raises it when a task deserves it.
+
+One caveat worth respecting: the effort instruction is rendered at the very front
+of the prompt, so changing it between turns invalidates the whole prompt cache.
+Choose per session, not per task.
+
+## When the server requires an inference key
+
+If `llm key` is on, two things change for a client. The provider block pi
+consumes carries the key, so `GET /api/pi-models.json` is no longer handed out
+without the registry token — configure the token even if the agent is never
+meant to change anything:
+
+```bash
+echo '{"url": "http://<server-ip>:8081", "token": "<llm api token>"}' \
+  > ~/.pi/agent/llm-box.json
+```
+
+The extension then reads the key from the registry along with everything else,
+so a rotation on the server needs nothing on the client but a refresh. `llm api
+client` on the server prints the exact lines.
 
 ## Giving subagents a different model
 
@@ -231,6 +273,10 @@ always wins:
 | `# pi: maxTokens=65536` | more room for the answer |
 | `# pi: thinkingFormat=qwen-chat-template` | set the thinking format |
 | `# pi-json: {"compat":{…}}` | mix in arbitrary fields from the pi documentation |
+
+Boolean values accept `true`/`1`/`yes` — and `ja`, which older configurations
+written before this project was translated may still contain. A bare `# pi: skip`
+with no value counts as true.
 
 A trailing comment (` # …`) is allowed. The same works over the API through
 `piOverrides` in `PATCH /api/models/{id}`.

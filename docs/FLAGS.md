@@ -19,6 +19,8 @@ To change an option for *all* models, change the macro — not every model.
 | `-fa on` | flash attention — faster and leaner, leave it on. |
 | `-ctk q8_0 -ctv q8_0` | quantise the KV cache: **halves** context memory, quality loss not measurable in practice. Worth it from ~64k context. |
 | `-np 4 -kvu` | four **slots**: four requests are served at the same time instead of queueing. `-c` is the *total* KV either way, so slots cost no KV memory — only ~1.4 GB of extra compute buffer on a 27B. `-kvu` makes the `-c` tokens one shared pool, so a lone request may still use all of them; without it each slot gets a hard `-c / slots` share. Leaving the flag out entirely is the same as `-np 4 -kvu` (llama.cpp's auto default). See "Slots" below. |
+| `--reasoning-effort low` | the **default** thinking depth for clients that send no `reasoning_effort` — which is most of them. A request that sends one still wins. Accepted values come from the model's template, not from llama.cpp; see "Thinking depth" below. |
+| `--no-reasoning-preserve` | drop previous `reasoning_content` from the conversation instead of re-feeding the model its own deliberation from every earlier turn. |
 | `-cram 16384` | how much **host RAM** (MiB) may hold prompt caches, so a returning agent does not re-read its whole prompt. Costs no VRAM. Default is 8192. See "Slots" below. |
 | `--mmproj <file>` | vision projector for image models (see "Understanding images"). |
 | `--jinja` | correct chat templates and tool calling (essential for agents and editors). |
@@ -168,17 +170,10 @@ Gemma ≈ 4 as starting points; try 1–6 and keep the fastest (`llm edit`, then
 > sentences of answer. Otherwise `content` is empty with
 > `finish_reason: length`. Open WebUI folds the thinking into a collapsible block.
 >
-> **Controlling thinking depth.** Templates like Qwen3.8's default to `xhigh` and
-> think accordingly long. That is a per-request decision and needs no reload —
-> llama-server accepts the plain OpenAI field:
-> ```bash
-> curl … -d '{"model":"qwen3.8-27b-q6_k","reasoning_effort":"low","messages":[...]}'
-> ```
-> Values: `none` · `low` · `medium` · `high` · `xhigh`. Measured on a trivial
-> question: `low` spent ~25 thinking tokens, `xhigh` ~30, and `none` switched
-> thinking off entirely (4 tokens total instead of 62). Rule of thumb: extraction
-> and RAG answers `low`–`medium`, real puzzles `high`+. The server flag `-rea off`
-> disables thinking for a whole model.
+> **Controlling thinking depth** has its own section below — the short version is
+> that `reasoning_effort` is a per-request field, the accepted values are decided
+> by the model's chat template rather than by llama.cpp, and `-rea off` switches
+> thinking off for a whole model.
 >
 > Token prediction does **not** help here: it speeds up writing, not thinking, and
 > thinking text is prose — the acceptance rate is roughly half what it is on code.
@@ -194,6 +189,83 @@ Especially strong on code and repetitive text, and always the safe choice when
 llama.cpp also supports `draft-eagle3`, `draft-dflash` (a small separate draft
 model) and several `ngram-*` variants. Details in `llama.cpp/docs/speculative.md`;
 add a macro alongside the existing ones to use them.
+
+## Thinking depth (`reasoning_effort`)
+
+A reasoning model decides how long to think from a `reasoning_effort` value that
+ends up in its chat template. Three things about it are easy to get wrong, and
+all three cost either latency or a failed request.
+
+### The accepted values come from the model, not from llama.cpp
+
+`llama-server --help` lists the OpenAI set, and `/props` reports
+`supports_reasoning_effort: true` — neither tells you which values the template
+will accept. Qwen3.8's takes exactly three:
+
+| sent | result |
+|---|---|
+| nothing | `xhigh` — the template's own default |
+| `low` | "Keep your thinking brief…" |
+| `medium` | **no instruction at all** — the template injects nothing |
+| `xhigh` | "Please think carefully…" |
+| `none` | thinking off; llama.cpp handles this before the template |
+| `high`, `minimal`, `max` | **HTTP 500**, `Jinja Exception: Unexpected reasoning effort` |
+
+So a client offering the usual low/medium/high picker fails on a third of it.
+The set is in the GGUF header, so `llm ls` and the registry read it rather than
+guess: `runtime.reasoningEffort.accepts` per model, and `compat.reasoningEfforts`
+in what pi receives, so a client can offer only what works. Models whose template
+does not gate the value report `null` — then anything goes.
+
+### The server sets a floor, not a ceiling
+
+Most harnesses send no `reasoning_effort` for a local model at all, which is why
+"I set it to low and nothing happened" is a common complaint: the field never
+leaves the client. Set the default where it cannot be skipped:
+
+```
+--reasoning-effort low
+```
+
+A request that carries the field still wins — `server-common.cpp` merges the
+command-line kwargs first, then the request's `chat_template_kwargs`, then the
+OpenAI field. So this lowers the default without taking control away from a
+client that knows what it wants.
+
+Measured on Qwen3.8-27B with nothing sent: `xhigh` before, `low` after.
+
+### Old thinking accumulates unless you say otherwise
+
+The template keeps previous `reasoning_content` blocks in the conversation by
+default, so at turn five the model re-reads its own deliberation from turns one
+to four and continues in the same groove. Qwen recommends against feeding
+reasoning back for their own models.
+
+```
+--no-reasoning-preserve
+```
+
+A no-op if your client never returns `reasoning_content`; otherwise it drops the
+old blocks. A request can force them back on with
+`{"chat_template_kwargs":{"preserve_reasoning":true}}`.
+
+`--reasoning-budget N` also exists in this build and is a real token budget
+(`-1` unlimited, `0` off, `N` a cap, plus `--reasoning-budget-message` for the
+text inserted before the closing tag). Treat it as an emergency brake: cutting a
+thought off mid-sentence is not a setting.
+
+### Do not switch effort mid-session
+
+The effort instruction is rendered at the very front of the prompt, ahead of your
+own system prompt. Changing it between turns therefore changes the prefix from
+position 0 and throws away the whole prompt cache — on a 90k-token session that
+is a full re-prefill, which costs far more than the thinking you saved. Decide
+per session, not per task. The same applies to `preserve_reasoning`.
+
+If you want both depths available at once, give them separate names rather than
+toggling: two `llm add` entries pointing at the same GGUF differ only in their
+flags, and `llm role` puts a stable name in front of each. That costs no extra
+VRAM only if you never load both at the same time — otherwise it is two models.
 
 ## Understanding images (vision / mmproj)
 
@@ -317,8 +389,8 @@ groups:
     exclusive: false   # and do not evict anything from other groups
     persistent: true   # and no other group may evict THEM
     members:
-      - "qwen3.8-27b-q6_k"        # Karte 0
-      - "qwen3-embedding-4b-q8_0" # Karte 1
+      - "qwen3.8-27b-q6_k"        # card 0
+      - "qwen3-embedding-4b-q8_0" # card 1
 ```
 
 Only that lets **two cards each hold a model at the same time** — without a group,
