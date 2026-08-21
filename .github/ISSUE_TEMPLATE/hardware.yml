@@ -1,0 +1,36 @@
+name: Hardware or driver support
+description: It does not detect, build or run on your cards
+labels: [hardware]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This stack was developed on AMD cards under ROCm, and the card detection
+        parses `rocm-smi` output. Different hardware, a different ROCm version or
+        a different naming scheme is exactly the case that needs a report - the
+        fixtures in `tests/fixtures/` exist so a new machine shape can be
+        reproduced without owning it.
+  - type: textarea
+    id: smi
+    attributes:
+      label: Raw output of `rocm-smi --showtemp --showpower --showuse --showmeminfo vram --showproductname`
+      description: |
+        This is the exact call the detection makes. Paste it verbatim - the
+        labels matter, and they differ between dGPU and APU.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: seen
+    attributes:
+      label: What llm-box makes of it
+      description: "`llm gpu list` and the `dgpus` block from `llm doctor`."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: stack
+    attributes:
+      label: Cards, distribution and ROCm version
+    validations:
+      required: true

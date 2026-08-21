@@ -461,12 +461,38 @@ update_swap(){ # $1=target version (empty = the latest)
   if [[ -z "$want" ]]; then upd_refresh; want=$(upd_get swap); fi
   [[ -z "$want" ]] && { err "could not determine the latest llama-swap version."; return 1; }
   [[ "$cur" == "$want" ]] && { ok "llama-swap is up to date ($cur)."; return 0; }
-  url=$(curl -sf --max-time 10 "$GH_SWAP" \
-        | sed -n 's/.*"browser_download_url": *"\([^"]*linux_amd64[^"]*\)".*/\1/p' | head -1)
-  [[ -z "$url" ]] && { err "no linux_amd64 download in release $want."; return 1; }
-  tmp=$(mktemp -d); info "downloading llama-swap $want ..."
-  if ! curl -sfL --max-time 120 "$url" -o "$tmp/s.tar.gz"; then err "the download failed."; rm -rf "$tmp"; return 1; fi
-  tar -xzf "$tmp/s.tar.gz" -C "$tmp" || { err "the archive is broken."; rm -rf "$tmp"; return 1; }
+  #  Ask for the release we actually want. This used to read releases/latest
+  #  whatever version was requested, so 'llm update swap v240' downloaded the
+  #  newest tarball and then reported itself as v240.
+  local rel meta
+  rel="$GH_SWAP"
+  [[ -n "${1:-}" ]] && rel="${GH_SWAP%/latest}/tags/$want"
+  tmp=$(mktemp -d)
+  if ! curl -sf --max-time 15 "$rel" -o "$tmp/release.json"; then
+    err "could not read the release information for $want."; rm -rf "$tmp"; return 1
+  fi
+  meta="$tmp/release.json"
+  url=$(sed -n 's/.*"browser_download_url": *"\([^"]*linux_amd64[^"]*\)".*/\1/p' "$meta" | head -1)
+  [[ -z "$url" ]] && { err "no linux_amd64 download in release $want."; rm -rf "$tmp"; return 1; }
+  #  This binary is the one thing this project installs that it does not build
+  #  from source. Until now the only gate was '--version', which a replaced
+  #  tarball would pass. The release ships a checksums file; refuse rather than
+  #  install something unverified.
+  local sums arc
+  sums=$(sed -n 's/.*"browser_download_url": *"\([^"]*checksums[^"]*\)".*/\1/p' "$meta" | head -1)
+  [[ -z "$sums" ]] && { err "release $want ships no checksums file - refusing to install it unverified."; rm -rf "$tmp"; return 1; }
+  arc="${url##*/}"                                  # the name the checksums list uses
+  info "downloading llama-swap $want ..."
+  if ! curl -sfL --max-time 120 "$url" -o "$tmp/$arc"; then err "the download failed."; rm -rf "$tmp"; return 1; fi
+  if ! curl -sfL --max-time 30 "$sums" -o "$tmp/checksums.txt"; then err "the checksums file could not be downloaded."; rm -rf "$tmp"; return 1; fi
+  if ! ( cd "$tmp" && grep -F " $arc" checksums.txt | sha256sum -c - >/dev/null 2>&1 ); then
+    err "the checksum of $arc does not match the release list - NOT installing it."
+    echo "  expected: $(grep -F " $arc" "$tmp/checksums.txt" | awk '{print $1}')" >&2
+    echo "  got:      $(sha256sum "$tmp/$arc" | awk '{print $1}')" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  ok "checksum verified against the release list."
+  tar -xzf "$tmp/$arc" -C "$tmp" || { err "the archive is broken."; rm -rf "$tmp"; return 1; }
   local new; new=$(find "$tmp" -type f -name 'llama-swap' | head -1)
   [[ -z "$new" ]] && { err "no llama-swap inside the archive."; rm -rf "$tmp"; return 1; }
   chmod +x "$new"

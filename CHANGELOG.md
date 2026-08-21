@@ -138,6 +138,74 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   the registry sets it for every job, and what other tools still emit is
   stripped. This affected the download log too.
 
+- **The test runner reported a green result for a run that was less than half
+  done.** `tests/api-matrix.sh` needs `venv-api` and `tests/ui-matrix.sh` needs
+  `node`; without them each called `skip` and then `summary; exit $?`, and
+  `summary` returned 0 as long as nothing had *failed*. So `run-all.sh` printed
+  *"all 5 suites passed"* on a fresh clone while **130 of about 300 assertions
+  had never executed**. The summary names the skipped count now, `--strict` turns
+  a skip into a failure, and CI has a step that asserts `--strict` *fails*
+  without those dependencies — so the old behaviour cannot return quietly. This
+  was precisely what `CONTRIBUTING.md` calls the worst kind of test: one that
+  reads like cover.
+- **The inference key was readable by every account on the machine.** `llm key
+  new` writes it to `config/api-key` with mode 600 and then, because llama-swap
+  needs it there, a copy of it into `config/llama-swap.yaml` — which `llm init`
+  created 644. The careful mode on the small file was undone by the large one
+  beside it. Config writes narrow the file to 600 whenever it contains an
+  `apiKeys:` block, at the single point every write passes through, and
+  `llm doctor` reports an older installation that is still 644.
+- **`llm update swap <version>` installed the newest release instead.** It read
+  `releases/latest` whatever version was requested, downloaded that tarball and
+  then reported itself as the version you had named. It asks for the release you
+  named.
+- **The one binary this project does not build was installed unverified.** The
+  `llama-swap` tarball's only gate was that the extracted file answered
+  `--version`, which a substituted archive would also do. Its SHA-256 is checked
+  against the checksum list published in the same release, before unpacking, and
+  a release without such a list is refused rather than trusted. Verified both
+  ways: the real archive passes, a tampered one is rejected with both digests
+  printed.
+- **`LLM_API_REQUIRE_AUTH=1` left half the door open.** It closed reads over
+  HTTP while the MCP tools `list_models`, `get_model`, `gpu_status` and
+  `job_status` kept answering without a token — the same catalog and the same
+  filesystem paths, through `/mcp` instead of `/api`. They follow the switch now.
+  The MCP transport's `Origin` check also accepted `*`; it gets the same list as
+  the `Host` check, which is what makes that DNS-rebinding protection whole.
+- **The registry created no write token unless it was started by its own
+  `__main__`.** `api_token(create=True)` sat under `if __name__ == "__main__"`,
+  so a process started through an ASGI server answered 503 "no token configured"
+  to every write while `llm api token` printed one — created by the CLI, not by
+  the service. It moved into the lifespan handler.
+- Token comparison is `secrets.compare_digest` rather than `==`, in all four
+  places that compare one.
+- A failure to write `config/api-key.env` was swallowed by a bare
+  `except OSError: pass`, so the chat UI kept its previous key and began failing
+  401 after the next restart with nothing saying why. It warns — and the warning
+  names neither `API_KEY_ENV` nor the exception object — CodeQL reads a name
+  containing "key" as a secret, and neither form could have carried the key
+  anyway. It was the new scanner's first finding, on code from the pull request
+  that added it.
+- The snippet `llm api client` prints created `~/.pi/agent/llm-box.json` — which
+  holds the registry write token — with whatever umask the client machine had. It
+  creates the directory and uses `umask 077`.
+- **The `docs` job had never checked a link.** It was a python heredoc in the
+  workflow — `git ls-files '*.md' | python - <<'PY'` — and the heredoc *is*
+  stdin, so the interpreter read its program from there and the piped file list
+  went nowhere. `for line in sys.stdin` iterated an exhausted stream, found
+  nothing, and the job reported success for every push since it was written.
+  Confirmed by putting a broken link in and watching it exit 0. It is
+  `tests/check-links.py` now, taking the file list as arguments, and it is also a
+  check in `tests/repo-matrix.sh` so it runs locally. All 50 relative links in
+  the tree do resolve — the documentation was fine, the check was not.
+- **shellcheck never saw `lib/update.sh`.** The workflow named four paths, and
+  636 lines that build engines and restart services were reached only
+  transitively through `-x`. The file list comes from `git ls-files`, so a new
+  script cannot be forgotten.
+- Three stale claims in `docs/UPDATES.md`: the build flags live in
+  `lib/update.sh` rather than `bin/llm`, and `GGML_CCACHE=ON` is llama.cpp's own
+  default rather than something this project sets.
+
 ### Added
 
 - **Updates and rollbacks from the control page.** The System tab now has
@@ -160,6 +228,29 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 - `LLM_WHISPER_HOME` overrides where whisper.cpp lives, the way
   `LLM_COMFY_HOME` already did — which also lets the page tests run against a
   sandbox instead of whatever the machine has installed.
+
+- **Six CI jobs instead of three, and every tool version pinned.** `gitleaks`
+  over the whole commit history, `pip-audit` on the registry's requirements,
+  `zizmor` on the workflows themselves, and CodeQL for Python and
+  JavaScript/TypeScript in its own workflow. Actions are pinned by commit hash,
+  linters by version, and Dependabot moves both weekly — pinning without updates
+  is just old software with extra steps. The unpinned versions were not
+  hypothetical: the runner image shipped shellcheck 0.9.0 while the author had
+  0.11.0, and CI went red on a tree that was green locally.
+- **`tests/repo-matrix.sh`** — the four checks that are about the repository
+  rather than the code: no leftover German, no machine-specific path or private
+  address, nothing per-machine or downloaded tracked, and one version number
+  rather than three (`VERSION`, `package.json`, `CHANGELOG.md`) that agreed by
+  hand. Three of these were inline in the workflow, where a contributor could
+  only find them by pushing and going red. The secrets check asks `git ls-files`
+  rather than the filesystem, so loosening `.gitignore` cannot quiet it.
+- **`bash tests/run-all.sh --strict`**, and a summary of what actually ran rather
+  than how many suites returned zero. See *Fixed* for why that is not a nicety.
+- **Issue and pull request templates, `CODEOWNERS`, and a private security
+  channel.** `SECURITY.md` said "open an issue"; reports go through GitHub
+  Security Advisories now. The hardware template asks for raw `rocm-smi` output,
+  because "which card, which ROCm version" is always the first question and
+  `tests/fixtures/` exists so a machine nobody here owns can be reproduced.
 
 ## [1.3.0] — 2026-08-20
 

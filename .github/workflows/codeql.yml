@@ -1,0 +1,60 @@
+# ============================================================================
+#  CodeQL — static analysis for the two languages this tree actually ships
+# ============================================================================
+#  A separate workflow because it is the only thing here that needs
+#  security-events: write, and ci.yml should stay read-only.
+#
+#  python covers lib/llmreg.py and bin/llm-api.py, which between them read every
+#  model file, hold config/api-token and turn request bodies into argv.
+#  javascript-typescript covers pi/extensions/llm-box.ts and the inline script
+#  in web/index.html - the extractor reads <script> blocks out of HTML.
+#
+#  bin/llm and lib/update.sh are bash; CodeQL has no extractor for it. That gap
+#  is covered by shellcheck in ci.yml, which is not the same thing and is worth
+#  knowing about.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    #  Weekly, so a newly published query finds this tree without a push.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          #  security-and-quality over the default: this is a small tree and the
+          #  extra queries cost seconds, not minutes.
+          queries: security-and-quality
+
+      #  No build step. Nothing here compiles - bin/llm is a shell script,
+      #  lib/llmreg.py needs only the standard library, and the venvs exist for
+      #  Open WebUI and the registry.
+      - uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          category: "/language:${{ matrix.language }}"

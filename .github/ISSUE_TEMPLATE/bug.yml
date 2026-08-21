@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `llm doctor` walks the whole chain and prints the command that fixes each
+        failure. Please run it first and paste the output below - it answers most
+        of what would otherwise be the first three questions.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `llm doctor`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What you did and what happened
+      description: The command, its output, and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`llm --version`, and `llm versions` if an engine is involved."
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Cards and driver stack
+      description: "Output of `llm gpu list`, plus your ROCm version."
