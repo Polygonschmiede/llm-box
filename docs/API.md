@@ -404,9 +404,13 @@ Otherwise `400`.
 - **Python environment:** the registry has its **own** `venv-api/` with just
   `fastapi`, `uvicorn` and `mcp` (~33 MB). It used to share the 6.4 GB environment
   with Open WebUI, which meant an Open WebUI upgrade could move `fastapi`/`pydantic`/
-  `mcp` underneath it and take every agent offline. Note that `mcp` is pinned below
-  2.0: mcp 2.0 renamed `mcp.server.fastmcp` to `mcp.server.mcpserver` and the server
-  does not start with it.
+  `mcp` underneath it and take every agent offline. Note that `mcp` is pinned to the
+  **2.x** series and cannot span both: 2.0 renamed `mcp.server.fastmcp` to
+  `mcp.server.mcpserver`, dropped the module-wide `get_context()` in favour of a
+  `Context` injected into each tool, and moved `stateless_http`,
+  `streamable_http_path` and `transport_security` from the constructor to
+  `streamable_http_app()`. An existing installation needs `llm setup` once to move
+  its `venv-api`, and until it does the registry will not start.
 - **During an update** (`llm update llama|swap`) llama-swap is briefly stopped. The
   registry keeps running, reports `swapUp: false` for that moment, and the catalog
   stays readable.

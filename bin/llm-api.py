@@ -265,7 +265,7 @@ READ = [Depends(require_read)]
 # ---------------------------------------------------------------------------
 #  MCP
 # ---------------------------------------------------------------------------
-from mcp.server.fastmcp import FastMCP                                  # noqa: E402
+from mcp.server.mcpserver import MCPServer, Context                     # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings     # noqa: E402
 
 #  The MCP transport rejects unknown Host headers (DNS-rebinding protection) and
@@ -293,28 +293,40 @@ def _allowed_hosts() -> list[str]:
 #  browser-driven request, and this service answers with a session cookie. An
 #  MCP client that is not a browser sends no Origin at all and is unaffected -
 #  LLM_API_ALLOWED_HOSTS widens both if you need it to.
-mcp = FastMCP("llm-box", stateless_http=True, streamable_http_path="/mcp",
-              transport_security=TransportSecuritySettings(
-                  allowed_hosts=_allowed_hosts(),
-                  allowed_origins=_allowed_hosts()))
+mcp = MCPServer("llm-box")
+
+#  Built here, not at the mount below: 'mcp.session_manager' raises until
+#  streamable_http_app() has run once, and the lifespan needs it. Keeping the two
+#  next to each other means the order cannot be broken by moving the mount.
+#  In mcp 1.x all three of these were constructor arguments.
+MCP_APP = mcp.streamable_http_app(
+    streamable_http_path="/mcp", stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=_allowed_hosts(),
+        allowed_origins=_allowed_hosts()))
 
 
-def _mcp_token() -> str | None:
+#  mcp 1.x had a module-wide mcp.get_context(); 2.0 injects the context into any
+#  tool that asks for it by type hint, so the header has to be handed down. Every
+#  tool below therefore takes a keyword-only 'ctx' - it stays out of the tool
+#  schema, so nothing changes for a client.
+def _mcp_token(ctx: Context | None) -> str | None:
     try:
-        req = mcp.get_context().request_context.request
-        return req.headers.get("x-llm-token") if req else None
+        #  None on stdio and on any transport without a request object.
+        headers = ctx.headers if ctx else None
+        return headers.get("x-llm-token") if headers else None
     except Exception:                                                   # noqa: BLE001
         return None
 
 
-def _mcp_check_token():
+def _mcp_check_token(ctx: Context | None):
     want = llmreg.api_token(create=False)
-    if not want or not _token_ok(_mcp_token(), want):
+    if not want or not _token_ok(_mcp_token(ctx), want):
         raise ValueError("this action needs the X-LLM-Token header "
                          "(contents of config/api-token on the server).")
 
 
-def _mcp_check_read():
+def _mcp_check_read(ctx: Context | None):
     """The read half of the MCP surface, gated the same way HTTP reads are.
 
     Without this, LLM_API_REQUIRE_AUTH closed /api/models over HTTP and left
@@ -324,7 +336,7 @@ def _mcp_check_read():
     unless you ask in MCP".
     """
     if READ_NEEDS_AUTH:
-        _mcp_check_token()
+        _mcp_check_token(ctx)
 
 
 async def _thread(fn, *a, **kw):
@@ -373,24 +385,24 @@ def _slim(m: dict) -> dict:
 
 @mcp.tool(description="All local models with their configuration, GPU placement and "
                       "Hugging Face provenance. Always the real, current state.")
-async def list_models(role: str | None = None) -> list[dict]:
-    _mcp_check_read()
+async def list_models(role: str | None = None, *, ctx: Context) -> list[dict]:
+    _mcp_check_read(ctx)
     models = await _thread(CAT.all)
     return [_slim(m) for m in models if not role or m["role"] == role]
 
 
 @mcp.tool(description="Every detail of one model including the full llama-server "
                       "command line, its files and its VRAM requirement.")
-async def get_model(model_id: str) -> dict:
-    _mcp_check_read()
+async def get_model(model_id: str, *, ctx: Context) -> dict:
+    _mcp_check_read(ctx)
     return await _thread(CAT.one, model_id)
 
 
 @mcp.tool(description="VRAM and temperature per card, plus which models are pinned "
                       "to which card. The card count depends on the machine, so "
                       "call this before pinning anything.")
-async def gpu_status() -> list[dict]:
-    _mcp_check_read()
+async def gpu_status(*, ctx: Context) -> list[dict]:
+    _mcp_check_read(ctx)
     return await _thread(llmreg.gpus)
 
 
@@ -405,8 +417,9 @@ async def set_model_config(model_id: str, gpu: str | None = None,
                            ttl: int | None = None,
                            temperature: float | None = None, top_p: float | None = None,
                            top_k: int | None = None, min_p: float | None = None,
-                           force: bool = False, dry_run: bool = False) -> dict:
-    _mcp_check_token()
+                           force: bool = False, dry_run: bool = False,
+                           *, ctx: Context) -> dict:
+    _mcp_check_token(ctx)
     sampling = {k: v for k, v in (("temperature", temperature), ("top_p", top_p),
                                   ("top_k", top_k), ("min_p", min_p)) if v is not None}
     changes = {"gpu": gpu, "contextWindow": context_window, "parallel": slots,
@@ -420,14 +433,14 @@ async def set_model_config(model_id: str, gpu: str | None = None,
 
 
 @mcp.tool(description="Load a model into VRAM (llama-swap starts it).")
-async def load_model(model_id: str) -> dict:
-    _mcp_check_token()
+async def load_model(model_id: str, *, ctx: Context) -> dict:
+    _mcp_check_token(ctx)
     return await _thread(llmreg.load_model, model_id)
 
 
 @mcp.tool(description="Drop every loaded model out of VRAM.")
-async def unload_models() -> dict:
-    _mcp_check_token()
+async def unload_models(*, ctx: Context) -> dict:
+    _mcp_check_token(ctx)
     return await _thread(llmreg.unload_all)
 
 
@@ -436,8 +449,9 @@ async def unload_models() -> dict:
                       "progress with job_status. Needs X-LLM-Token.")
 async def add_model(repo: str, quant: str = "Q4_K_M", gpu: str | None = None,
                     context_window: int | None = None, mtp: bool = False,
-                    ngram: bool = False, ttl: int | None = None) -> dict:
-    _mcp_check_token()
+                    ngram: bool = False, ttl: int | None = None,
+                    *, ctx: Context) -> dict:
+    _mcp_check_token(ctx)
     body = {"repo": repo, "quant": quant, "gpu": gpu, "contextWindow": context_window,
             "mtp": mtp, "ngram": ngram, "ttl": ttl}
     try:
@@ -449,16 +463,17 @@ async def add_model(repo: str, quant: str = "Q4_K_M", gpu: str | None = None,
 @mcp.tool(description="Remove a model from the configuration. delete_files=true "
                       "also deletes the GGUF files (irreversibly). "
                       "Needs X-LLM-Token.")
-async def remove_model(model_id: str, delete_files: bool = False) -> dict:
-    _mcp_check_token()
+async def remove_model(model_id: str, delete_files: bool = False,
+                       *, ctx: Context) -> dict:
+    _mcp_check_token(ctx)
     return await _thread(llmreg.remove_model, model_id, delete_files)
 
 
 @mcp.tool(description="State and log of a background job (e.g. a download).")
-async def job_status(job_id: str) -> dict:
+async def job_status(job_id: str, *, ctx: Context) -> dict:
     #  Job logs carry the full build and download output, including the argv the
     #  job was started with - so they are a read like any other.
-    _mcp_check_read()
+    _mcp_check_read(ctx)
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1008,7 +1023,7 @@ def root():
 # Deliberately mounted at "/" (the MCP app brings its own /mcp path): mounting on
 # "/mcp" would redirect POSTs to /mcp/ with a 307, which some MCP clients cannot
 # follow. All /api routes are registered before this one and therefore still win.
-app.mount("/", mcp.streamable_http_app())
+app.mount("/", MCP_APP)
 
 
 if __name__ == "__main__":

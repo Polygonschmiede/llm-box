@@ -19,6 +19,7 @@ safe to run on a live server.
 | `tests/config-matrix.sh` | marker blocks, card groups, roles, `patch_model`, the flag primitives |
 | `tests/vram-matrix.sh` | KV cache size for the three layouts, and the per-card fit |
 | `tests/api-matrix.sh` | the registry's HTTP surface, both catalog shapes, auth |
+| `tests/mcp-matrix.sh` | the registry's MCP surface: the tool list, and the token gate on reads and writes |
 | `tests/ui-matrix.sh` | that `web/index.html` really renders, and fetches nothing external |
 | `tests/repo-matrix.sh` | the repository itself: no German, no machine paths, no tracked secret, links resolve, one version number |
 
@@ -28,7 +29,8 @@ edit anywhere. Suites run in their own process; the totals come back through
 
 ### Skipped is not passed
 
-`tests/api-matrix.sh` needs `venv-api` and `tests/ui-matrix.sh` needs `node`.
+`tests/api-matrix.sh` and `tests/mcp-matrix.sh` need `venv-api`, and
+`tests/ui-matrix.sh` needs `node`.
 Without them those suites **skip themselves whole** — 130 of the ~300 checks.
 They used to call `skip` and then exit 0, so the runner printed
 *"all 5 suites passed"* on a machine where less than half of them had run. Now

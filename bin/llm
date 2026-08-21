@@ -490,9 +490,9 @@ cmd_doctor(){
       _bad "$(basename "$d") is missing" "llm setup"
     fi
   done
-  [[ -x "$VENV_API/bin/python" ]] && { "$VENV_API/bin/python" -c 'from mcp.server.fastmcp import FastMCP' 2>/dev/null \
+  [[ -x "$VENV_API/bin/python" ]] && { "$VENV_API/bin/python" -c 'from mcp.server.mcpserver import MCPServer' 2>/dev/null \
     && _ok "registry: fastapi and mcp import cleanly" \
-    || _bad "registry imports failed (mcp 2.x is not compatible)" "llm setup"; }
+    || _bad "registry imports failed (mcp 1.x is too old)" "llm setup"; }
   [[ -d "$LLM_HOME/venv" ]] && _warn "the old shared venv/ is still here ($(du -sh "$LLM_HOME/venv" 2>/dev/null | cut -f1))" "once everything works:  rm -rf $LLM_HOME/venv"
 
   info "Services"
