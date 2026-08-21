@@ -112,32 +112,48 @@ Two things a rollback cannot fix, so they are worth knowing:
 - An Open WebUI downgrade restores the database snapshot, which means anything
   written *after* the upgrade is not in it.
 
-## One build belongs to one backend
+## One build per version, per backend — and switching is a relink
 
-`build-<tag>` says nothing about **which** backend it was built for, so a HIP and
-a Vulkan build of the same tag would land in the same directory and `llm versions`
-could not tell them apart. Each build therefore records it in
-`build-<tag>/.llm-backend`, and a build for the other backend is rebuilt rather
-than reused.
+A HIP and a Vulkan build of the same tag are two different binaries, so they get
+two directories, and the backend is in the **name**:
 
-Two consequences worth knowing before you switch:
+```
+llama.cpp/
+├── build -> build-b10545          ← active
+├── build-b10545/                  ROCm
+├── build-vulkan-b10545/           Vulkan, same version
+└── build-vulkan-b10500/           and its fallback
+```
 
-- **A backend switch costs a rebuild.** `llm gpu backend vulkan` rewrites the
-  configuration and the environment file in a second, then tells you to run
-  `llm update llama` (and `llm update whisper` if it is installed).
-- **The rollback stock is per backend.** `KEEP_BUILDS` fallbacks are counted per
-  directory, and after a switch the fallbacks belong to the other backend — so
-  they are rebuilt too rather than rolled back into. Holding a ROCm and a Vulkan
-  build of the same version side by side for an A/B comparison is not possible
-  without waiting for one of them.
+Only non-default backends are prefixed. That asymmetry is deliberate: renaming
+the existing `build-<tag>` directories would invalidate every recorded rollback
+target on every machine already running this.
 
-A build with no marker at all was made before backends existed, which can only
-have been ROCm; it is treated as such rather than rebuilt for no reason.
+Because both can exist at once, **switching backend is a symlink change**:
+
+```bash
+llm gpu backend vulkan       # rewrites the config, then relinks if it can
+```
+
+If a build of the active version already exists for the new backend, it is smoke
+tested and linked — the same seconds a rollback takes. If not, it says which
+`llm update` to run and leaves the endpoint on the current binaries until you do.
+So the **first** build of each backend costs a build; after that, back and forth
+as often as you like.
+
+`KEEP_BUILDS` counts **per backend**, and `llm versions` lists the active
+backend's builds — a rollback never silently changes backend. Getting that
+scoping wrong would delete the fallbacks of whichever backend you just switched
+away from, quietly, and you would find out the next time you switched back; there
+is a test for exactly that in `tests/update-matrix.sh`.
+
+An installation with no `build` symlink at all predates versioned builds and can
+only have been ROCm; it is treated as such rather than rebuilt for no reason.
 
 The prerequisites are checked **before** anything is fetched or checked out. That
 was not true at first: a machine missing `glslc` had already moved the llama.cpp
-source tree to the new tag by the time it was told. The active build was safe -
-that is what the symlink is for - but the checkout was left on a version nothing
+source tree to the new tag by the time it was told. The active build was safe —
+that is what the symlink is for — but the checkout was left on a version nothing
 was built from.
 
 ## Build time and flags

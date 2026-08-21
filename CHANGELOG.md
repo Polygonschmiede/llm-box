@@ -254,6 +254,16 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   is just old software with extra steps. The unpinned versions were not
   hypothetical: the runner image shipped shellcheck 0.9.0 while the author had
   0.11.0, and CI went red on a tree that was green locally.
+- **`tests/update-matrix.sh`** — 33 checks on `lib/update.sh`, which had none.
+  636 lines that build engines and restart services, covered until now by
+  shellcheck and nothing else. Reachable because `bin/llm` *sources* that file:
+  the suite fakes the six helpers it reaches for and calls the pure functions
+  directly against empty directories in `/tmp`. No build, no network, no GPU.
+  It covers the build-directory naming, which builds belong to which backend,
+  what the symlink says is active, what prune keeps, the version cache, and the
+  dirty guard in all four of its cases. Verified by breaking two things
+  deliberately — and one of those breakages showed prune deleting the other
+  backend's builds, which is the silent kind of damage this exists to prevent.
 - **`tests/repo-matrix.sh`** — the four checks that are about the repository
   rather than the code: no leftover German, no machine-specific path or private
   address, nothing per-machine or downloaded tracked, and one version number
@@ -308,10 +318,16 @@ Version numbers describe **llm-box itself**, not the engines it drives —
     cosmetic — whisper has no `--device` flag, and a mask the runtime does not read
     is not a mask. Reading always accepts either spelling, so a config survives a
     switch in both directions.
-  - **A build belongs to one backend.** `build-<tag>/.llm-backend` records which,
-    and a build for the other one is rebuilt rather than reused. The cost is
-    stated in `docs/UPDATES.md`: switching means rebuilding, and the rollback
-    stock is per backend.
+  - **Switching back and forth is a symlink change**, not a rebuild each time.
+    The backend is in the build directory's *name* — `build-b10545` for ROCm
+    (unchanged, so existing installations are untouched) and
+    `build-vulkan-b10545` beside it — so both can exist at once and
+    `llm gpu backend` relinks where a build is already there. Only the first
+    build of each backend costs a build. `KEEP_BUILDS` and `llm versions` are
+    scoped per backend, so a rollback never silently changes backend and pruning
+    one backend cannot delete the other's fallbacks — which is what the first
+    attempt at this would have done, and what `tests/update-matrix.sh` now
+    catches.
   - **ComfyUI stays ROCm-only** and says so instead of downloading three gigabytes
     of PyTorch wheel and then failing on `torch.version.hip`. There is no Vulkan
     build of PyTorch.

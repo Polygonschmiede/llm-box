@@ -136,8 +136,9 @@ card numbers. It refuses to overwrite an existing configuration.
 
 Without `--backend` it takes ROCm when `rocm-smi` and `hipcc` are both there and
 report a card, Vulkan when `vulkaninfo` reports one, and says so. To change it
-later: `llm gpu backend vulkan` — which rewrites the configuration and tells you
-to rebuild, because a build belongs to one backend.
+later: `llm gpu backend vulkan`, which rewrites the configuration and relinks the
+engines if a build for that backend already exists. The first build of each
+backend costs a build; after that, switching is a symlink change.
 
 The template also carries a set of proven model entries, all commented out. They are
 settings that were measured to work well on 32 GB Radeon cards, including the MTP

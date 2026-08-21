@@ -111,6 +111,9 @@ def compiler() -> str | None:
         if p and os.path.exists(os.path.join(p, "clang++")):
             return os.path.join(p, "clang++")
     except (OSError, subprocess.SubprocessError):
+        #  No hipconfig, or it hung. Not fatal: the candidate list below covers
+        #  every layout seen so far, and reporting nothing at all here would turn
+        #  a slow tool into "ROCm is not installed".
         pass
     for cand in ("/opt/rocm/llvm/bin/clang++", shutil.which("amdclang++"),
                  shutil.which("hipcc")):
