@@ -273,6 +273,12 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   rather than the filesystem, so loosening `.gitignore` cannot quiet it.
 - **`bash tests/run-all.sh --strict`**, and a summary of what actually ran rather
   than how many suites returned zero. See *Fixed* for why that is not a nicety.
+- Dependabot ignores **major** updates to `mcp`. It proposed
+  `>=2.0.0,<3` within hours of being switched on, and that version does not start
+  this registry: mcp 2.0 renamed `mcp.server.fastmcp` to `mcp.server.mcpserver`
+  and `bin/llm-api.py` imports `FastMCP` from the old path. The bound in
+  `config/requirements-api.txt` already said so. Patch and minor updates still
+  come through, so the ignore expires the moment that import is migrated.
 - **Issue and pull request templates, `CODEOWNERS`, and a private security
   channel.** `SECURITY.md` said "open an issue"; reports go through GitHub
   Security Advisories now. The hardware template asks for raw `rocm-smi` output,

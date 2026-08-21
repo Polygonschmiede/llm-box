@@ -27,6 +27,14 @@ updates:
       - dependency-name: fastapi
       - dependency-name: uvicorn
       - dependency-name: mcp
+    ignore:
+      #  mcp 2.0 renamed mcp.server.fastmcp to mcp.server.mcpserver, and
+      #  bin/llm-api.py imports FastMCP from the old path - so the registry does
+      #  not start at all on 2.x. The bound in requirements-api.txt says so, and
+      #  Dependabot proposed crossing it anyway (PR #5). Ignore the major until
+      #  that import is migrated; patch and minor updates still come through.
+      - dependency-name: mcp
+        update-types: [version-update:semver-major]
     commit-message:
       prefix: chore
     labels: [dependencies]
