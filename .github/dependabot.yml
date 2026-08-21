@@ -1,0 +1,32 @@
+# ============================================================================
+#  Dependabot
+# ============================================================================
+#  Two ecosystems, because pinning without updates is just old software with
+#  extra steps. The action pins in the workflows are commit hashes, which
+#  Dependabot understands and rewrites together with the `# vX.Y.Z` comment
+#  beside them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    labels: [dependencies]
+
+  #  Only the registry's requirements. config/requirements-webui.txt is a single
+  #  unpinned `open-webui`, whose ~500 transitive packages this project does not
+  #  choose - a PR per week there would be noise, and `llm update ui` is how
+  #  that one moves.
+  - package-ecosystem: pip
+    directory: "/config"
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: fastapi
+      - dependency-name: uvicorn
+      - dependency-name: mcp
+    commit-message:
+      prefix: chore
+    labels: [dependencies]

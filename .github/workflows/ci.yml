@@ -1,5 +1,5 @@
 # ============================================================================
-#  CI — lint, tests, docs
+#  CI — lint, tests, docs, and four scanners
 # ============================================================================
 #  Nothing here needs a GPU. The card detection is fed by the fake rocm-smi
 #  fixtures in tests/fixtures, and the configuration by a temporary LLM_HOME,
@@ -12,62 +12,92 @@ on:
   pull_request:
   workflow_dispatch:
 
+#  Read-only by default. The one job that needs more (CodeQL, in its own
+#  workflow) asks for it there rather than widening this.
 permissions:
   contents: read
+
+#  A second push to the same branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+#  Every tool version CI runs, in one place.
+#
+#  Unpinned tools are how this went red on a tree that was green locally: the
+#  runner image shipped shellcheck 0.9.0 while the author had 0.11.0, and
+#  `pip install ruff` means "whatever was released today". Now CI runs exactly
+#  what CONTRIBUTING.md tells you to run - if you move a number here, move it
+#  there too.
+env:
+  RUFF_VERSION: "0.16.4"
+  SHELLCHECK_VERSION: "0.11.0.1"      # shellcheck-py, i.e. shellcheck 0.11.0
+  ZIZMOR_VERSION: "1.29.0"
+  PIP_AUDIT_VERSION: "2.10.1"
+  GITLEAKS_VERSION: "8.30.1"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
+          cache: pip
+
+      - name: install the linters
+        run: pip install --quiet "ruff==$RUFF_VERSION" "shellcheck-py==$SHELLCHECK_VERSION"
 
       - name: ruff
-        run: |
-          pip install --quiet ruff
-          ruff check .
+        run: ruff check .
 
-      # shellcheck is preinstalled on the Ubuntu runners.
+      #  The file list is derived, not written out: the previous one named four
+      #  paths and therefore missed lib/update.sh - 636 lines that build and
+      #  restart services - plus every fixture stub. -x follows `source`, so
+      #  tests/lib.sh is reached from the suites either way.
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x -S warning bin/llm setup-system.sh bin/install-comfyui.sh tests/*.sh
+          shellcheck -x -S warning $(git ls-files '*.sh' 'bin/llm')
 
-      # The tree was translated once and the residue kept turning up in
-      # user-facing strings - an HTTP 400 body, a diff label, two pi menu items.
-      # A short explicit word list is cheap and catches the regression; a
-      # general language detector would only produce false positives.
-      - name: english only
-        run: |
-          if git grep -nIE '[äöüÄÖÜß]|\b(Karte|Grafikkarte|Modelle|Fortschritt|enthaelt|unerlaubte|Dienst|riesige|ueberspringen|Zeichen|neu\))' \
-               -- ':!CHANGELOG.md' ':!.github/workflows/ci.yml'; then
-            echo "::error::German text in a tracked file - this project is English throughout"
-            exit 1
-          fi
-
-      - name: no leaked machine paths or addresses
-        run: |
-          # The repo must stay portable: no /home/<someone>, no LAN address.
-          if git grep -nE '/home/[a-z][a-z0-9_-]+/|192\.168\.[0-9]+\.[0-9]+' -- \
-               ':!*.md' ':!.github/**'; then
-            echo "::error::a machine-specific path or address is committed"
-            exit 1
-          fi
+      #  Language, portability, tracked secrets, one version number. These used
+      #  to be inline here, where a contributor could only find them by pushing.
+      - name: repository guards
+        run: bash tests/repo-matrix.sh
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
+      #  Before anything is installed, prove that --strict actually refuses.
+      #  A suite without its dependencies used to call skip() and then exit 0,
+      #  so `run-all.sh` printed "all 5 suites passed" while 130 of 300
+      #  assertions had not run. If this step ever succeeds, that lie is back.
+      - name: an incomplete run must not pass
+        run: |
+          if bash tests/run-all.sh --strict; then
+            echo "::error::run-all.sh --strict passed without node or venv-api"
+            exit 1
+          fi
+          echo "ok: --strict refused an incomplete run"
+
       # tests/ui-matrix.sh runs the control page's script under node against a
-      # generated configuration. Without node it skips, which would mean the
-      # page is never checked at all in CI.
-      - uses: actions/setup-node@v4
+      # generated configuration. Without node it skips, which under --strict is
+      # now a failure rather than a silent gap.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "22"
 
@@ -79,27 +109,86 @@ jobs:
           ./venv-api/bin/pip install --quiet -r config/requirements-api.txt httpx
 
       - name: suites
-        run: bash tests/run-all.sh
+        run: bash tests/run-all.sh --strict
 
   docs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      #  Tracked files only: the venvs and models/ are gitignored and full of
+      #  third-party markdown whose links are none of our business.
+      #
+      #  The file list is arguments, not stdin. It used to be a python heredoc
+      #  here, and the heredoc WAS stdin - so the interpreter read the program
+      #  from it and the piped list of files went nowhere. The loop ran zero
+      #  times and this job passed every push since it was written; a broken
+      #  link exits 0. Confirmed by putting one in.
       - name: relative links resolve
+        run: python3 tests/check-links.py $(git ls-files '*.md')
+
+  #  A leaked token is the one mistake here that cannot be taken back: this
+  #  repository generates config/api-token and config/api-key per machine, and
+  #  an agent worktree is a second checkout carrying a real one.
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0            # gitleaks scans commits, not just the tree
+          persist-credentials: false
+      - name: gitleaks
         run: |
-          # Tracked files only: the venvs and models/ are gitignored and full of
-          # third-party markdown whose links are none of our business.
-          git ls-files '*.md' | python - <<'PY'
-          import pathlib, re, sys
-          bad = []
-          for line in sys.stdin:
-              md = pathlib.Path(line.strip())
-              for text, target in re.findall(r"\[([^\]]*)\]\(([^)]+)\)", md.read_text()):
-                  if re.match(r"^(https?:|mailto:|#)", target):
-                      continue
-                  if not (md.parent / target.split("#")[0]).exists():
-                      bad.append("%s: [%s](%s)" % (md, text, target))
-          for b in bad:
-              print("::error::broken link %s" % b)
-          sys.exit(1 if bad else 0)
-          PY
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION"
+          tar="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sfL -o "$tar" "$base/$tar"
+          curl -sfL -o sums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " $tar\$" sums.txt | sha256sum -c -
+          tar -xzf "$tar" gitleaks
+          ./gitleaks git --redact --no-banner .
+
+  #  Only the registry's own requirements. Open WebUI pulls ~500 packages that
+  #  this project neither chooses nor pins, so auditing them would report other
+  #  people's code as this repository's problem.
+  deps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: pip-audit
+        run: |
+          pip install --quiet "pip-audit==$PIP_AUDIT_VERSION"
+          pip-audit --strict -r config/requirements-api.txt
+
+  #  The workflows themselves: unpinned actions, permissions wider than needed,
+  #  script injection through a PR title. Cheap, and it holds the rules above in
+  #  place rather than trusting review to notice.
+  workflows:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: zizmor
+        run: |
+          pip install --quiet "zizmor==$ZIZMOR_VERSION"
+          zizmor --no-progress --persona regular .github/workflows

@@ -1,0 +1,4 @@
+# Every path, one owner. This exists so a review is requested automatically
+# rather than remembered, and so the file is already here when the repository
+# gains a second contributor.
+*       @Polygonschmiede
