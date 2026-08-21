@@ -7,7 +7,8 @@
 fastapi
 uvicorn
 
-# mcp 2.0 renamed 'mcp.server.fastmcp' to 'mcp.server.mcpserver' - bin/llm-api.py
-# imports FastMCP and does not start with 2.x. Until that import is migrated, the
-# 1.x series is required.
-mcp>=1.27,<2
+# 2.x only, and not by preference: mcp 2.0 renamed 'mcp.server.fastmcp' to
+# 'mcp.server.mcpserver', dropped the module-wide get_context() and moved the
+# transport settings out of the constructor. bin/llm-api.py uses all three, so
+# there is no range that covers both series - see docs/API.md.
+mcp>=2.0.0,<3

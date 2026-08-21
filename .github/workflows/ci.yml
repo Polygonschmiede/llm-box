@@ -101,8 +101,8 @@ jobs:
         with:
           node-version: "22"
 
-      # tests/api-matrix.sh skips itself without this; building it means the
-      # registry's checks actually run.
+      # tests/api-matrix.sh and tests/mcp-matrix.sh skip themselves without
+      # this; building it means the registry's checks actually run.
       - name: registry environment
         run: |
           python -m venv venv-api

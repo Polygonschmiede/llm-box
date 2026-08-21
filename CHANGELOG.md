@@ -11,6 +11,15 @@ Version numbers describe **llm-box itself**, not the engines it drives —
 
 ### Added
 
+- **`tests/mcp-matrix.sh` — the MCP surface finally has tests.** `api-matrix`
+  covered the HTTP half and left the other door untested: the same catalogue and
+  the same write actions, reachable over MCP, with nothing holding the token gate
+  in place. Fourteen checks now assert the tool list against the documented nine,
+  that a read is open and a write is refused without the token, that a wrong
+  token is not enough, that `LLM_API_REQUIRE_AUTH=1` closes the reads too, and
+  that the transport still answers 421 to an unknown `Host`. Driven in-process
+  through fastapi's `TestClient` with raw JSON-RPC, so it costs no subprocess.
+  Verified by mutation: disabling the gate turns five of the fourteen red.
 - **The control page is built on a design system.**
   [Stellar DS](https://github.com/Polygonschmiede/stellar-ds)
   (`@polygonschmied/stellar-tokens`), vendored as two CSS files under
@@ -56,6 +65,25 @@ Version numbers describe **llm-box itself**, not the engines it drives —
   `watch -n 2 rocm-smi`: every device the driver exposes, the integrated GPU
   included, and nothing about what the stack was doing with them. Now it is the
   model that is loaded plus the same filtered card table as `llm status`.
+
+### Changed
+
+- **The registry runs on `mcp` 2.x — and only on 2.x.** The 2.0 release renamed
+  `mcp.server.fastmcp` to `mcp.server.mcpserver` (`FastMCP` is now `MCPServer`),
+  removed the module-wide `get_context()`, and moved `stateless_http`,
+  `streamable_http_path` and `transport_security` out of the constructor into
+  `streamable_http_app()`. `bin/llm-api.py` used all three, so there is no
+  version range that covers both series and the pin had been sitting at `<2` with
+  a comment explaining why. The migration: each of the nine tools now takes a
+  keyword-only `ctx: Context`, which mcp injects by type hint and keeps out of the
+  tool schema — verified tool by tool, so a client sees exactly the arguments it
+  saw before. The token the write gate checks comes from `ctx.headers` instead of
+  a global lookup. `mcp.session_manager` raises in 2.0 until
+  `streamable_http_app()` has run once, so the ASGI app is built next to the
+  server object rather than at the mount, where a later edit could reorder it.
+  **An existing installation needs `llm setup` once** to move its `venv-api`;
+  until it does, the registry will not start. `llm doctor` tests the new import
+  and now flags 1.x as too old.
 
 ### Fixed
 
